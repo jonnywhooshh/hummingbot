@@ -76,6 +76,25 @@ def test_missing_fee_fill_price_moves_cost_to_residual():
     assert attribute(ledger, 1).net_pnl is None
 
 
+@pytest.mark.parametrize("end_price", [D("20"), None])
+def test_offsetting_fees_preserve_missing_price_attribution(end_price):
+    prices = Prices({("BNB", 1): D("10"), ("BNB", 3): end_price})
+    ledger = Ledger(Opening(D("100"), 0, D("100")), prices)
+    ledger.apply(Fill(1, "buy", D("1"), D("100"), D("0.1"), "BNB", D("100")))
+    ledger.apply(Fill(2, "sell", D("1"), D("100"), D("-0.1"), "BNB", D("100")))
+    result = attribute(ledger, 3)
+    assert result.end_equity == D("100")
+    assert result.net_pnl == D("0")
+    assert result.fees == D("1")
+    if end_price is None:
+        assert result.inventory is None
+        assert result.residual is None
+        assert result.missing_tokens == ("BNB",)
+    else:
+        assert result.inventory == D("-1")
+        assert result.residual == D("2")
+
+
 def test_mark_valuation_and_external_flows():
     ledger = Ledger(Opening(D("100"), 0, D("100")), Prices({("SOL", 2): None}))
     ledger.apply(Transfer(1, D("10")))

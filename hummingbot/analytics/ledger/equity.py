@@ -147,6 +147,9 @@ class Ledger:
             q += closed * sign
             if old_q:
                 self._lots.appendleft((old_q, old_price))
+        if not self._lots:
+            self._cost_quantity = ZERO
+            self._cost_notional = ZERO
         if q:
             self._cost_quantity += q
             self._cost_notional += q * price

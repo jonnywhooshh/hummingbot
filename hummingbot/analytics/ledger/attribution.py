@@ -34,28 +34,34 @@ def attribute(ledger: Ledger, t: int, *, mark: Optional[Decimal] = None) -> Attr
 
     fees includes only fees with a known fill-time mid. Unvalued fees with
     a known ending value enter residual and unvalued_fee_tokens identifies
-    them. Missing ending prices make equity and the split unavailable.
+    them. Missing ending prices make dependent values unavailable.
     versus_hold is unavailable whenever any external transfer was applied.
     """
     point = ledger.value(t, mark=mark)
     opening = ledger.opening
     net_pnl = inventory = book_unknown = residual = versus_hold = bps = None
+    missing = set(point.missing_tokens)
     if point.equity is not None:
         mid = point.mid
         net_pnl = point.equity - opening.E_open - ledger.external_flows
         inventory = (opening.pos_open * (mid - opening.mid_open)
                      + ledger._known_quantity * mid - ledger._known_mid_notional)
-        fee_end = ZERO
-        unknown_fee_end = ZERO
+        known_fee_end = ZERO
         for token, quantity in ledger.fees_by_token.items():
-            if not quantity:
+            known_quantity = quantity - ledger._unvalued_fee_quantities.get(token, ZERO)
+            if not known_quantity:
                 continue
             price = mid if token == ledger.base_token else ledger.token_mid(token, t)
-            fee_end += quantity * price
-            unknown_fee_end += ledger._unvalued_fee_quantities.get(token, ZERO) * price
-        inventory += ledger.fees_at_fill - (fee_end - unknown_fee_end)
+            if price is None:
+                missing.add(token)
+            else:
+                known_fee_end += known_quantity * price
         book_unknown = ledger._unknown_quantity * mid - ledger._unknown_notional
-        residual = net_pnl - (ledger.spread + inventory + book_unknown - ledger.fees_at_fill + ledger.funding)
+        if missing:
+            inventory = None
+        else:
+            inventory += ledger.fees_at_fill - known_fee_end
+            residual = net_pnl - (ledger.spread + inventory + book_unknown - ledger.fees_at_fill + ledger.funding)
         if not ledger.has_transfers:
             hold = opening.E_open + opening.pos_open * (mid - opening.mid_open)
             versus_hold = point.equity - hold
@@ -65,7 +71,7 @@ def attribute(ledger: Ledger, t: int, *, mark: Optional[Decimal] = None) -> Attr
     return Attribution(point.equity, net_pnl, ledger.spread, inventory, book_unknown, ledger.fees_at_fill,
                        ledger.funding, residual, versus_hold, ledger.turnover, bps, share,
                        dict(ledger.fees_by_token), dict(ledger.rebates_by_token),
-                       tuple(sorted(ledger.unvalued_fees)), point.missing_tokens, point.mark_valued)
+                       tuple(sorted(ledger.unvalued_fees)), tuple(sorted(missing)), point.mark_valued)
 
 
 @dataclass(frozen=True)
