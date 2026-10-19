@@ -267,7 +267,7 @@ class ConnectorBehaviorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(149.97, book.get_price(False))
 
     async def test_20000_depth_frames_fill_under_one_second(self):
-        async with connected_backpack(state_dir=self.temp.name) as (venue, connector, events):
+        async with connected_backpack() as (venue, connector, events):
             client_id = self.buy(connector)
             await events.next(MarketEvent.BuyOrderCreated)
             order = self.venue_order(venue, client_id)
