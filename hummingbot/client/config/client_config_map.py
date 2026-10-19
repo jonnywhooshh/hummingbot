@@ -1,4 +1,5 @@
 import json
+import logging
 import random
 import re
 from abc import ABC, abstractmethod
@@ -89,6 +90,28 @@ class MQTTBridgeConfigMap(BaseClientModel):
         json_schema_extra={"prompt": lambda cm: "Enable/Disable MQTT Autostart"},
     )
     model_config = ConfigDict(title="mqtt_bridge")
+
+
+class AnalyticsConfigMap(BaseClientModel):
+    enabled: bool = Field(default=False)
+    dir: str = Field(default="data/analytics", min_length=1)
+    book_levels: int = Field(default=20, ge=0)
+    log_level: str = Field(default="INFO")
+    queue_max_bytes: int = Field(default=268435456, ge=0)
+    priority_reserve_bytes: int = Field(default=67108864, ge=0)
+    flush_interval_ms: int = Field(default=100, gt=0)
+    segment_max_bytes: int = Field(default=67108864, gt=0)
+    segment_max_seconds: int = Field(default=600, gt=0)
+    min_free_bytes: int = Field(default=5368709120, ge=0)
+    hard_min_free_bytes: int = Field(default=1073741824, ge=0)
+    model_config = ConfigDict(title="analytics")
+
+    @field_validator("log_level")
+    @classmethod
+    def validate_log_level(cls, v: str):
+        if v not in logging.getLevelNamesMapping():
+            raise ValueError(f"Unknown log level {v!r}.")
+        return v
 
 
 class MarketDataCollectionConfigMap(BaseClientModel):
@@ -803,6 +826,12 @@ class ClientConfigMap(BaseClientModel):
     mqtt_bridge: MQTTBridgeConfigMap = Field(
         default=MQTTBridgeConfigMap(),
         description=('MQTT Bridge configuration.'),
+    )
+    analytics: AnalyticsConfigMap = Field(
+        default=AnalyticsConfigMap(),
+        description=("Market-making analytics capture (MARKET_MAKING_ANALYTICS_SPEC.md section 11)."
+                     "\nStock-image bots reject this block, so set it only in a credentials profile"
+                     "\nthat analytics-image bots use."),
     )
     send_error_logs: bool = Field(
         default=True,
