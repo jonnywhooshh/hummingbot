@@ -165,6 +165,7 @@ class FakeBackpackVenue:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             self._rest_log = (self.state_dir / "requests.jsonl").open("a")
             self._ws_log = (self.state_dir / "ws.jsonl").open("a")
+            self._schedule(self._flush_logs_forever())
         app = web.Application()
         app.router.add_get("/", self._ws)
         app.router.add_route("*", "/{tail:.+}", self._rest)
@@ -211,18 +212,27 @@ class FakeBackpackVenue:
                 await self._sub_changed.wait()
         await asyncio.wait_for(wait(), timeout)
 
+    def flush_logs(self):
+        for log in (self._rest_log, self._ws_log):
+            if log is not None and not log.closed:
+                log.flush()
+
+    async def _flush_logs_forever(self):
+        while True:
+            await asyncio.sleep(0.1)
+            self.flush_logs()
+
     def _log_ws(self, direction, connection, message_type, payload):
         if self._ws_log is not None:
             self._ws_log.write(json.dumps({"t_mono_ns": time.monotonic_ns(), "direction": direction,
                                           "connection_id": connection, "type": message_type, "payload": payload}) + "\n")
-            self._ws_log.flush()
 
     async def push(self, stream: str, data: dict) -> int:
         frame = json.dumps({"stream": stream, "data": data})
         targets = [ws for ws, streams in self.subscriptions.items() if stream in streams]
         self.ws_outbound.append((time.monotonic(), len(targets), data))
         for ws in targets:
-            self._log_ws("out", id(ws), "TEXT", json.loads(frame))
+            self._log_ws("out", id(ws), "TEXT", {"stream": stream, "data": data})
             await ws.send_str(frame)
         return len(targets)
 
@@ -286,7 +296,7 @@ class FakeBackpackVenue:
         if Decimal(quantity) != 0:
             self.positions.append(row)
         await self.push("account.positionUpdate", {"e": "positionUpdate", "E": now_ms() * 1000,
-                                                   "s": symbol, "q": quantity, "p": row["entryPrice"],
+                                                   "s": symbol, "q": quantity, "B": row["entryPrice"],
                                                    "P": unrealized_pnl, "M": self.mid})
         return row
 
