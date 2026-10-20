@@ -112,15 +112,16 @@ class BookReferenceTests(TestCase):
     def test_undefined_mid_is_invalid_without_falling_back_from_a_known_bot_book(self):
         bot = BookStream()
         bot.apply_snapshot({"lastUpdateId": 10, "bids": [], "asks": [["101", "1"]]}, timestamp_ns=0)
-        bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=3 * SECOND)
+        bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=SECOND // 2)
+        bot.apply_diff({"U": 12, "u": 12, "b": [], "a": []}, timestamp_ns=3 * SECOND)
         reference = BookReference(bot, sidecar=stream_with_move(), run_end_ns=4 * SECOND)
         observation = reference.observe(SECOND, SECOND)
         self.assertEqual("invalid", observation.status)
-        self.assertEqual("book_unknown", observation.reason)
+        self.assertEqual("mid_undefined", observation.reason)
         self.assertEqual("bot", observation.source)
         self.assertIsNone(observation.m0)
         self.assertIsNone(observation.mh)
-        self.assertFalse(reference.known(SECOND))
+        self.assertTrue(reference.known(SECOND))
 
     def test_receipt_clock_is_labeled_and_not_mixed_with_venue_clock(self):
         receipt = stream_with_move(clock_basis="receipt")
@@ -144,3 +145,49 @@ class BookReferenceTests(TestCase):
             reference.observe(0.5, SECOND)
         with self.assertRaises(TypeError):
             reference.observe(SECOND, 0.5)
+
+    def test_unknown_fill_is_invalid_before_a_pending_horizon(self):
+        reference = BookReference(stream_with_move(gap=True), run_end_ns=4 * SECOND)
+        observation = reference.observe(3 * SECOND, 15 * SECOND)
+        self.assertEqual("invalid", observation.status)
+        self.assertEqual("book_unknown", observation.reason)
+        self.assertIsNone(observation.m0)
+        self.assertIsNone(observation.mh)
+
+    def test_undefined_horizon_mid_is_not_an_unknown_book(self):
+        bot = stream_with_move()
+        bot.apply_diff({"U": 14, "u": 14, "b": [["97", "0"]], "a": []}, timestamp_ns=4 * SECOND)
+        reference = BookReference(bot, sidecar=stream_with_move(), run_end_ns=5 * SECOND)
+        observation = reference.observe(2 * SECOND, 2 * SECOND)
+        self.assertTrue(reference.known(4 * SECOND))
+        self.assertEqual("invalid", observation.status)
+        self.assertEqual("mid_undefined", observation.reason)
+        self.assertEqual("bot", observation.mh_source)
+        self.assertIsNone(observation.mh)
+
+    def test_receipt_clock_sidecar_cannot_compare_process_clocks(self):
+        with self.assertRaises(ValueError):
+            BookReference(stream_with_move(clock_basis="receipt"),
+                          sidecar=stream_with_move(clock_basis="receipt"), run_end_ns=4 * SECOND)
+
+    def test_sidecar_m0_and_bot_mh_keep_the_sidecar_source(self):
+        bot = BookStream()
+        bot.apply_snapshot({"lastUpdateId": 10, "bids": [["97", "1"]], "asks": [["99", "1"]]},
+                           timestamp_ns=2 * SECOND)
+        bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=2 * SECOND)
+        bot.apply_diff({"U": 12, "u": 12, "b": [], "a": []}, timestamp_ns=3 * SECOND)
+        observation = BookReference(bot, sidecar=stream_with_move(), run_end_ns=4 * SECOND).observe(
+            SECOND + SECOND // 2, SECOND + SECOND // 2)
+        self.assertEqual("valid", observation.status)
+        self.assertEqual("sidecar", observation.m0_source)
+        self.assertEqual("bot", observation.mh_source)
+        self.assertEqual("sidecar", observation.source)
+
+    def test_sidecar_same_time_diff_flags_a_bot_reference(self):
+        sidecar = stream_with_move()
+        sidecar.apply_diff({"U": 14, "u": 14, "b": [], "a": []}, timestamp_ns=4 * SECOND)
+        bot = stream_with_move()
+        bot.apply_diff({"U": 14, "u": 14, "b": [], "a": []}, timestamp_ns=5 * SECOND)
+        observation = BookReference(bot, sidecar=sidecar, run_end_ns=5 * SECOND).observe(4 * SECOND, 0)
+        self.assertEqual("bot", observation.source)
+        self.assertTrue(observation.m0_tie_uncertain)
