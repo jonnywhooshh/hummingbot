@@ -12,7 +12,7 @@ caller's Decimal context. Zero always serializes without a negative sign.
 """
 
 from dataclasses import dataclass
-from decimal import Context, Decimal, ROUND_HALF_EVEN, localcontext
+from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 from fractions import Fraction
 from typing import Literal, Optional
 
@@ -37,7 +37,6 @@ class MarkoutObservation:
         return self.reference.clock_basis
 
 
-
 def _decimal(value: Fraction) -> Decimal:
     if not value:
         return Decimal(0)
@@ -55,6 +54,7 @@ def _decimal(value: Fraction) -> Decimal:
         return Decimal((int(coefficient < 0), tuple(map(int, str(abs(coefficient)))), -scale))
     with localcontext(Context(prec=80, rounding=ROUND_HALF_EVEN)):
         return Decimal(value.numerator) / Decimal(value.denominator)
+
 
 def compute_markout(
     *,

@@ -1,5 +1,5 @@
 from dataclasses import replace
-from decimal import Decimal, Inexact, ROUND_DOWN, localcontext
+from decimal import ROUND_DOWN, Decimal, Inexact, localcontext
 from fractions import Fraction
 from unittest import TestCase
 

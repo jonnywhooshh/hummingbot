@@ -21,6 +21,7 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from decimal import Context, Decimal, localcontext
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Iterable, Literal, Mapping, Optional, Sequence, Tuple
 
 ClockBasis = Literal["venue", "receipt"]
@@ -66,14 +67,24 @@ class _Stretch:
         self.end_ns = point.timestamp_ns
 
 
+def _level(price: Any, quantity: Any) -> Tuple[Decimal, Decimal]:
+    if isinstance(price, float) or isinstance(quantity, float):
+        raise TypeError("Depth prices and quantities must not pass through float")
+    price, quantity = Decimal(price), Decimal(quantity)
+    if not price.is_finite() or price <= 0 or not quantity.is_finite() or quantity < 0:
+        raise ValueError("Depth requires positive finite prices and nonnegative finite quantities")
+    return price, quantity
+
+
+@lru_cache(maxsize=16384)
+def _string_level(price: str, quantity: str) -> Tuple[Decimal, Decimal]:
+    return _level(price, quantity)
+
+
 def _levels(rows: Iterable[Sequence[Any]]) -> Iterable[Tuple[Decimal, Decimal]]:
     for price, quantity in rows:
-        if isinstance(price, float) or isinstance(quantity, float):
-            raise TypeError("Depth prices and quantities must not pass through float")
-        price, quantity = Decimal(price), Decimal(quantity)
-        if not price.is_finite() or price <= 0 or not quantity.is_finite() or quantity < 0:
-            raise ValueError("Depth requires positive finite prices and nonnegative finite quantities")
-        yield price, quantity
+        yield (_string_level(price, quantity) if isinstance(price, str) and isinstance(quantity, str)
+               else _level(price, quantity))
 
 
 class BookStream:

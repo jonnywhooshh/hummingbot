@@ -176,7 +176,7 @@ class BookStreamTests(TestCase):
 
     def test_equal_and_lagging_hourly_snapshots_preserve_continuity(self):
         stream = BookStream()
-        stream.apply_snapshot(snapshot(), timestamp_ns=10)
+        stream.apply_snapshot(snapshot(), timestamp_ns=0)
         stream.apply_diff(diff(11), timestamp_ns=1)
         stream.apply_diff(diff(12, bids=[["99", "0"], ["97", "1"]]), timestamp_ns=2)
         for uid in (12, 10):
@@ -232,7 +232,7 @@ class BookStreamTests(TestCase):
     def test_mid_uses_best_prices_and_ignores_zero_snapshot_levels(self):
         stream = BookStream()
         stream.apply_snapshot(snapshot(bids=[["99", "2"], ["98", "3"], ["100", "0"]],
-                                       asks=[["103", "2"], ["101", "1"], ["100", "0"]]), timestamp_ns=0)
+                                       asks=[["103", "2"], ["101", "1"], ["100.5", "0"]]), timestamp_ns=0)
         stream.apply_diff(diff(11), timestamp_ns=1)
         self.assertEqual(Decimal("100"), stream.mid_at(1))
 
@@ -245,3 +245,18 @@ class BookStreamTests(TestCase):
                                       timestamp_ns=0)
                 stream.apply_diff(diff(11), timestamp_ns=1)
                 self.assertEqual(Decimal("100.000000000000000000000000005"), stream.mid_at(1))
+
+    def test_repeated_levels_still_reject_floats_and_invalid_quantities(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(), timestamp_ns=0)
+        stream.apply_diff(diff(11, bids=[["99", "1"]]), timestamp_ns=1)
+        for price, quantity, exception in (
+            (99.0, "1", TypeError), ("99", 1.0, TypeError),
+            ("99", "-1", ValueError), ("99", "NaN", ValueError),
+            (Decimal("sNaN"), "1", ValueError),
+        ):
+            with self.subTest(price=price, quantity=quantity):
+                with self.assertRaises(exception):
+                    stream.apply_diff(diff(12, bids=[[price, quantity]]), timestamp_ns=2)
+        stream.apply_diff(diff(12, bids=[["99", "0"], ["98", "1"]]), timestamp_ns=2)
+        self.assertEqual(Decimal("99.5"), stream.mid_at(2))
