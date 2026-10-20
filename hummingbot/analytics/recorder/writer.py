@@ -43,6 +43,7 @@ class Writer:
         self.free_bytes: Optional[int] = None
         self.written = 0
         self.disk_dropped = 0
+        self.disk_dropped_priority = 0
         self.segments_closed = 0
         self.errors = 0
         self.clean = False
@@ -56,6 +57,9 @@ class Writer:
         self._finish: Optional[Finish] = None
         self._lock = threading.Lock()
         self._wake = threading.Event()
+        self._drain_requested = False
+        self._drain_complete = False
+        self._drained = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="analytics-writer", daemon=True)
 
     def start(self) -> None:
@@ -70,6 +74,13 @@ class Writer:
     def resume(self) -> None:
         self._paused = False
         self._wake.set()
+
+    def drain(self, deadline: float) -> bool:
+        self._drain_requested = True
+        self._wake.set()
+        if self._thread.is_alive():
+            self._drained.wait(max(0.0, deadline - time.monotonic()))
+        return self._drain_complete
 
     def finish(self, run_json: Optional[bytes], deadline: float) -> bool:
         self._finish = Finish(run_json, deadline)
@@ -104,6 +115,7 @@ class Writer:
             logger.exception("Analytics writer stopped writing %s.", self.run_dir)
         finally:
             self._give_up()
+            self._drained.set()
 
     def _step(self) -> bool:
         self._check_disk()
@@ -132,6 +144,10 @@ class Writer:
         if self.state not in (DiskState.FULL, DiskState.FAILED) and segment is not None and segment.opened is not None \
                 and time.monotonic() - segment.opened >= self.segment_max_seconds:
             self._close_segment()
+        if self._drain_requested and not self._drain_complete and not len(self.queue):
+            self._sync()
+            self._drain_complete = True
+            self._drained.set()
         finish = self._finish
         if finish is None or len(self.queue):
             return False
@@ -151,6 +167,7 @@ class Writer:
         if state is DiskState.OK or (state is DiskState.LOW and priority):
             return True
         self.disk_dropped += 1
+        self.disk_dropped_priority += priority
         if state is not DiskState.FAILED and state not in self._gaps_written:
             self._gaps_written.add(state)
             gap_seq, line = self.make_gap(state.value, seq, None, None, state is DiskState.FULL)
