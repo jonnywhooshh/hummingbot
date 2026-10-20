@@ -72,14 +72,20 @@ class FundingPayment:
 
 @dataclass(frozen=True)
 class Transfer:
-    """A quote-denominated external flow, positive for a deposit."""
+    """An external token flow, positive for a deposit. None means quote."""
 
     t: int
     amount: Decimal
+    token: Optional[str] = None
 
     def __post_init__(self):
         venue_time(self.t)
         decimal_amount(self.amount, "amount")
+        if self.token is not None:
+            if not isinstance(self.token, str):
+                raise TypeError("token must be a string or None for the ledger quote")
+            if not self.token:
+                raise ValueError("token must not be empty")
 
 
 @dataclass(frozen=True)

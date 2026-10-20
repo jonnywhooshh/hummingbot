@@ -1,17 +1,10 @@
 from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal as D
+from test.hummingbot.analytics.ledger import Prices
 
 import pytest
 
 from hummingbot.analytics.ledger import Fill, FundingPayment, Ledger, Opening, Transfer
-
-
-class Prices:
-    def __init__(self, values=None):
-        self.values = values or {}
-
-    def mid(self, token, t):
-        return self.values.get((token, t), D("100") if token == "SOL" else None)
 
 
 def test_spot_criterion_10():
@@ -76,6 +69,11 @@ def test_cost_methods_match_equity_but_not_realized_pnl():
             assert ledgers[1].value(3).realized_pnl == D("30")
             assert ledgers[0].value(3).entry_price == D("100")
             assert ledgers[1].value(3).entry_price == D("110")
+        if event.t == 4:
+            assert ledgers[0].value(4).realized_pnl == D("25")
+            assert ledgers[1].value(4).realized_pnl == D("25")
+            assert ledgers[0].value(4).entry_price == D("105")
+            assert ledgers[1].value(4).entry_price == D("105")
     assert ledgers[0].value(5).entry_price is None
     assert ledgers[1].value(5).realized_pnl == D("30")
 
@@ -207,3 +205,78 @@ def test_fifo_entry_averages_all_remaining_lots():
     ledger.apply(Fill(3, "sell", D("2"), D("120")))
     assert ledger.value(3).entry_price == D("110")
     assert ledger.value(3).realized_pnl == D("40")
+
+
+@pytest.mark.parametrize("method", ["wac", "fifo"])
+def test_spot_base_fee_removes_cost_lots_without_a_fake_gain(method):
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices(), market="spot", cost_method=method)
+    ledger.apply(Fill(1, "buy", D("1"), D("100"), D("0.01"), "SOL"))
+    assert ledger.value(1).entry_price == D("100")
+    ledger.apply(Fill(2, "sell", D("0.99"), D("100")))
+    assert ledger.value(2).position == D("0")
+    assert ledger.value(2).entry_price is None
+    ledger.apply(Fill(3, "buy", D("1"), D("120")))
+    assert ledger.value(3).entry_price == D("120")
+    ledger.apply(Fill(4, "sell", D("1"), D("130")))
+    assert ledger.value(4).realized_pnl == D("10")
+    assert ledger.value(4).entry_price is None
+
+
+def test_unknown_spot_opening_basis_is_not_invented():
+    ledger = Ledger(Opening(D("1100"), 0, D("100"), D("1")), Prices(), market="spot")
+    assert ledger.value(0).entry_price is None
+    ledger.apply(Fill(1, "sell", D("1"), D("110")))
+    assert ledger.value(1).realized_pnl is None
+    assert ledger.value(1).equity == D("1110")
+
+
+@pytest.mark.parametrize("market", ["spot", "perpetual"])
+def test_base_transfer_is_a_token_flow_not_a_synthetic_fill(market):
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices({("SOL", 2): D("110")}), market=market)
+    ledger.apply(Transfer(1, D("1"), "SOL"))
+    point = ledger.value(2)
+    assert point.equity == D("1110")
+    assert point.external_flows == D("100")
+    assert point.net_pnl == D("10")
+    assert point.position == (D("1") if market == "spot" else D("0"))
+    assert ledger.turnover == D("0")
+    assert ledger.base_valuation_exposure == D("1")
+
+
+def test_unpriced_transfer_has_unknown_flow_but_known_ending_equity():
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices({("BNB", 2): D("20")}))
+    ledger.apply(Transfer(1, D("1"), "BNB"))
+    point = ledger.value(2)
+    assert point.equity == D("1020")
+    assert point.external_flows is None
+    assert point.net_pnl is None
+    assert point.unvalued_transfer_tokens == ("BNB",)
+
+
+def test_perpetual_fee_token_mid_is_not_the_contract_mark():
+    prices = Prices({("SOL-PERP", 1): D("100"), ("SOL-PERP", 2): None,
+                     ("SOL", 1): D("90"), ("SOL", 2): D("95")})
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), prices, instrument="SOL-PERP")
+    ledger.apply(Fill(1, "buy", D("1"), D("100"), D("0.01"), "SOL"))
+    point = ledger.value(2, mark=D("110"))
+    assert point.equity == D("1009.05")
+    assert point.mark_valued
+
+
+@pytest.mark.parametrize("fee", [D("0.01"), D("-0.01")])
+def test_perpetual_base_valuation_exposure_includes_token_fees(fee):
+    ledger = Ledger(Opening(D("100"), 0, D("100")), Prices())
+    ledger.apply(Fill(1, "buy", D("1"), D("100"), fee, "SOL"))
+    assert ledger.position == D("1")
+    assert ledger.base_valuation_exposure == D("1") - fee
+
+
+@pytest.mark.parametrize("field", ["base_token", "quote_token"])
+def test_token_identifiers_reject_non_strings(field):
+    with pytest.raises(TypeError):
+        Ledger(Opening(D("100"), 0, D("100")), Prices(), **{field: 0.5})
+
+
+def test_fee_identifier_rejects_non_string():
+    with pytest.raises(TypeError):
+        Fill(1, "buy", D("1"), D("100"), fee_token=0.5)
