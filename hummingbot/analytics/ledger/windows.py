@@ -1,4 +1,8 @@
-"""Venue-time windows use integer nanoseconds from one run directory."""
+"""Venue-time windows retain their clock basis within one run directory.
+
+Server-time samples take precedence over estimated offsets in that run.
+Only a run without server-time samples uses offset_estimated windows.
+"""
 
 from bisect import bisect_left
 from dataclasses import dataclass
@@ -11,12 +15,15 @@ from hummingbot.analytics.ledger.model import venue_time
 class Window:
     start: int
     end: int
+    basis: str = "server_time"
 
     def __post_init__(self):
         venue_time(self.start)
         venue_time(self.end)
         if self.end < self.start:
             raise ValueError("window ends before it starts")
+        if self.basis not in ("server_time", "offset_estimated", "mixed"):
+            raise ValueError("unknown window clock basis")
 
     @property
     def midpoint(self) -> int:
@@ -53,8 +60,10 @@ class VenueClock:
         grouped = {}
         for sample in samples:
             grouped.setdefault(sample.run_id, []).append(sample)
+        selected = {run: [sample for sample in values if sample.basis == "server_time"]
+                    or values for run, values in grouped.items()}
         self._samples = {run: sorted(values, key=lambda sample: sample.local_midpoint)
-                         for run, values in grouped.items()}
+                         for run, values in selected.items()}
         self._times = {run: [sample.local_midpoint for sample in values]
                        for run, values in self._samples.items()}
 
@@ -67,7 +76,7 @@ class VenueClock:
         candidates = samples[max(0, index - 1):index + 1]
         sample = min(candidates, key=lambda value: abs(value.local_midpoint - local.midpoint))
         return Window(sent_ns + sample.offset_ns - sample.uncertainty_ns,
-                      received_ns + sample.offset_ns + sample.uncertainty_ns)
+                      received_ns + sample.offset_ns + sample.uncertainty_ns, sample.basis)
 
 
 def estimated_clock(run_id: str, receipts: Iterable[tuple[int, int]]) -> ClockSample:

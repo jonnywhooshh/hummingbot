@@ -1,6 +1,5 @@
 from dataclasses import replace
 from decimal import Decimal as D
-from itertools import product
 from random import Random
 
 import pytest
@@ -83,13 +82,15 @@ def test_no_responses_and_missing_opening_mid():
         def mid(self, token, t):
             return None
 
-    with pytest.raises(ValueError, match="opening mid"):
-        open_ledger([balance(1, 2)], [position(3, 4)], [], Missing())
+    result = open_ledger([balance(1, 2)], [position(3, 4)], [], Missing())
+    assert result.selection.status == "opening_unresolved"
+    assert result.selection.reason == "opening_mid_unavailable"
 
 
 def test_cut_is_symmetric_and_preserves_post_opening_events():
     event = Transfer(8, D("4"))
-    opened = open_ledger([balance(5, 6)], [position(1, 2)], [event], Prices(), market="spot")
+    opened = open_ledger([balance(5, 6, token_balances={"USDC": D("100")})],
+                         [position(1, 2)], [event], Prices(), market="spot")
     assert opened.selection.status == "resolved"
     assert opened.selection.cut.window == Window(1, 6)
     assert opened.events == (event,)
@@ -103,11 +104,18 @@ def test_cut_finder_matches_all_pairs_reference():
         balances = [balance(start, start + rng.randrange(4)) for start in rng.sample(range(30), 4)]
         positions = [position(start, start + rng.randrange(4)) for start in rng.sample(range(30), 4)]
         events = [Transfer(t, D("1")) for t in rng.sample(range(35), 8)]
-        valid = [max(b.window.end, p.window.end) for b, p in product(balances, positions)
+        valid = [(max(b.window.end, p.window.end), bi, pi) for bi, b in enumerate(balances)
+                 for pi, p in enumerate(positions)
                  if not any(min(b.window.start, p.window.start) <= e.t <= max(b.window.end, p.window.end)
                             for e in events)]
         result = find_quiet_cut(balances, positions, events)
-        assert (result.cut.window.end if result.cut else None) == (min(valid) if valid else None)
+        if valid:
+            end, bi, pi = min(valid)
+            assert result.cut.window.end == end
+            assert result.cut.balance == balances[bi]
+            assert result.cut.position == positions[pi]
+        else:
+            assert result.cut is None
 
 
 @pytest.mark.parametrize("t", [2, 4])
@@ -174,6 +182,76 @@ def test_position_and_equity_definition_boundaries():
         position(1, 2, "1", "0")
     with pytest.raises(ValueError, match="definition"):
         balance(1, 2).equity("unknown")
-    with pytest.raises(ValueError, match="unavailable"):
-        balance(1, 2).equity("netEquity_plus_unrealized")
+    assert balance(1, 2).equity("netEquity_plus_unrealized") is None
     assert balance(1, 2, unrealized_pnl=D("3")).equity("netEquity_plus_unrealized") == D("103")
+
+
+def test_equal_completion_uses_original_input_order_for_opening_anchor():
+    balances = [balance(10, 20, "102"), balance(0, 5)]
+    opened = open_ledger(balances, [position(30, 40, "1", "99")], [], Prices())
+    assert opened.selection.cut.balance == balances[0]
+    assert opened.ledger.opening.t_open == 15
+    assert opened.ledger.opening.E_open == opened.ledger.opening.mid_open == D("102")
+
+
+def test_opening_skips_balance_without_the_chosen_equity_definition():
+    balances = [balance(0, 2), balance(10, 12, unrealized_pnl=D("1"))]
+    opened = open_ledger(balances, [position(3, 4)], [], Prices(),
+                         equity_definition="netEquity_plus_unrealized")
+    assert opened.selection.cut.balance == balances[1]
+    assert opened.equity_definition == "netEquity_plus_unrealized"
+    assert opened.ledger.opening.E_open == D("101")
+
+
+def test_opening_skips_a_quiet_cut_without_a_mid():
+    class InitiallyUnknown:
+        def mid(self, token, t):
+            return None if t < 10 else D("100")
+
+    balances = [balance(0, 2), balance(10, 12)]
+    opened = open_ledger(balances, [position(3, 4)], [], InitiallyUnknown())
+    assert opened.selection.cut.balance == balances[1]
+    assert opened.ledger.opening.mid_open == D("100")
+
+
+def test_backfill_responses_cannot_resolve_an_in_run_opening():
+    fill = Fill(1, "buy", D("1"), D("99"))
+    balances = [balance(0, 2), balance(20, 22, backfill=True)]
+    positions = [position(0, 2), replace(position(20, 22), backfill=True)]
+    opened = open_ledger(balances, positions, [fill], Prices())
+    assert opened.selection.status == "opening_unresolved"
+    assert opened.selection.overlapping_fills == (fill,)
+    assert opened.events == (fill,)
+    assert find_quiet_cut([balances[0]], [positions[1]], []).cut is None
+
+
+def test_explicit_run_boundary_excludes_late_ordinary_responses():
+    opened = open_ledger([balance(20, 22)], [position(20, 22)], [], Prices(), run_end=10)
+    assert opened.selection.status == "opening_unresolved"
+
+
+def test_opening_exposes_the_mark_minus_mid_difference():
+    opened = open_ledger([replace(balance(0, 2), mark=D("103"))], [position(3, 4)], [], Prices())
+    assert opened.opening_valuation_difference == D("3")
+
+
+def test_spot_opening_uses_reported_token_balances_not_net_equity_or_contract_position():
+    response = balance(0, 2, "1000", token_balances={"SOL": D("1"), "USDC": D("1000")})
+    opened = open_ledger([response], [position(3, 4, "9", "99")], [], Prices(), market="spot")
+    assert opened.ledger.opening.E_open == D("1100")
+    assert opened.ledger.position == D("1")
+    assert opened.ledger.value(5).equity == D("1100")
+
+
+def test_server_clock_samples_take_precedence_over_estimated_offsets():
+    clock = VenueClock([clock_sample("bot", 0, 2, 101), estimated_clock("bot", [(11, 1011)]),
+                        clock_sample("bot", 20, 22, 121)])
+    assert clock.response_window("bot", 10, 12) == Window(109, 113)
+    assert clock.response_window("bot", 10, 12).basis == "server_time"
+
+
+def test_estimated_clock_basis_reaches_the_response_window():
+    clock = VenueClock([estimated_clock("bot", [(110, 15), (120, 30)])])
+    window = clock.response_window("bot", 130, 132)
+    assert (window.start, window.end) == (40, 42)
+    assert window.basis == "offset_estimated"
