@@ -1,0 +1,207 @@
+import logging
+import os
+import threading
+import time
+from enum import Enum
+from pathlib import Path
+from typing import Callable, NamedTuple, Optional, Tuple
+
+from hummingbot.analytics.recorder.queue import CaptureQueue
+from hummingbot.analytics.recorder.segments import Abandoned, ActiveSegment, write_run_json
+
+BATCH_BYTES = 64 * 1024
+BATCH_ITEMS = 256
+logger = logging.getLogger(__name__)
+GapFactory = Callable[[str, int, Optional[int], Optional[int], bool], Tuple[int, bytes]]
+
+
+class DiskState(Enum):
+    OK = "ok"
+    LOW = "disk_low"
+    FULL = "disk_full"
+    FAILED = "failed"
+
+
+class Finish(NamedTuple):
+    run_json: Optional[bytes]
+    deadline: float
+
+
+class Writer:
+    """Own all run files. Hook bodies arrive only as immutable bytes, never as live bot objects."""
+
+    def __init__(self, run_dir: Path, settings, queue: CaptureQueue, make_gap: GapFactory):
+        self.run_dir = run_dir
+        self.queue = queue
+        self.make_gap = make_gap
+        self.interval = settings.flush_interval_ms / 1000
+        self.segment_max_bytes = settings.segment_max_bytes
+        self.segment_max_seconds = settings.segment_max_seconds
+        self.min_free_bytes = settings.min_free_bytes
+        self.hard_min_free_bytes = settings.hard_min_free_bytes
+        self.state = DiskState.OK
+        self.free_bytes: Optional[int] = None
+        self.written = 0
+        self.disk_dropped = 0
+        self.segments_closed = 0
+        self.errors = 0
+        self.clean = False
+        self.run_json: Optional[bytes] = None
+        self._run_json_written: Optional[bytes] = None
+        self._segment: Optional[ActiveSegment] = None
+        self._next_number = 1
+        self._gaps_written = set()
+        self._last_sync = time.monotonic()
+        self._paused = False
+        self._finish: Optional[Finish] = None
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="analytics-writer", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def pause(self) -> None:
+        """Wait for the current writer batch, then stop dequeuing. Hooks never acquire this lock."""
+        self._paused = True
+        with self._lock:
+            pass
+
+    def resume(self) -> None:
+        self._paused = False
+        self._wake.set()
+
+    def finish(self, run_json: Optional[bytes], deadline: float) -> bool:
+        self._finish = Finish(run_json, deadline)
+        self._wake.set()
+        self._thread.join(max(0.0, deadline - time.monotonic()))
+        return self.clean and not self._thread.is_alive()
+
+    def _check_deadline(self) -> None:
+        finish = self._finish
+        if finish is not None and time.monotonic() >= finish.deadline:
+            raise Abandoned()
+
+    def _loop(self) -> None:
+        try:
+            self._segment = ActiveSegment(self.run_dir, self._next_number)
+            self._next_number += 1
+            while True:
+                self._check_deadline()
+                if not self._paused:
+                    with self._lock:
+                        if not self._paused and self._step():
+                            return
+                if not self._paused and len(self.queue):
+                    continue
+                self._wake.wait(self.interval)
+                self._wake.clear()
+        except Abandoned:
+            pass
+        except Exception:
+            self.errors += 1
+            self.state = DiskState.FAILED
+            logger.exception("Analytics writer stopped writing %s.", self.run_dir)
+        finally:
+            self._give_up()
+
+    def _step(self) -> bool:
+        self._check_disk()
+        self._write_run_json(self.run_json)
+        size = 0
+        for _ in range(BATCH_ITEMS):
+            self._check_deadline()
+            item = self.queue.pop()
+            if item is None:
+                break
+            seq, priority, line = item
+            if self._admit(seq, priority):
+                self._append(seq, line)
+            size += len(line)
+            if size >= BATCH_BYTES:
+                break
+        if self.state not in (DiskState.FULL, DiskState.FAILED):
+            for first, last, priority in self.queue.take_drops():
+                seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
+                self._append(seq, line)
+        if self._segment is not None:
+            self._segment.flush()
+        if time.monotonic() - self._last_sync >= self.interval:
+            self._sync()
+        segment = self._segment
+        if self.state not in (DiskState.FULL, DiskState.FAILED) and segment is not None and segment.opened is not None \
+                and time.monotonic() - segment.opened >= self.segment_max_seconds:
+            self._close_segment()
+        finish = self._finish
+        if finish is None or len(self.queue):
+            return False
+        self._check_deadline()
+        if self.state in (DiskState.FULL, DiskState.FAILED) or finish.run_json is None:
+            self._sync()
+            return True
+        if self._segment is not None and self._segment.records:
+            self._close_segment()
+        self._write_run_json(finish.run_json)
+        self._check_deadline()
+        self.clean = True
+        return True
+
+    def _admit(self, seq: int, priority: bool) -> bool:
+        state = self.state
+        if state is DiskState.OK or (state is DiskState.LOW and priority):
+            return True
+        self.disk_dropped += 1
+        if state is not DiskState.FAILED and state not in self._gaps_written:
+            self._gaps_written.add(state)
+            gap_seq, line = self.make_gap(state.value, seq, None, None, state is DiskState.FULL)
+            self._append(gap_seq, line, rotate=False)
+            self._sync()
+        return False
+
+    def _append(self, seq: int, line: bytes, rotate: bool = True) -> None:
+        segment = self._segment
+        if rotate and segment is not None and segment.records and segment.size + len(line) > self.segment_max_bytes:
+            self._close_segment()
+            segment = None
+        if segment is None:
+            segment = self._segment = ActiveSegment(self.run_dir, self._next_number)
+            self._next_number += 1
+        segment.add(seq, line)
+        self.written += 1
+
+    def _close_segment(self) -> None:
+        self._segment.close(self._check_deadline)
+        self._segment = None
+        self.segments_closed += 1
+        self._last_sync = time.monotonic()
+
+    def _sync(self) -> None:
+        if self._segment is not None:
+            self._segment.sync()
+        self._last_sync = time.monotonic()
+
+    def _check_disk(self) -> None:
+        stat = os.statvfs(self.run_dir)
+        self.free_bytes = stat.f_bavail * stat.f_frsize
+        before = self.state
+        if before in (DiskState.OK, DiskState.LOW):
+            if self.free_bytes < self.hard_min_free_bytes:
+                self.state = DiskState.FULL
+            elif self.free_bytes < self.min_free_bytes:
+                self.state = DiskState.LOW
+        if self.state is not before:
+            logger.warning("Analytics capture under %s has %d bytes free and is now %s.", self.run_dir,
+                           self.free_bytes, self.state.value)
+
+    def _write_run_json(self, data: Optional[bytes]) -> None:
+        if data is not None and data is not self._run_json_written and self.state not in (DiskState.FULL, DiskState.FAILED):
+            write_run_json(self.run_dir, data, self._check_deadline)
+            self._run_json_written = data
+
+    def _give_up(self) -> None:
+        segment, self._segment = self._segment, None
+        if segment is not None:
+            try:
+                segment.abandon()
+            except OSError:
+                self.errors += 1

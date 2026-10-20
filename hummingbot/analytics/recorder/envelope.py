@@ -49,10 +49,10 @@ def encode_body(body: Dict[str, Any]) -> str:
 def frame(seq: int, run_id: str, kind: str, t_wall_ns: int, t_mono_ns: int, hook_ns: int,
           connector: Optional[str], trading_pair: Optional[str], controller_id: Optional[str],
           executor_id: Optional[str], client_order_id: Optional[str], exchange_order_id: Optional[str],
-          body_json: str) -> bytes:
+          body_json: str, payload_bytes: int = 0) -> bytes:
     head = ujson.dumps({
         "seq": seq, "run_id": run_id, "kind": kind, "t_wall_ns": t_wall_ns, "t_mono_ns": t_mono_ns,
-        "hook_ns": hook_ns, "connector": connector, "trading_pair": trading_pair,
+        "hook_ns": hook_ns, "payload_bytes": payload_bytes, "connector": connector, "trading_pair": trading_pair,
         "controller_id": controller_id, "executor_id": executor_id,
         "client_order_id": client_order_id, "exchange_order_id": exchange_order_id,
     }, ensure_ascii=False, escape_forward_slashes=False)
@@ -66,11 +66,19 @@ def gap_line(seq: int, run_id: str, gap_type: str, first_seq: int, last_seq: Opt
     size = "null" if count is None else str(count)
     priority = "true" if priority_dropped else "false"
     return (f'{{"seq":{seq},"run_id":"{run_id}","kind":"capture_gap",'
-            f'"t_wall_ns":{time_ns()},"t_mono_ns":{monotonic_ns()},"hook_ns":0,'
+            f'"t_wall_ns":{time_ns()},"t_mono_ns":{monotonic_ns()},"hook_ns":0,"payload_bytes":0,'
             '"connector":null,"trading_pair":null,"controller_id":null,"executor_id":null,'
             '"client_order_id":null,"exchange_order_id":null,'
             f'"body":{{"type":"{gap_type}","first_seq":{first_seq},"last_seq":{last},'
             f'"count":{size},"priority_dropped":{priority}}}}}\n').encode("ascii")
+
+
+def payload_size(body: Dict[str, Any], body_json: str) -> int:
+    if "text" in body:
+        return len(body["text"].encode("utf-8"))
+    if "b64" in body:
+        return len(body["b64"]) * 3 // 4 - len(body["b64"]) + len(body["b64"].rstrip("="))
+    return len(body_json.encode("utf-8"))
 
 
 def payload(data: Union[str, bytes, bytearray, memoryview]) -> Dict[str, str]:
