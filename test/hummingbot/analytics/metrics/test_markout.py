@@ -1,4 +1,6 @@
-from decimal import Decimal
+from dataclasses import replace
+from decimal import Decimal, Inexact, ROUND_DOWN, localcontext
+from fractions import Fraction
 from unittest import TestCase
 
 from hummingbot.analytics.book.reference import BookReference
@@ -107,3 +109,57 @@ class MarkoutTests(TestCase):
                     compute_markout(**arguments)
         with self.assertRaises(ValueError):
             compute_markout(side="hold", quantity=Decimal("1"), price=Decimal("99"), reference=reference)
+
+    def test_all_financial_outputs_preserve_exact_decimal_digits(self):
+        reference = replace(self.reference(), m0=Decimal("1"),
+                            mh=Decimal("1.987654321098765432109876543210987654321"))
+        for precision in (6, 28):
+            with self.subTest(precision=precision), localcontext() as context:
+                context.prec = precision
+                result = compute_markout(
+                    side="buy", quantity=Decimal("2"),
+                    price=Decimal("0.123456789012345678901234567890123456789"),
+                    reference=reference, fee_quote=Decimal("0.000000123"))
+                expected = {
+                    "edge_bps": "8765.43210987654321098765432109876543211",
+                    "drift_bps": "9876.54321098765432109876543210987654321",
+                    "markout_bps": "18641.97532086419753208641975320864197532",
+                    "edge_value": "1.753086421975308642197530864219753086422",
+                    "drift_value": "1.975308642197530864219753086421975308642",
+                    "markout_value": "3.728395064172839506417283950641728395064",
+                    "fee_adjusted_markout_bps": "18641.97470586419753208641975320864197532",
+                    "fee_adjusted_markout_value": "3.728394941172839506417283950641728395064",
+                }
+                for name, value in expected.items():
+                    self.assertEqual(Decimal(value), getattr(result, name), name)
+
+    def test_terminating_outputs_are_not_limited_to_eighty_digits(self):
+        price = Decimal("0." + "1234567890" * 12)
+        reference = replace(self.reference(), m0=Decimal("1"), mh=Decimal("1"))
+        result = compute_markout(side="buy", quantity=Decimal("1"), price=price, reference=reference)
+        self.assertEqual(10000 * (1 - Fraction(price)), Fraction(result.edge_bps))
+        self.assertEqual(1 - Fraction(price), Fraction(result.markout_value))
+
+    def test_repeating_bps_have_a_stable_rounding_policy(self):
+        reference = replace(self.reference(), m0=Decimal("3"), mh=Decimal("2"))
+        with localcontext() as context:
+            context.prec = 6
+            context.rounding = ROUND_DOWN
+            context.traps[Inexact] = True
+            result = compute_markout(side="buy", quantity=Decimal("2"), price=Decimal("1"),
+                                     reference=reference, fee_quote=Decimal("0.1"))
+        self.assertEqual(Decimal("6666." + "6" * 75 + "7"), result.edge_bps)
+        self.assertEqual(Decimal("-3333." + "3" * 76), result.drift_bps)
+        self.assertEqual(Decimal("3333." + "3" * 76), result.markout_bps)
+        self.assertEqual(Decimal("3166." + "6" * 75 + "7"), result.fee_adjusted_markout_bps)
+        self.assertEqual(Decimal("1.9"), result.fee_adjusted_markout_value)
+
+    def test_flat_sell_outputs_never_serialize_as_negative_zero(self):
+        reference = replace(self.reference(), m0=Decimal("100"), mh=Decimal("100"))
+        result = compute_markout(side="sell", quantity=Decimal("1.0"), price=Decimal("100"),
+                                 reference=reference, fee_quote=Decimal("0"))
+        for name in ("edge_bps", "drift_bps", "markout_bps", "edge_value", "drift_value",
+                     "markout_value", "fee_adjusted_markout_bps", "fee_adjusted_markout_value"):
+            value = getattr(result, name)
+            self.assertEqual(Decimal("0"), value, name)
+            self.assertFalse(value.is_signed(), name)
