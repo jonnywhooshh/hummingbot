@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from unittest import TestCase
 
 from hummingbot.analytics.book.stream import BookStream, KnownInterval, StreamState
@@ -26,8 +26,9 @@ class BookStreamTests(TestCase):
         self.assertEqual((), stream.known_intervals)
         stream.apply_diff(diff(9, 12), timestamp_ns=2)
         self.assertEqual(StreamState.CONTINUOUS, stream.state)
-        self.assertEqual((KnownInterval(0, 2),), stream.known_intervals)
-        self.assertEqual(Decimal("100"), stream.mid_at(1))
+        self.assertEqual((KnownInterval(2, 2),), stream.known_intervals)
+        self.assertIsNone(stream.mid_at(1))
+        self.assertFalse(stream.known(1))
         self.assertFalse(stream.known(3))
 
     def test_missing_snapshot_update_requires_another_snapshot(self):
@@ -41,7 +42,8 @@ class BookStreamTests(TestCase):
         self.assertIsNone(stream.mid_at(2))
         stream.apply_snapshot(snapshot(uid=20), timestamp_ns=4)
         stream.apply_diff(diff(21), timestamp_ns=5)
-        self.assertTrue(stream.known(4))
+        self.assertFalse(stream.known(4))
+        self.assertTrue(stream.known(5))
 
     def test_gap_does_not_extend_a_stretch_or_recover_without_a_snapshot(self):
         stream = BookStream()
@@ -50,14 +52,15 @@ class BookStreamTests(TestCase):
         stream.apply_diff(diff(14, 16), timestamp_ns=4)
         stream.apply_diff(diff(18), timestamp_ns=6)
         stream.apply_diff(diff(19), timestamp_ns=8)
-        self.assertEqual((KnownInterval(0, 4),), stream.known_intervals)
+        self.assertEqual((KnownInterval(2, 4),), stream.known_intervals)
         self.assertFalse(stream.known(5))
         self.assertFalse(stream.known(6))
         stream.apply_snapshot(snapshot(uid=30), timestamp_ns=10)
         stream.apply_diff(diff(31), timestamp_ns=12)
-        self.assertEqual((KnownInterval(0, 4), KnownInterval(10, 12)), stream.known_intervals)
+        self.assertEqual((KnownInterval(2, 4), KnownInterval(12, 12)), stream.known_intervals)
         self.assertIsNone(stream.mid_at(9))
-        self.assertEqual(Decimal("100"), stream.mid_at(10))
+        self.assertIsNone(stream.mid_at(10))
+        self.assertEqual(Decimal("100"), stream.mid_at(12))
         self.assertIsNone(stream.mid_at(-1))
 
     def test_overlapping_diff_after_the_bridge_is_not_continuous(self):
@@ -114,7 +117,7 @@ class BookStreamTests(TestCase):
         self.assertFalse(stream.known(4))
         self.assertFalse(stream.known(5))
         stream.apply_diff(diff(21), timestamp_ns=6)
-        self.assertEqual((KnownInterval(0, 1), KnownInterval(5, 6)), stream.known_intervals)
+        self.assertEqual((KnownInterval(1, 1), KnownInterval(6, 6)), stream.known_intervals)
 
     def test_backpack_engine_timestamp_is_microseconds(self):
         stream = BookStream()
@@ -146,7 +149,99 @@ class BookStreamTests(TestCase):
         with self.assertRaises(TypeError):
             stream.apply_snapshot(snapshot(), timestamp_ns=0.5)
         stream.apply_snapshot(snapshot(), timestamp_ns=2)
+        stream.apply_diff(diff(11), timestamp_ns=2)
         with self.assertRaises(ValueError):
-            stream.apply_diff(diff(11), timestamp_ns=1)
+            stream.apply_diff(diff(12), timestamp_ns=1)
         with self.assertRaises(ValueError):
             stream.apply_diff(diff(12, 11), timestamp_ns=3)
+
+    def test_snapshot_receipt_time_does_not_order_engine_diffs(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(), timestamp_ns=10_000)
+        stream.apply_diff({**diff(11), "T": 5})
+        self.assertEqual((KnownInterval(5_000, 5_000),), stream.known_intervals)
+        self.assertEqual(Decimal("100"), stream.mid_at(5_000))
+        self.assertFalse(stream.known(4_999))
+
+    def test_diffs_buffered_before_snapshot_bridge_in_engine_time(self):
+        stream = BookStream()
+        stream.apply_diff(diff(9, 10), timestamp_ns=1)
+        stream.apply_diff(diff(11, bids=[["99", "0"], ["97", "1"]]), timestamp_ns=2)
+        stream.apply_diff(diff(12), timestamp_ns=3)
+        stream.apply_snapshot(snapshot(), timestamp_ns=10)
+        self.assertEqual(StreamState.CONTINUOUS, stream.state)
+        self.assertEqual((KnownInterval(2, 3),), stream.known_intervals)
+        self.assertEqual(Decimal("99"), stream.mid_at(2))
+        self.assertEqual(Decimal("99"), stream.mid_at(3))
+
+    def test_equal_and_lagging_hourly_snapshots_preserve_continuity(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(), timestamp_ns=10)
+        stream.apply_diff(diff(11), timestamp_ns=1)
+        stream.apply_diff(diff(12, bids=[["99", "0"], ["97", "1"]]), timestamp_ns=2)
+        for uid in (12, 10):
+            with self.subTest(snapshot_uid=uid):
+                stream.apply_snapshot(snapshot(uid=uid), timestamp_ns=20)
+                self.assertEqual(StreamState.CONTINUOUS, stream.state)
+                self.assertEqual(Decimal("99"), stream.mid_at(2))
+        stream.apply_diff(diff(13), timestamp_ns=3)
+        self.assertEqual((KnownInterval(1, 3),), stream.known_intervals)
+        self.assertEqual(Decimal("99"), stream.mid_at(3))
+
+    def test_snapshot_at_fill_time_preserves_the_strict_before_mid(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(), timestamp_ns=0)
+        stream.apply_diff(diff(11), timestamp_ns=1)
+        stream.apply_diff(diff(12), timestamp_ns=2)
+        stream.apply_snapshot(snapshot(uid=12), timestamp_ns=2)
+        stream.apply_diff(diff(13), timestamp_ns=3)
+        self.assertEqual(Decimal("100"), stream.mid_at(2, strictly_before=True))
+        self.assertEqual((KnownInterval(1, 3),), stream.known_intervals)
+
+    def test_same_timestamp_gap_revokes_only_the_unproven_endpoint(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(), timestamp_ns=0)
+        stream.apply_diff(diff(11), timestamp_ns=1)
+        stream.apply_diff(diff(12), timestamp_ns=1_000)
+        stream.apply_diff(diff(14), timestamp_ns=1_000)
+        self.assertEqual(StreamState.NEED_SNAPSHOT, stream.state)
+        self.assertFalse(stream.known(1_000))
+        self.assertIsNone(stream.mid_at(1_000))
+        self.assertTrue(stream.known(999))
+        self.assertEqual(Decimal("100"), stream.mid_at(999))
+        self.assertEqual((KnownInterval(1, 999),), stream.known_intervals)
+
+    def test_gap_at_the_first_covering_timestamp_leaves_no_known_interval(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(), timestamp_ns=0)
+        stream.apply_diff(diff(11), timestamp_ns=1)
+        stream.apply_diff(diff(13), timestamp_ns=1)
+        self.assertFalse(stream.known(1))
+        self.assertEqual((), stream.known_intervals)
+
+    def test_resync_snapshot_replaces_stale_levels_and_replays_buffer(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(bids=[["100", "1"]], asks=[["101", "1"]]), timestamp_ns=0)
+        stream.apply_diff(diff(11), timestamp_ns=1)
+        stream.apply_diff(diff(13), timestamp_ns=2)
+        stream.apply_diff(diff(21), timestamp_ns=3)
+        stream.apply_snapshot(snapshot(bids=[["98", "1"]], asks=[["102", "1"]], uid=20), timestamp_ns=10)
+        self.assertEqual(Decimal("100"), stream.mid_at(3))
+        self.assertEqual((KnownInterval(1, 1), KnownInterval(3, 3)), stream.known_intervals)
+
+    def test_mid_uses_best_prices_and_ignores_zero_snapshot_levels(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(bids=[["99", "2"], ["98", "3"], ["100", "0"]],
+                                       asks=[["103", "2"], ["101", "1"], ["100", "0"]]), timestamp_ns=0)
+        stream.apply_diff(diff(11), timestamp_ns=1)
+        self.assertEqual(Decimal("100"), stream.mid_at(1))
+
+    def test_mid_preserves_all_digits_independent_of_decimal_context(self):
+        for precision in (6, 28):
+            with self.subTest(precision=precision), localcontext() as context:
+                context.prec = precision
+                stream = BookStream()
+                stream.apply_snapshot(snapshot(bids=[["99.00000000000000000000000001", "1"]]),
+                                      timestamp_ns=0)
+                stream.apply_diff(diff(11), timestamp_ns=1)
+                self.assertEqual(Decimal("100.000000000000000000000000005"), stream.mid_at(1))

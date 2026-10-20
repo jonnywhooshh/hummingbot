@@ -1,15 +1,25 @@
 """Rebuild one Backpack depth stream without importing the trading connector.
 
-Feed snapshots and diffs in nondecreasing engine time. All times are integer
-nanoseconds. Snapshot times come from the caller; Backpack diff ``T`` values
-are microseconds. Pass ``timestamp_ns`` explicitly for a receipt-clock stream.
-A snapshot is provisional until a diff covers ``lastUpdateId + 1``. Only a
-later continuous frame can prove that an unchanged book remained known.
+Diffs use nondecreasing timestamps in integer nanoseconds. Backpack ``T`` is
+in microseconds. Receipt-clock diffs require an explicit ``timestamp_ns`` on
+the bot's local clock.
+
+Backpack REST snapshots have no engine timestamp. Their ``timestamp_ns`` is
+receipt metadata, not a venue-time ordering constraint or a known-interval
+boundary. Feed snapshots in capture order and diffs in engine-time order.
+Diffs received before a usable snapshot are buffered. A snapshot becomes
+known only at the first diff covering ``lastUpdateId + 1``, including buffered
+diffs that predate the response receipt. Equal or lagging snapshots cannot
+replace a continuous book. Advancing snapshots replace it and need a new
+covering diff. The same sequence rule applies on a receipt-clock stream.
+
+Only a later continuous frame can confirm silence. A gap stamped at the last
+confirmed timestamp revokes that timestamp, but not earlier nanoseconds.
 """
 
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 from enum import Enum
 from typing import Any, Iterable, Literal, Mapping, Optional, Sequence, Tuple
 
@@ -35,17 +45,25 @@ class BookPoint:
     mid: Optional[Decimal]
 
 
+@dataclass(frozen=True)
+class _DepthDiff:
+    timestamp_ns: int
+    first: int
+    last: int
+    bids: Tuple[Tuple[Decimal, Decimal], ...]
+    asks: Tuple[Tuple[Decimal, Decimal], ...]
+
+
 @dataclass
 class _Stretch:
     points: list[BookPoint] = field(default_factory=list)
     times: list[int] = field(default_factory=list)
-    diff_times: list[int] = field(default_factory=list)
+    end_ns: int = 0
 
-    def append(self, point: BookPoint, *, is_diff: bool) -> None:
+    def append(self, point: BookPoint) -> None:
         self.points.append(point)
         self.times.append(point.timestamp_ns)
-        if is_diff:
-            self.diff_times.append(point.timestamp_ns)
+        self.end_ns = point.timestamp_ns
 
 
 def _levels(rows: Iterable[Sequence[Any]]) -> Iterable[Tuple[Decimal, Decimal]]:
@@ -71,6 +89,7 @@ class BookStream:
         self._current: Optional[_Stretch] = None
         self._stretches: list[_Stretch] = []
         self._starts: list[int] = []
+        self._buffer: list[_DepthDiff] = []
 
     def _check_time(self, timestamp_ns: int) -> None:
         if not isinstance(timestamp_ns, int):
@@ -92,20 +111,28 @@ class BookStream:
         if self._bids and self._asks:
             bid, ask = max(self._bids), min(self._asks)
             if bid <= ask:
-                mid = (bid + ask) / 2
+                precision = max(bid.adjusted(), ask.adjusted()) - min(
+                    bid.as_tuple().exponent, ask.as_tuple().exponent) + 3
+                with localcontext(Context(prec=precision)):
+                    mid = (bid + ask) / 2
         return BookPoint(timestamp_ns, self._last_update_id, mid)
 
     def apply_snapshot(self, message: Mapping[str, Any], *, timestamp_ns: int) -> None:
         bids, asks = dict(_levels(message["bids"])), dict(_levels(message["asks"]))
         update_id = int(message["lastUpdateId"])
-        self._check_time(timestamp_ns)
+        if not isinstance(timestamp_ns, int):
+            raise TypeError("timestamp_ns must be an integer")
+        if self.state is StreamState.CONTINUOUS and update_id <= self._last_update_id:
+            return
         self._bids, self._asks = {}, {}
         self._update(self._bids, bids.items())
         self._update(self._asks, asks.items())
         self._last_update_id = update_id
         self._current = _Stretch()
-        self._current.append(self._point(timestamp_ns), is_diff=False)
+        buffered, self._buffer = self._buffer, []
         self.state = StreamState.AWAITING_DIFF
+        for frame in buffered:
+            self._apply_diff(frame)
 
     def apply_diff(self, message: Mapping[str, Any], *, timestamp_ns: Optional[int] = None) -> None:
         data = message.get("data", message)
@@ -118,7 +145,12 @@ class BookStream:
             raise ValueError("Depth update range is reversed")
         bids, asks = tuple(_levels(data["b"])), tuple(_levels(data["a"]))
         self._check_time(timestamp_ns)
+        self._apply_diff(_DepthDiff(timestamp_ns, first, last, bids, asks))
+
+    def _apply_diff(self, frame: _DepthDiff) -> None:
+        first, last, timestamp_ns = frame.first, frame.last, frame.timestamp_ns
         if self.state is StreamState.NEED_SNAPSHOT:
+            self._buffer.append(frame)
             return
         if self.state is StreamState.AWAITING_DIFF:
             if last <= self._last_update_id:
@@ -127,28 +159,33 @@ class BookStream:
         else:
             continuous = first == self._last_update_id + 1
         if not continuous:
+            if self._current is not None and self._current.times:
+                self._current.end_ns = min(self._current.end_ns, timestamp_ns - 1)
             self.state = StreamState.NEED_SNAPSHOT
             self._current = None
+            self._buffer.append(frame)
             return
-        self._update(self._bids, bids)
-        self._update(self._asks, asks)
+        self._update(self._bids, frame.bids)
+        self._update(self._asks, frame.asks)
         self._last_update_id = last
         if self.state is StreamState.AWAITING_DIFF:
+            if self._stretches and self._stretches[-1].end_ns >= timestamp_ns:
+                self._stretches[-1].end_ns = timestamp_ns - 1
             self._stretches.append(self._current)
-            self._starts.append(self._current.times[0])
+            self._starts.append(timestamp_ns)
             self.state = StreamState.CONTINUOUS
-        self._current.append(self._point(timestamp_ns), is_diff=True)
+        self._current.append(self._point(timestamp_ns))
 
     @property
     def known_intervals(self) -> Tuple[KnownInterval, ...]:
-        return tuple(KnownInterval(s.times[0], s.times[-1]) for s in self._stretches)
+        return tuple(KnownInterval(s.times[0], s.end_ns) for s in self._stretches if s.times[0] <= s.end_ns)
 
     def _stretch_at(self, timestamp_ns: int) -> Optional[_Stretch]:
         index = bisect_right(self._starts, timestamp_ns) - 1
         if index < 0:
             return None
         stretch = self._stretches[index]
-        return stretch if timestamp_ns <= stretch.times[-1] else None
+        return stretch if timestamp_ns <= stretch.end_ns else None
 
     def known(self, timestamp_ns: int) -> bool:
         return self._stretch_at(timestamp_ns) is not None
@@ -164,5 +201,5 @@ class BookStream:
         stretch = self._stretch_at(timestamp_ns)
         if stretch is None:
             return False
-        index = bisect_left(stretch.diff_times, timestamp_ns)
-        return index < len(stretch.diff_times) and stretch.diff_times[index] == timestamp_ns
+        index = bisect_left(stretch.times, timestamp_ns)
+        return index < len(stretch.times) and stretch.times[index] == timestamp_ns
