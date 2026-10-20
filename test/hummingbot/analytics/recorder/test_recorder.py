@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import threading
 import time
@@ -101,3 +103,41 @@ class RecorderTest(RunTestCase):
         with patch("hummingbot.analytics.recorder.os.statvfs", side_effect=OSError("disk unavailable")):
             self.assertIsNone(recorder.activate(AnalyticsConfigMap(enabled=True), self.root))
         self.assertFalse(recorder.ACTIVE)
+
+    def test_raw_text_binary_and_rest_bytes_survive_the_public_api_and_gzip(self):
+        run_dir = self.start(segment_max_bytes=1024)
+        recorder.secrets.add("inbound-witness")
+        inputs = [
+            ("ws_in", b' {"amount":0.1000000000000000055,"key":"inbound-witness"} \\r\\n'),
+            ("ws_in", bytes(range(256))),
+            ("rest_body", ' {"fee":0.000000123,"text":"雪\\u0000"} '.encode()),
+        ]
+        for kind, raw in inputs:
+            self.record(kind, recorder.payload(raw), priority=True)
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        records = [row for row in self.records(run_dir) if row["kind"] != "run_end"]
+        self.assertEqual(len(inputs), len(records))
+        for (_, raw), row in zip(inputs, records):
+            body = row["body"]
+            recovered = body["text"].encode() if "text" in body else base64.b64decode(body["b64"])
+            self.assertEqual(hashlib.sha256(raw).digest(), hashlib.sha256(recovered).digest())
+            self.assertEqual(len(raw), row["payload_bytes"])
+
+    def test_run_end_counters_describe_the_drained_artifact_not_the_pre_flush_queue(self):
+        run_dir = self.start(queue_max_bytes=1500)
+        recorder.pause()
+        recorder.write_run_start({"purpose": "final counters"})
+        for index in range(20):
+            self.record("ws_in", {"text": "x" * 200, "i": index})
+        dropped = recorder.stats()["dropped"]
+        self.assertGreater(dropped, 0)
+        recorder.resume()
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        records = self.records(run_dir)
+        self.assertEqual("run_end", records[-1]["kind"])
+        counters = records[-1]["body"]["counters"]
+        self.assertEqual(len(records), counters["records"])
+        self.assertEqual(dropped, counters["dropped"])
+        self.assertEqual(0, counters["queue_records"])
+        self.assertEqual(0, counters["queue_bytes"])
+        self.assertEqual(counters, json.loads((run_dir / "run.json").read_bytes())["run_end"]["counters"])

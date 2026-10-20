@@ -147,7 +147,7 @@ def write_run_start(body: Dict[str, Any]) -> None:
 
 
 def end_run(body: Dict[str, Any]) -> bool:
-    """Write run_end once, drain, close, and save run.json. Return False if the two-second deadline expires.
+    """Drain observations, write run_end once with final counters, close, and save run.json within two seconds.
 
     On timeout the active JSONL remains recoverable and run.json has no run_end. Calling twice does not add a record.
     """
@@ -161,9 +161,16 @@ def end_run(body: Dict[str, Any]) -> bool:
     _run = None
     run_json = None
     try:
-        body_json = encode_body({**body, "counters": _counters(run)})
-        _push(run, "run_end", body_json, t0_ns)
-        run_json = _run_json(run.run_id, run.run_start_json, body_json)
+        run.queue.seal_drops()
+        if run.writer.drain(deadline):
+            counters = {"records": run.writer.written + 1,
+                        "dropped": run.queue.dropped + run.writer.disk_dropped,
+                        "dropped_priority": run.queue.dropped_priority + run.writer.disk_dropped_priority,
+                        "queue_records": 0, "queue_bytes": 0, "hook_errors": sum(_errors.values()),
+                        "writer_errors": run.writer.errors}
+            body_json = encode_body({**body, "counters": counters})
+            _push(run, "run_end", body_json, t0_ns)
+            run_json = _run_json(run.run_id, run.run_start_json, body_json)
     except Exception as error:
         hook_error("run_end", error)
     try:
