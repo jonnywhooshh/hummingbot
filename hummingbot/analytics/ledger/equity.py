@@ -3,6 +3,7 @@
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
+from fractions import Fraction
 from typing import Optional, Union
 
 from hummingbot.analytics.ledger.model import (
@@ -27,14 +28,16 @@ class EquityPoint:
     entry_price: Optional[Decimal]
     mark_valued: bool
     missing_tokens: tuple[str, ...]
+    external_flows: Optional[Decimal]
+    net_pnl: Optional[Decimal]
 
 
 class Ledger:
     """Apply ordered events after an opening cut, then value the current state.
 
-    Events at t_open belong to the opening and must not be applied again.
-    value(t) cannot travel behind the last applied event. To sample history,
-    apply events in venue order and call value at each desired timestamp.
+    apply raises ValueError for events at or before t_open and for events
+    behind the last applied event. value(t) samples the current event state.
+    It does not advance the event cursor or freeze earlier observations.
     Spot position includes base fees. Perpetual position never includes them.
     The mids provider prices tokens in quote units and never returns floats.
     """
@@ -73,12 +76,12 @@ class Ledger:
         self.spread = ZERO
         self.turnover = ZERO
         self.unknown_turnover = ZERO
-        self.realized_pnl = ZERO
+        self._realized_pnl = Fraction(0)
         self._lots = deque()
         self._cost_quantity = opening.pos_open
-        self._cost_notional = opening.pos_open * (opening.entry_price or opening.mid_open)
+        self._cost_notional = Fraction(opening.pos_open) * Fraction(opening.entry_price or opening.mid_open)
         if opening.pos_open:
-            self._lots.append((opening.pos_open, opening.entry_price or opening.mid_open))
+            self._lots.append((opening.pos_open, self._cost_notional))
 
     def token_mid(self, token: str, t: int) -> Optional[Decimal]:
         if token == self.quote_token:
@@ -95,6 +98,10 @@ class Ledger:
             quantity -= self.fees_by_token.get(self.base_token, ZERO)
         return quantity
 
+    @property
+    def realized_pnl(self) -> Decimal:
+        return Decimal(self._realized_pnl.numerator) / Decimal(self._realized_pnl.denominator)
+
     def apply(self, event: Union[Fill, FundingPayment, Transfer]) -> None:
         if not isinstance(event, (Fill, FundingPayment, Transfer)):
             raise TypeError("expected Fill, FundingPayment, or Transfer")
@@ -102,7 +109,7 @@ class Ledger:
             raise ValueError("events must follow the opening cut in venue order")
         fee_mid = None
         if isinstance(event, Fill) and event.fee:
-            fee_mid = self.token_mid(event.fee_token, event.t)
+            fee_mid = self.token_mid(event.fee_token or self.quote_token, event.t)
         self.last_t = event.t
         if isinstance(event, FundingPayment):
             self.funding += event.amount
@@ -124,7 +131,7 @@ class Ledger:
                 self._known_quantity += q
                 self._known_mid_notional += q * event.m0
             if event.fee:
-                token = event.fee_token
+                token = event.fee_token or self.quote_token
                 self.fees_by_token[token] = self.fees_by_token.get(token, ZERO) + event.fee
                 if event.fee < ZERO:
                     self.rebates_by_token[token] = self.rebates_by_token.get(token, ZERO) - event.fee
@@ -137,27 +144,29 @@ class Ledger:
 
     def _apply_cost(self, q: Decimal, price: Decimal) -> None:
         while q and self._lots and (q > ZERO) != (self._lots[0][0] > ZERO):
-            old_q, old_price = self._lots.popleft()
+            old_q, old_cost = self._lots.popleft()
             closed = min(abs(q), abs(old_q))
             sign = Decimal("1") if old_q > ZERO else Decimal("-1")
-            self.realized_pnl += closed * sign * (price - old_price)
+            closed_cost = old_cost * Fraction(closed) / Fraction(abs(old_q))
+            self._realized_pnl += Fraction(closed * sign) * Fraction(price) - closed_cost
             self._cost_quantity -= closed * sign
-            self._cost_notional -= closed * sign * old_price
+            self._cost_notional -= closed_cost
             old_q -= closed * sign
             q += closed * sign
             if old_q:
-                self._lots.appendleft((old_q, old_price))
+                self._lots.appendleft((old_q, old_cost - closed_cost))
         if not self._lots:
             self._cost_quantity = ZERO
-            self._cost_notional = ZERO
+            self._cost_notional = Fraction(0)
         if q:
             self._cost_quantity += q
-            self._cost_notional += q * price
+            cost = Fraction(q) * Fraction(price)
+            self._cost_notional += cost
             if self.cost_method == "wac" and self._lots:
-                old_q, old_price = self._lots.pop()
-                self._lots.append((old_q + q, (old_q * old_price + q * price) / (old_q + q)))
+                old_q, old_cost = self._lots.pop()
+                self._lots.append((old_q + q, old_cost + cost))
             else:
-                self._lots.append((q, price))
+                self._lots.append((q, cost))
 
     def value(self, t: int, *, mark: Optional[Decimal] = None) -> EquityPoint:
         venue_time(t)
@@ -179,14 +188,18 @@ class Ledger:
                 missing.add(token)
             else:
                 fee_value += quantity * price
-        if mid is None:
+        exposure = self.opening.pos_open + self.trade_quantity
+        if mid is None and exposure:
             missing.add(self.base_token)
         equity = None
         if not missing:
-            equity = (self.opening.E_open + self.opening.pos_open * (mid - self.opening.mid_open)
-                      + self.trade_quantity * mid - self.trade_notional - fee_value
-                      + self.funding + self.external_flows)
+            equity = (self.opening.E_open + (exposure * mid if exposure else ZERO)
+                      - self.opening.pos_open * self.opening.mid_open
+                      - self.trade_notional - fee_value + self.funding + self.external_flows)
         entry = None
         if self._lots:
-            entry = self._cost_notional / self._cost_quantity
-        return EquityPoint(t, equity, mid, self.position, self.realized_pnl, entry, mark_valued, tuple(sorted(missing)))
+            entry_cost = self._cost_notional / Fraction(self._cost_quantity)
+            entry = Decimal(entry_cost.numerator) / Decimal(entry_cost.denominator)
+        net_pnl = None if equity is None else equity - self.opening.E_open - self.external_flows
+        return EquityPoint(t, equity, mid, self.position, self.realized_pnl, entry, mark_valued,
+                           tuple(sorted(missing)), self.external_flows, net_pnl)

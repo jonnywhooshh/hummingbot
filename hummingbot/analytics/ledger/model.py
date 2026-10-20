@@ -34,7 +34,7 @@ class Fill:
     quantity: Decimal
     price: Decimal
     fee: Decimal = ZERO
-    fee_token: str = "USDC"
+    fee_token: Optional[str] = None
     m0: Optional[Decimal] = None
 
     def __post_init__(self):
@@ -47,8 +47,11 @@ class Fill:
             raise ValueError("quantity and price must be positive")
         if self.m0 is not None and decimal_amount(self.m0, "m0") <= ZERO:
             raise ValueError("m0 must be positive")
-        if not self.fee_token:
-            raise ValueError("fee_token must not be empty")
+        if self.fee_token is not None:
+            if not isinstance(self.fee_token, str):
+                raise TypeError("fee_token must be a string or None for the ledger quote")
+            if not self.fee_token:
+                raise ValueError("fee_token must not be empty")
 
     @property
     def signed_quantity(self) -> Decimal:

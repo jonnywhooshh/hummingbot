@@ -153,3 +153,57 @@ def test_frozen_events_and_boundary_validation():
         Ledger(opening, Prices({("SOL", 1): 100.0})).value(1)
     with pytest.raises(ValueError):
         Ledger(opening, Prices({("SOL", 1): D("0")})).value(1)
+
+
+def test_flat_equity_does_not_require_a_mid():
+    ledger = Ledger(Opening(D("100"), 0, D("100")), Prices({("SOL", 3): None}))
+    ledger.apply(Fill(1, "buy", D("1"), D("99")))
+    ledger.apply(Fill(2, "sell", D("1"), D("101")))
+    point = ledger.value(3)
+    assert point.equity == D("102")
+    assert point.missing_tokens == ()
+
+
+def test_default_fee_uses_the_ledgers_quote_token():
+    ledger = Ledger(Opening(D("100"), 0, D("100")), Prices(), quote_token="USDT")
+    ledger.apply(Fill(1, "buy", D("1"), D("99"), D("0.01")))
+    assert ledger.value(1).equity == D("100.99")
+    assert ledger.fees_by_token == {"USDT": D("0.01")}
+
+
+def test_wac_full_close_uses_exact_total_cost():
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices())
+    ledger.apply(Fill(1, "buy", D("3"), D("100")))
+    ledger.apply(Fill(2, "buy", D("4"), D("101")))
+    ledger.apply(Fill(3, "sell", D("7"), D("100.5")))
+    point = ledger.value(3)
+    assert point.realized_pnl == D("-0.5")
+    assert point.entry_price is None
+
+
+def test_sampled_equity_carries_external_flows_and_net_pnl():
+    ledger = Ledger(Opening(D("100"), 0, D("100")), Prices())
+    ledger.apply(Transfer(1, D("10")))
+    first = ledger.value(1)
+    ledger.apply(Transfer(2, D("-5")))
+    second = ledger.value(2)
+    assert (first.external_flows, second.external_flows) == (D("10"), D("5"))
+    assert first.net_pnl == second.net_pnl == D("0")
+
+
+@pytest.mark.parametrize("method", ["wac", "fifo"])
+def test_closing_opening_position_uses_reported_entry(method):
+    ledger = Ledger(Opening(D("101"), 0, D("100"), D("1"), D("90")),
+                    Prices(), cost_method=method)
+    ledger.apply(Fill(1, "sell", D("1"), D("110")))
+    assert ledger.value(1).realized_pnl == D("20")
+
+
+def test_fifo_entry_averages_all_remaining_lots():
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices(), cost_method="fifo")
+    ledger.apply(Fill(1, "buy", D("1"), D("90")))
+    ledger.apply(Fill(2, "buy", D("3"), D("110")))
+    assert ledger.value(2).entry_price == D("105")
+    ledger.apply(Fill(3, "sell", D("2"), D("120")))
+    assert ledger.value(3).entry_price == D("110")
+    assert ledger.value(3).realized_pnl == D("40")
