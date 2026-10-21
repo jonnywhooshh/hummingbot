@@ -152,7 +152,7 @@ class MarkoutTests(TestCase):
                                      reference=reference, fee_quote=Decimal("0.1"))
         self.assertEqual(Decimal("6666." + "6" * 75 + "7"), result.edge_bps)
         self.assertEqual(Decimal("-3333." + "3" * 76), result.drift_bps)
-        self.assertEqual(Decimal("3333." + "3" * 76), result.markout_bps)
+        self.assertEqual(Decimal("3333." + "3" * 75 + "4"), result.markout_bps)
         self.assertEqual(Decimal("3166." + "6" * 75 + "7"), result.fee_adjusted_markout_bps)
         self.assertEqual(Decimal("1.9"), result.fee_adjusted_markout_value)
 
@@ -178,3 +178,21 @@ class MarkoutTests(TestCase):
                 self.assertEqual(Fraction(base) - Fraction(price), Fraction(result.edge_value))
                 self.assertEqual(result.edge_value, result.markout_value)
                 self.assertEqual(result.markout_value, result.fee_adjusted_markout_value)
+
+    def test_reported_repeating_parts_sum_exactly_to_reported_markout(self):
+        for side in ("buy", "sell"):
+            for precision in (6, 28, 80):
+                with self.subTest(side=side, precision=precision), localcontext() as context:
+                    context.prec = precision
+                    context.rounding = ROUND_DOWN
+                    context.traps[Inexact] = True
+                    reference = replace(self.reference(), m0=Decimal("3"), mh=Decimal("2"))
+                    result = compute_markout(side=side, quantity=Decimal("2"), price=Decimal("1"),
+                                             reference=reference, fee_quote=Decimal("0"))
+                    self.assertEqual(Fraction(result.edge_bps) + Fraction(result.drift_bps),
+                                     Fraction(result.markout_bps))
+                    self.assertEqual(Fraction(result.edge_value) + Fraction(result.drift_value),
+                                     Fraction(result.markout_value))
+                    self.assertEqual(result.markout_bps, result.fee_adjusted_markout_bps)
+                    context.prec = 200
+                    self.assertEqual(result.edge_bps + result.drift_bps, result.markout_bps)
