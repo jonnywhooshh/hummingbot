@@ -22,8 +22,8 @@ class CaptureQueue:
     """
 
     def __init__(self, bulk_bound: int, priority_bound: int):
-        self.items: Deque[bytes] = deque()
-        self._metadata: Deque[Tuple[int, bool]] = deque()
+        self.items: Deque[Item] = deque()
+        self.closed = False
         self.bulk_bound = bulk_bound
         self.priority_bound = priority_bound
         self.bytes_in = 0
@@ -42,20 +42,30 @@ class CaptureQueue:
         return len(self.items)
 
     def offer(self, seq: int, priority: bool, line: bytes) -> bool:
-        if self.depth_bytes + len(line) > (self.priority_bound if priority else self.bulk_bound):
-            self.dropped += 1
-            self.dropped_priority += priority
-            current = self._open
-            if current is None or seq != current.snapshot[0] + 1:
-                self.seal_drops()
-                current = self._open = DropRange(seq, priority)
-                self._ranges.append(current)
-            else:
-                current.snapshot = (seq, seq if priority else current.snapshot[1])
+        if self.closed or self.depth_bytes + len(line) > (self.priority_bound if priority else self.bulk_bound):
+            self.lose(seq, priority)
             return False
         self.push(seq, line, priority)
         self.accepted += 1
         return True
+
+    def lose(self, seq: int, priority: bool) -> None:
+        """Count a seq that will never reach the writer, so its capture_gap range stays exact."""
+        self.dropped += 1
+        self.dropped_priority += priority
+        current = self._open
+        if current is None or seq != current.snapshot[0] + 1:
+            self.seal_drops()
+            current = self._open = DropRange(seq, priority)
+            self._ranges.append(current)
+        else:
+            current.snapshot = (seq, seq if priority else current.snapshot[1])
+
+    def close(self) -> None:
+        """Refuse every later record and release the queued ones. Called by the writer once it can write no more."""
+        self.closed = True
+        while self.pop() is not None:
+            pass
 
     def seal_drops(self) -> None:
         if self._open is not None:
@@ -64,10 +74,11 @@ class CaptureQueue:
 
     def push(self, seq: int, line: bytes, priority: bool = True) -> None:
         """Lifecycle records bypass capacity, so stopping does not lose run_end to a bulk flood."""
+        if self.closed:
+            return
         self.seal_drops()
-        self._metadata.append((seq, priority))
         self.bytes_in += len(line)
-        self.items.append(line)
+        self.items.append((seq, priority, line))
 
     def take_drops(self) -> List[Tuple[int, int, bool]]:
         ranges = []
@@ -86,9 +97,8 @@ class CaptureQueue:
 
     def pop(self) -> Optional[Item]:
         try:
-            line = self.items.popleft()
+            item = self.items.popleft()
         except IndexError:
             return None
-        seq, priority = self._metadata.popleft()
-        self.bytes_out += len(line)
-        return seq, priority, line
+        self.bytes_out += len(item[2])
+        return item

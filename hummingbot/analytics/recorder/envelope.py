@@ -43,7 +43,7 @@ def _fallback(value: Any) -> Any:
 
 
 def encode_body(body: Dict[str, Any]) -> str:
-    return ujson.dumps(exact(body), ensure_ascii=False, escape_forward_slashes=False, default=_fallback)
+    return ujson.dumps(exact(body), ensure_ascii=True, escape_forward_slashes=False, default=_fallback)
 
 
 def frame(seq: int, run_id: str, kind: str, t_wall_ns: int, t_mono_ns: int, hook_ns: int,
@@ -55,7 +55,7 @@ def frame(seq: int, run_id: str, kind: str, t_wall_ns: int, t_mono_ns: int, hook
         "hook_ns": hook_ns, "payload_bytes": payload_bytes, "connector": connector, "trading_pair": trading_pair,
         "controller_id": controller_id, "executor_id": executor_id,
         "client_order_id": client_order_id, "exchange_order_id": exchange_order_id,
-    }, ensure_ascii=False, escape_forward_slashes=False)
+    }, ensure_ascii=True, escape_forward_slashes=False)
     return f'{head[:-1]},"body":{body_json}}}\n'.encode("utf-8")
 
 

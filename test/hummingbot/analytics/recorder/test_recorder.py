@@ -1,5 +1,7 @@
 import base64
+import enum
 import hashlib
+import io
 import json
 import threading
 import time
@@ -9,6 +11,7 @@ from unittest.mock import patch
 from uuid import UUID
 
 from hummingbot.analytics import recorder
+from hummingbot.analytics.commands import dump
 from hummingbot.analytics.recorder import accounts, timing
 from hummingbot.client.config.client_config_map import AnalyticsConfigMap
 
@@ -141,3 +144,47 @@ class RecorderTest(RunTestCase):
         self.assertEqual(0, counters["queue_records"])
         self.assertEqual(0, counters["queue_bytes"])
         self.assertEqual(counters, json.loads((run_dir / "run.json").read_bytes())["run_end"]["counters"])
+
+
+class SequenceAccountingTest(RunTestCase):
+    def verify(self, run_dir):
+        out = io.BytesIO()
+        return dump.main(["--run", str(run_dir), "--verify"], out), out.getvalue().decode()
+
+    def test_a_lone_surrogate_from_aiohttp_headers_is_recorded_not_lost(self):
+        run_dir = self.start()
+        headers = {"Ma\udcef'ch": "v\udcff"}
+        self.record("rest", {"headers": headers})
+        self.record("clock", {})
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        rest = next(row for row in self.records(run_dir) if row["kind"] == "rest")
+        self.assertEqual(headers, rest["body"]["headers"])
+        self.assertEqual(0, recorder.stats()["hook_errors"])
+        status, text = self.verify(run_dir)
+        self.assertEqual(0, status, text)
+        self.assertIn("manifest OK", text)
+
+    def test_a_record_that_fails_after_its_seq_is_taken_is_reported_as_a_dropped_seq(self):
+        class Side(enum.Enum):
+            BUY = 1
+
+        run_dir = self.start()
+        self.record("clock", {})
+        self.record("order_request", {}, exchange_order_id=Side.BUY)
+        self.record("clock", {})
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        records = self.records(run_dir)
+        gap = next(row["body"] for row in records if row["kind"] == "capture_gap")
+        self.assertEqual((2, 2, 1, True), (gap["first_seq"], gap["last_seq"], gap["count"], gap["priority_dropped"]))
+        self.assertEqual(1, recorder.stats()["hook_errors"])
+        status, text = self.verify(run_dir)
+        self.assertEqual(0, status, text)
+
+    def test_failed_calls_are_counted_in_hook_timing(self):
+        self.start()
+        timing.drain()
+        with patch("hummingbot.analytics.recorder.encode_body", side_effect=ValueError("broken")):
+            self.record("clock", {})
+        row = timing.drain()["clock"]
+        self.assertEqual(1, row["count"])
+        self.assertGreater(row["total_ns"], 0)
