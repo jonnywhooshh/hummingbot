@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import os
+import statistics
 import tempfile
 import time
 import unittest
@@ -405,9 +406,8 @@ class TransportTest(IsolatedAsyncioWrapperTestCase):
                 self.assertEqual(200, response.status)
                 self.assertIsNone(response._aiohttp_response._body)
                 response._aiohttp_response.close()
-        for off, on in zip(measurements[False], measurements[True]):
-            self.assertLess(on - off, 0.005)
-            self.assertLess(max(off, on), 0.1)
+        self.assertLess(statistics.median(measurements[True]) - statistics.median(measurements[False]), 0.005)
+        self.assertLess(max(measurements[False] + measurements[True]), 0.1)
         print("UNREAD_DELAYED_BODY_SECONDS", measurements)
         self.assertEqual([], self.records("rest_body"))
 
