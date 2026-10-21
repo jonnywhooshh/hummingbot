@@ -69,7 +69,7 @@ class Writer:
         self._thread.start()
 
     def pause(self) -> None:
-        """Wait for the current writer batch, then stop dequeuing. Hooks never acquire this lock."""
+        """Wait for the current writer step, then stop dequeuing. Test-only, and the step can include a segment close."""
         self._paused = True
         with self._lock:
             pass

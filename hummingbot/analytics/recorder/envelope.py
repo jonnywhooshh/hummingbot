@@ -1,18 +1,21 @@
 import base64
 from decimal import Decimal
+from math import isfinite
 from time import monotonic_ns, time_ns
 from typing import Any, Dict, Optional, Union
 
 import ujson
 from pydantic import BaseModel
 
-_PLAIN = frozenset((str, int, float, bool, type(None)))
+_PLAIN = frozenset((str, int, bool, type(None)))
 
 
 def exact(value: Any) -> Any:
-    """Convert Decimal before ujson can silently encode it through a binary float."""
+    """Convert Decimal before ujson can silently encode it through a binary float, and non-finite floats to text."""
     if type(value) in _PLAIN:
         return value
+    if isinstance(value, float):
+        return value if isfinite(value) else repr(float(value))
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, dict):

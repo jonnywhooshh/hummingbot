@@ -72,7 +72,7 @@ class _Run:
 _run: Optional[_Run] = None
 _errors: Dict[str, int] = {}
 _diagnostics: Deque[Tuple[str, int, BaseException]] = deque()
-_discarded = 0
+_discarded: Optional[int] = None
 
 
 def activate(config: Any, root: Union[str, Path, None] = None) -> Optional[str]:
@@ -125,7 +125,7 @@ def record(kind: str, body: Dict[str, Any], *, t0_ns: int, hook: str, priority: 
     global _discarded
     run = _run
     if run is None:
-        _discarded += 1
+        _discarded = (_discarded or 0) + 1
         return
     try:
         if get_ident() != run.thread_id:
@@ -137,7 +137,7 @@ def record(kind: str, body: Dict[str, Any], *, t0_ns: int, hook: str, priority: 
         if connector is not None and "account_id" not in body:
             body = {**body, "account_id": accounts.get(connector)}
         body_json = encode_body(body)
-        size = payload_size(body, body_json)
+        size = payload_size(body, body_json) if spec.per_kib_us else 0
         priority = priority or spec.priority
         seq = next(run.counter)
         line = _framed(run, seq, priority, kind, t_wall_ns, t_mono_ns, perf_counter_ns() - t0_ns, connector,
@@ -152,18 +152,22 @@ def record(kind: str, body: Dict[str, Any], *, t0_ns: int, hook: str, priority: 
 
 
 def write_run_start(body: Dict[str, Any]) -> None:
-    """Enqueue run_start once and save its body in run.json, adding analytics and discarded_before_run."""
+    """Enqueue run_start once and save its body in run.json, adding analytics and discarded_before_run.
+
+    discarded_before_run counts record() calls made while no run was active. It is null with a reason when none
+    arrived, because a hook that tests ACTIVE first never reaches record() and so cannot be counted.
+    """
     global _discarded
     run = _run
     if run is None or run.run_start_json is not None:
         return
     try:
         t0_ns = perf_counter_ns()
-        body_json = encode_body({**body, "discarded_before_run": _discarded, "analytics": run.settings._asdict()})
+        body_json = encode_body({**body, **_discarded_fields(), "analytics": run.settings._asdict()})
         _push(run, "run_start", body_json, t0_ns)
         run.run_start_json = body_json
         run.writer.run_json = _run_json(run.run_id, body_json, None)
-        _discarded = 0
+        _discarded = None
     except Exception as error:
         hook_error("run_start", error)
 
@@ -248,7 +252,11 @@ def settings() -> Optional[Settings]:
 
 
 def pause() -> None:
-    """Pause dequeueing for the queue-pressure acceptance probe. record keeps returning without waiting."""
+    """Pause dequeueing for the queue-pressure acceptance probe. record keeps returning without waiting.
+
+    For tests and probes only. The call waits for the writer's current step, which can include a segment close of
+    seconds, so never call it from the trading loop.
+    """
     if _run is not None:
         _run.writer.pause()
 
@@ -256,6 +264,13 @@ def pause() -> None:
 def resume() -> None:
     if _run is not None:
         _run.writer.resume()
+
+
+def _discarded_fields() -> Dict[str, Any]:
+    if _discarded is not None:
+        return {"discarded_before_run": _discarded}
+    return {"discarded_before_run": None,
+            "discarded_before_run_reason": "no record() call reached the recorder while capture was inactive"}
 
 
 def _counters(run: _Run) -> Dict[str, Any]:

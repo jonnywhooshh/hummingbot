@@ -13,3 +13,7 @@ class SecretsTest(unittest.TestCase):
         self.assertEqual(b"<redacted>\x00", secrets.scrub(b"recorder-secret\x00"))
         unchanged = "a public payload"
         self.assertIs(unchanged, secrets.scrub(unchanged))
+
+    def test_a_memoryview_is_scrubbed_like_bytes(self):
+        secrets.add("recorder-secret-view")
+        self.assertEqual(b'{"key":"<redacted>"}', secrets.scrub(memoryview(b'{"key":"recorder-secret-view"}')))

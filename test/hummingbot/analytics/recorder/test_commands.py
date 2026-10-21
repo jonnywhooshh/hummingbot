@@ -96,13 +96,33 @@ class CommandsTest(RunTestCase):
     def test_overhead_adjusts_each_payload_before_computing_p99(self):
         body = {"b64": base64.b64encode(b"\xff" * 1024).decode()}
         for duration, expected in ((72000, 0), (73000, 1)):
-            run_dir = self.fixture_run([{"kind": "ws_in", "hook_ns": duration, "body": body}])
+            run_dir = self.fixture_run([{"kind": "ws_in", "hook_ns": duration, "body": body,
+                                          "payload_bytes": 1024}])
             out = io.StringIO()
             self.assertEqual(expected, overhead.main(["--run", str(run_dir)], out))
             self.assertIn("records*", out.getvalue())
             self.assertIn("under 60 s", out.getvalue())
         run_dir = self.fixture_run([{"kind": "rest", "hook_ns": 72000, "body": body, "payload_bytes": 1024}])
         self.assertEqual(0, overhead.main(["--run", str(run_dir)], io.StringIO()))
+
+    def test_overhead_rejects_a_payload_kind_without_its_payload_length(self):
+        run_dir = self.fixture_run([{"kind": "ws_in", "hook_ns": 1000, "body": {"text": "x"}}])
+        out = io.StringIO()
+        self.assertEqual(1, overhead.main(["--run", str(run_dir)], out))
+        self.assertIn("overhead FAIL", out.getvalue())
+
+    def test_dump_and_overhead_report_a_corrupted_gzip_instead_of_a_traceback(self):
+        run_dir = self.start()
+        self.record("clock", {})
+        self.assertTrue(recorder.end_run({}))
+        entry = json.loads((run_dir / "manifest.jsonl").read_text())
+        (run_dir / entry["file"]).write_bytes(b"\x1f\x8b\x08\x00" + b"corrupt" * 20)
+        out = io.BytesIO()
+        self.assertEqual(1, dump.main(["--run", str(run_dir)], out))
+        self.assertIn(b"manifest FAIL", out.getvalue())
+        text = io.StringIO()
+        self.assertEqual(1, overhead.main(["--run", str(run_dir)], text))
+        self.assertIn("overhead FAIL", text.getvalue())
 
     def test_overhead_merges_host_buckets_and_includes_hooks_that_did_not_write_records(self):
         buckets = [0] * timing.BUCKETS

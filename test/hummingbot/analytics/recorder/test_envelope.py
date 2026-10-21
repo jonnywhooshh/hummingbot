@@ -35,6 +35,19 @@ class EnvelopeTest(unittest.TestCase):
         self.assertIs(number, body["amount"])
         self.assertIsInstance(body["nested"][0]["fee"], Decimal)
 
+    def test_non_finite_floats_become_text_so_every_line_is_strict_json(self):
+        def reject(constant):
+            raise ValueError(constant)
+
+        body = {"nan": float("nan"), "list": [float("inf"), float("-inf"), 1.5]}
+        line = frame(1, "run", "clock", 2, 3, 4, None, None, None, None, None, None, encode_body(body))
+        self.assertEqual({"nan": "nan", "list": ["inf", "-inf", 1.5]}, json.loads(line, parse_constant=reject)["body"])
+
+    def test_text_is_ascii_so_a_lone_surrogate_cannot_break_the_utf8_line(self):
+        line = frame(1, "run", "rest", 2, 3, 4, None, None, None, None, "a\udcffb", None, encode_body({"h": "x\udcef"}))
+        record = json.loads(line.decode("ascii"))
+        self.assertEqual(("a\udcffb", "x\udcef"), (record["client_order_id"], record["body"]["h"]))
+
     def test_gap_has_the_complete_envelope_and_exact_range(self):
         record = json.loads(gap_line(10, "generated-uuid", "queue_full", 3, 8, 6, True))
         self.assertEqual({"type": "queue_full", "first_seq": 3, "last_seq": 8, "count": 6,

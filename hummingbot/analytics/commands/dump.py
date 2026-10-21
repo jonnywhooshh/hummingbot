@@ -1,5 +1,6 @@
 import argparse
 import sys
+import zlib
 from pathlib import Path
 from typing import BinaryIO, List, Optional, Tuple
 
@@ -42,7 +43,7 @@ def main(argv: List[str], out: Optional[BinaryIO] = None) -> int:
                 out.write(f"{source.path.name}: partial last line of {partial} bytes ignored\n".encode())
         out.flush()
         return 0
-    except (OSError, ValueError, KeyError, TypeError, EOFError) as error:
+    except (OSError, ValueError, KeyError, TypeError, EOFError, zlib.error) as error:
         out.write(f"manifest FAIL {error}\n".encode("utf-8"))
         return 1
 

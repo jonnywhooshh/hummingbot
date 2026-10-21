@@ -1,5 +1,6 @@
 import argparse
 import sys
+import zlib
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, TextIO, Tuple
@@ -7,7 +8,6 @@ from typing import Dict, List, Optional, TextIO, Tuple
 import ujson
 
 from hummingbot.analytics.recorder import segments, timing
-from hummingbot.analytics.recorder.envelope import payload_size
 from hummingbot.analytics.recorder.kinds import KINDS
 
 WINDOW_NS = 60_000_000_000
@@ -22,7 +22,7 @@ def main(argv: List[str], out: Optional[TextIO] = None) -> int:
     out = out or sys.stdout
     try:
         return _report(args.run, out)
-    except (OSError, ValueError, KeyError, TypeError, EOFError) as error:
+    except (OSError, ValueError, KeyError, TypeError, EOFError, zlib.error) as error:
         out.write(f"overhead FAIL {error}\n")
         return 1
 
@@ -40,11 +40,7 @@ def _report(run_dir: Path, out: TextIO) -> int:
             continue
         us = record["hook_ns"] / 1000
         if kind is not None and kind.per_kib_us:
-            size = record.get("payload_bytes")
-            if size is None:
-                body = record["body"]
-                size = payload_size(body, ujson.dumps(body, ensure_ascii=False))
-            us -= kind.per_kib_us * size / 1024
+            us -= kind.per_kib_us * record["payload_bytes"] / 1024
         samples[name].append(us)
         events.append((record["t_mono_ns"], record["hook_ns"]))
         if name == "host":
