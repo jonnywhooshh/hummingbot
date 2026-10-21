@@ -86,6 +86,18 @@ class ActiveSegment:
         self.first_seq = seq if self.first_seq is None else min(self.first_seq, seq)
         self.last_seq = seq if self.last_seq is None else max(self.last_seq, seq)
 
+    def add_batch(self, batch: List[Tuple[int, bool, bytes]]) -> None:
+        """Add queue items in one pass of C-level calls. The caller has checked that the batch fits."""
+        seqs, _, lines = zip(*batch)
+        if self.opened is None:
+            self.opened = time.monotonic()
+        self._pending.extend(lines)
+        self.size += sum(map(len, lines))
+        self.records += len(lines)
+        low, high = min(seqs), max(seqs)
+        self.first_seq = low if self.first_seq is None else min(self.first_seq, low)
+        self.last_seq = high if self.last_seq is None else max(self.last_seq, high)
+
     def flush(self) -> None:
         if not self._pending:
             return
