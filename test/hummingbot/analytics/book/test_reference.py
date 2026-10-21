@@ -112,18 +112,21 @@ class BookReferenceTests(TestCase):
         self.assertEqual(Decimal("98"), observation.mh)
 
     def test_undefined_mid_is_invalid_without_falling_back_from_a_known_bot_book(self):
-        bot = BookStream()
-        bot.apply_snapshot({"lastUpdateId": 10, "bids": [], "asks": [["101", "1"]]}, timestamp_ns=0)
-        bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=SECOND // 2)
-        bot.apply_diff({"U": 12, "u": 12, "b": [], "a": []}, timestamp_ns=3 * SECOND)
-        reference = BookReference(bot, sidecar=stream_with_move(), run_end_ns=4 * SECOND)
-        observation = reference.observe(SECOND, SECOND)
-        self.assertEqual("invalid", observation.status)
-        self.assertEqual("mid_undefined", observation.reason)
-        self.assertEqual("bot", observation.source)
-        self.assertIsNone(observation.m0)
-        self.assertIsNone(observation.mh)
-        self.assertTrue(reference.known(SECOND))
+        for bids, asks in (([], [["101", "1"]]), ([["99", "1"]], []),
+                           ([["102", "1"]], [["101", "1"]])):
+            with self.subTest(bids=bids, asks=asks):
+                bot = BookStream()
+                bot.apply_snapshot({"lastUpdateId": 10, "bids": bids, "asks": asks}, timestamp_ns=0)
+                bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=SECOND // 2)
+                bot.apply_diff({"U": 12, "u": 12, "b": [], "a": []}, timestamp_ns=3 * SECOND)
+                reference = BookReference(bot, sidecar=stream_with_move(), run_end_ns=4 * SECOND)
+                observation = reference.observe(SECOND, SECOND)
+                self.assertEqual("invalid", observation.status)
+                self.assertEqual("mid_undefined", observation.reason)
+                self.assertEqual("bot", observation.source)
+                self.assertIsNone(observation.m0)
+                self.assertIsNone(observation.mh)
+                self.assertTrue(reference.known(SECOND))
 
     def test_receipt_clock_is_labeled_and_not_mixed_with_venue_clock(self):
         receipt = stream_with_move(clock_basis="receipt")

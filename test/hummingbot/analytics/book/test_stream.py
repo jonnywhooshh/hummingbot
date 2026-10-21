@@ -385,7 +385,7 @@ class BookStreamTests(TestCase):
         stream.apply_diff(diff(16), timestamp_ns=6_000)
         stream.apply_diff(diff(17), timestamp_ns=7_000)
         self.assertEqual((10_000, 20_000), tuple(interval.snapshot_received_ns
-                                               for interval in stream.known_intervals))
+                                                 for interval in stream.known_intervals))
         self.assertEqual(Decimal("99"), stream.mid_at(6_000))
 
     def test_adjacent_resync_stretches_do_not_overlap_at_a_shared_timestamp(self):
@@ -424,3 +424,16 @@ class BookStreamTests(TestCase):
         self.assertTrue(stream.known(2_000, strictly_before=True))
         self.assertEqual(Decimal("100"), stream.mid_at(2_000, strictly_before=True))
         self.assertFalse(stream.known(2_000))
+
+    def test_known_interval_duration_does_not_double_count_a_resync_timestamp(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(), timestamp_ns=0)
+        stream.apply_diff(diff(11), timestamp_ns=1_000)
+        stream.apply_diff(diff(12), timestamp_ns=2_000)
+        stream.apply_snapshot(snapshot(uid=13), timestamp_ns=5_000)
+        stream.apply_diff(diff(14), timestamp_ns=2_000)
+        stream.apply_diff(diff(15), timestamp_ns=3_000)
+        intervals = stream.known_intervals
+        duration = sum(interval.end_ns - interval.start_ns + 1 for interval in intervals)
+        self.assertEqual(intervals[-1].end_ns - intervals[0].start_ns + 1, duration)
+        self.assertLess(intervals[0].end_ns, intervals[1].start_ns)
