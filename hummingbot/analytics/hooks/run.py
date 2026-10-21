@@ -91,6 +91,7 @@ def finish(path: str, reason: Optional[str] = None, exception: Optional[BaseExce
     _run = None
     try:
         run.task.cancel()
+        run.sampler.close()
         for capture in run.connectors.values():
             capture.close()
         logging.getLogger("hummingbot").removeHandler(run.handler)
