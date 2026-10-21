@@ -499,6 +499,35 @@ class BookStreamTests(TestCase):
         stream.apply_diff(diff(14), timestamp_ns=2_000)
         self.assertEqual((KnownInterval(1_000, 1_999, 1),), stream.known_intervals)
 
+    def test_snapshot_at_the_last_applied_update_waits_for_its_covering_diff(self):
+        for received_in_stretch in (True, False):
+            with self.subTest(received_in_stretch=received_in_stretch):
+                stream = BookStream()
+                stream.apply_snapshot(snapshot(uid=10), timestamp_ns=0)
+                stream.apply_diff(diff(11), timestamp_ns=1_000)
+                stream.apply_diff(diff(12), timestamp_ns=2_000)
+                if received_in_stretch:
+                    stream.apply_snapshot(snapshot(uid=12, bids=[["98", "1"]]), timestamp_ns=7)
+                stream.apply_diff(diff(12), timestamp_ns=3_000)
+                if not received_in_stretch:
+                    stream.apply_snapshot(snapshot(uid=12, bids=[["98", "1"]]), timestamp_ns=7)
+                stream.apply_diff(diff(13), timestamp_ns=4_000)
+                stream.apply_diff(diff(14), timestamp_ns=5_000)
+                self.assertEqual(KnownInterval(4_000, 4_999, 7), stream.known_intervals[-1])
+                self.assertEqual(Decimal("99.5"), stream.mid_at(4_000))
+
+    def test_snapshot_starts_at_the_first_covering_buffered_frame_not_a_duplicate(self):
+        stream = BookStream()
+        stream.apply_diff(diff(11), timestamp_ns=1_000)
+        stream.apply_diff(diff(12, bids=[["99", "0"], ["98", "1"]]), timestamp_ns=2_000)
+        stream.apply_diff(diff(12, bids=[["98", "0"], ["97", "1"]]), timestamp_ns=3_000)
+        stream.apply_diff(diff(13), timestamp_ns=4_000)
+        stream.apply_diff(diff(14), timestamp_ns=5_000)
+        stream.apply_snapshot(snapshot(uid=11), timestamp_ns=1)
+        self.assertEqual((), stream.known_intervals)
+        self.assertFalse(stream.known(3_000))
+        self.assertFalse(stream.known(4_000))
+
     def test_candidate_limit_must_be_a_positive_integer(self):
         for limit in (0, -1, 1.5):
             with self.subTest(limit=limit), self.assertRaises(ValueError):

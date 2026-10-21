@@ -16,7 +16,7 @@ are kept as candidates, at most ``max_snapshot_candidates`` of them, 8 by
 default. The lowest update ID is evicted first. When several candidates cover
 the same diff, the highest update ID supplies the book and the receipt time.
 Snapshots that cannot cover the buffer or any later diff are discarded.
-Inside a stretch, a snapshot beyond the last applied update is kept for
+Inside a stretch, a snapshot at or beyond the last applied update is kept for
 recovery and never disturbs the running stretch. After a gap, the first diff
 that a candidate covers starts the next stretch. The same sequence rule applies
 on a receipt clock.
@@ -196,7 +196,7 @@ class BookStream:
             raise TypeError("timestamp_ns must be an integer")
         snapshot = _Snapshot(update_id, bids, asks, timestamp_ns)
         if self._current is not None:
-            if update_id > self._last_update_id:
+            if update_id >= self._last_update_id:
                 self._add_candidate(snapshot)
             return
         frames = list(self._buffer)
@@ -219,7 +219,6 @@ class BookStream:
         self._update(self._bids, snapshot.bids.items())
         self._update(self._asks, snapshot.asks.items())
         self._last_update_id = snapshot.update_id
-        self._candidates = [c for c in self._candidates if c.update_id > snapshot.update_id]
         self._buffer = deque(maxlen=self._buffer.maxlen)
         self._current = _Stretch(snapshot.received_ns)
         self._stretches.append(self._current)
@@ -246,7 +245,7 @@ class BookStream:
         self._update(self._asks, frame.asks)
         self._last_update_id = frame.last
         if self._candidates:
-            self._candidates = [c for c in self._candidates if c.update_id > frame.last]
+            self._candidates = [c for c in self._candidates if c.update_id >= frame.last]
         self._current.append(self._point(frame.timestamp_ns))
 
     def _apply_diff(self, frame: _DepthDiff) -> None:

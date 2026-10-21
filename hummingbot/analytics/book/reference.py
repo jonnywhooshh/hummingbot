@@ -5,11 +5,10 @@ clock. The run end is explicit. A later continuous depth frame must confirm
 silence. Only venue-clock streams can share a sidecar reference. Receipt-clock
 results use the bot's own clock and remain separate from venue-clock results.
 Phase 3 consumes two invalid reasons. ``book_unknown`` means that the stream
-cannot prove the required pre-fill or horizon book, including a fill at the
-first covering diff. ``mid_undefined`` means that the required book is known
-but a side is empty or the best bid exceeds the best ask. A known bot book
-with an undefined mid never falls back to the sidecar. An unknown fill is
-invalid even when its horizon is pending.
+cannot prove the required pre-fill or horizon book. ``mid_undefined`` means
+that the required book is known but a side is empty or the best bid exceeds
+the best ask. A known bot book with an undefined mid never falls back to the
+sidecar. An unknown fill is invalid even when its horizon is pending.
 
 ``known`` and ``mid_at`` answer the horizon question by default. Pass
 ``strictly_before=True`` for the pre-fill book ``m0``, which is what
