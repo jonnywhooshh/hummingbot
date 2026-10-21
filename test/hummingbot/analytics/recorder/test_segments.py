@@ -100,22 +100,48 @@ class PartialWriteTest(RunTestCase):
         self.addCleanup(lambda: segment.fd >= 0 and os.close(segment.fd))
         line = b'{"seq":1}\n'
         segment.add(1, line)
-        real_write = os.write
-        calls = iter([lambda fd, view: real_write(fd, bytes(view)[:5]), OSError("disk error"), None])
+        real_writev = os.writev
+        calls = iter([lambda fd, buffers: real_writev(fd, [b"".join(buffers)[:5]]), OSError("disk error"), None])
 
-        def write(fd, view):
+        def writev(fd, buffers):
             step = next(calls)
             if step is None:
-                return real_write(fd, view)
+                return real_writev(fd, buffers)
             if isinstance(step, OSError):
                 raise step
-            return step(fd, view)
+            return step(fd, buffers)
 
-        with patch("hummingbot.analytics.recorder.segments.os.write", side_effect=write):
+        with patch("hummingbot.analytics.recorder.segments.os.writev", side_effect=writev):
             with self.assertRaises(OSError):
                 segment.flush()
             segment.abandon()
         self.assertEqual(line, (self.root / "seg-000001.jsonl").read_bytes())
+
+
+    def test_flush_completes_a_writev_that_stops_inside_a_later_line(self):
+        segment = segments.ActiveSegment(self.root, 1)
+        self.addCleanup(lambda: segment.fd >= 0 and os.close(segment.fd))
+        lines = [b'{"seq":%d}\n' % seq for seq in (1, 2, 3)]
+        for seq, line in enumerate(lines, start=1):
+            segment.add(seq, line)
+        real_writev = os.writev
+        short = iter([True])
+
+        def writev(fd, buffers):
+            if next(short, False):
+                return real_writev(fd, [b"".join(buffers)[:15]])
+            return real_writev(fd, buffers)
+
+        with patch("hummingbot.analytics.recorder.segments.os.writev", side_effect=writev):
+            segment.flush()
+        self.assertEqual(b"".join(lines), (self.root / "seg-000001.jsonl").read_bytes())
+
+    def test_add_batch_tracks_records_size_and_sequence_bounds(self):
+        segment = segments.ActiveSegment(self.root, 1)
+        self.addCleanup(lambda: segment.fd >= 0 and os.close(segment.fd))
+        segment.add(7, b"a\n")
+        segment.add_batch([(3, True, b"bb\n"), (9, False, b"c\n")])
+        self.assertEqual((3, 7, 3, 9), (segment.records, segment.size, segment.first_seq, segment.last_seq))
 
 
 class AbandonedCloseTest(RunTestCase):
