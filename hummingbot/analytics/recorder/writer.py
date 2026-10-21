@@ -30,10 +30,12 @@ class Finish(NamedTuple):
 class Writer:
     """Own all run files. Hook bodies arrive only as immutable bytes, never as live bot objects."""
 
-    def __init__(self, run_dir: Path, settings, queue: CaptureQueue, make_gap: GapFactory):
+    def __init__(self, run_dir: Path, settings, queue: CaptureQueue, make_gap: GapFactory,
+                 emit_diagnostics: Callable[[], None]):
         self.run_dir = run_dir
         self.queue = queue
         self.make_gap = make_gap
+        self.emit_diagnostics = emit_diagnostics
         self.interval = settings.flush_interval_ms / 1000
         self.segment_max_bytes = settings.segment_max_bytes
         self.segment_max_seconds = settings.segment_max_seconds
@@ -105,6 +107,7 @@ class Writer:
                             return
                 if not self._paused and len(self.queue):
                     continue
+                self.emit_diagnostics()
                 self._wake.wait(self.interval)
                 self._wake.clear()
         except Abandoned:
@@ -116,6 +119,7 @@ class Writer:
         finally:
             self._give_up()
             self._drained.set()
+            self.emit_diagnostics()
 
     def _step(self) -> bool:
         self._check_disk()
