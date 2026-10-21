@@ -4,7 +4,7 @@ import json
 import unittest
 from decimal import Decimal
 
-from hummingbot.analytics.recorder.envelope import encode_body, frame, gap_line, payload
+from hummingbot.analytics.recorder.envelope import encode_body, frame, gap_line, payload, payload_size
 
 
 class EnvelopeTest(unittest.TestCase):
@@ -47,6 +47,26 @@ class EnvelopeTest(unittest.TestCase):
         line = frame(1, "run", "rest", 2, 3, 4, None, None, None, None, "a\udcffb", None, encode_body({"h": "x\udcef"}))
         record = json.loads(line.decode("ascii"))
         self.assertEqual(("a\udcffb", "x\udcef"), (record["client_order_id"], record["body"]["h"]))
+
+    def test_every_header_field_round_trips_including_quotes_unicode_and_null(self):
+        line = frame(7, "run", "rest", 2, 3, 4, 'c"on\\n', "SOL/USDC", None, "雪\n", "id\x00", None, "{}", 9)
+        self.assertTrue(line.endswith(b"}\n"))
+        self.assertTrue(line.isascii())
+        record = json.loads(line)
+        self.assertEqual({"seq": 7, "run_id": "run", "kind": "rest", "t_wall_ns": 2, "t_mono_ns": 3, "hook_ns": 4,
+                          "payload_bytes": 9, "connector": 'c"on\\n', "trading_pair": "SOL/USDC",
+                          "controller_id": None, "executor_id": "雪\n", "client_order_id": "id\x00",
+                          "exchange_order_id": None, "body": {}}, record)
+        self.assertEqual(["seq", "run_id", "kind", "t_wall_ns", "t_mono_ns", "hook_ns", "payload_bytes", "connector",
+                          "trading_pair", "controller_id", "executor_id", "client_order_id", "exchange_order_id",
+                          "body"], list(record))
+
+    def test_payload_size_counts_the_utf8_bytes_of_text_and_the_decoded_bytes_of_base64(self):
+        for text in ("plain ascii", "雪 and é", ""):
+            body = {"text": text}
+            self.assertEqual(len(text.encode()), payload_size(body, encode_body(body)))
+        self.assertEqual(256, payload_size(*(lambda b: (b, encode_body(b)))(payload(bytes(range(256))))))
+        self.assertEqual(len('{"k":"é"}'.replace("é", "\\u00e9")), payload_size({"k": "é"}, encode_body({"k": "é"})))
 
     def test_gap_has_the_complete_envelope_and_exact_range(self):
         record = json.loads(gap_line(10, "generated-uuid", "queue_full", 3, 8, 6, True))
