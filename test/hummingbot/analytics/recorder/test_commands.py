@@ -96,8 +96,7 @@ class CommandsTest(RunTestCase):
     def test_overhead_adjusts_each_payload_before_computing_p99(self):
         body = {"b64": base64.b64encode(b"\xff" * 1024).decode()}
         for duration, expected in ((72000, 0), (73000, 1)):
-            run_dir = self.fixture_run([{"kind": "ws_in", "hook_ns": duration, "body": body,
-                                          "payload_bytes": 1024}])
+            run_dir = self.fixture_run([{"kind": "ws_in", "hook_ns": duration, "body": body, "payload_bytes": 1024}])
             out = io.StringIO()
             self.assertEqual(expected, overhead.main(["--run", str(run_dir)], out))
             self.assertIn("records*", out.getvalue())
