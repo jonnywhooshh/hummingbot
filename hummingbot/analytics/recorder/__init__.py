@@ -53,9 +53,15 @@ class _Run:
         self.queue = CaptureQueue(settings.queue_max_bytes, settings.queue_max_bytes + settings.priority_reserve_bytes)
         self.off_thread = 0
         self.off_thread_lock = threading.Lock()
-        self.writer = Writer(run_dir, settings, self.queue, self.writer_gap, _emit_diagnostics)
+        self.writer = Writer(run_dir, settings, self.queue, self.writer_gap, _emit_diagnostics, self.writer_dead)
         self.writer.run_json = _run_json(run_id, None, None)
         self.run_start_json: Optional[str] = None
+
+    def writer_dead(self) -> None:
+        """The writer can write no more, so hooks stop building records. A run that already ended is left alone."""
+        global ACTIVE
+        if _run is self:
+            ACTIVE = False
 
     def writer_gap(self, gap_type: str, first: int, last: Optional[int], count: Optional[int],
                    priority: bool) -> Tuple[int, bytes]:
