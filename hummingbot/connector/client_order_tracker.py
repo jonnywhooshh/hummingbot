@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional
 
 from cachetools import TTLCache
 
+from hummingbot.analytics import recorder
+from hummingbot.analytics.hooks import orders as order_hooks
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.trade_fee import TradeFeeBase
@@ -198,9 +200,13 @@ class ClientOrderTracker:
         return found_order
 
     def process_order_update(self, order_update: OrderUpdate):
+        if recorder.ACTIVE:
+            order_hooks.order_update(self._connector, order_update)
         return safe_ensure_future(self._process_order_update(order_update))
 
     def process_trade_update(self, trade_update: TradeUpdate):
+        if recorder.ACTIVE:
+            order_hooks.trade_update(self._connector, trade_update)
         client_order_id: str = trade_update.client_order_id
         tracked_order: Optional[InFlightOrder] = self.all_fillable_orders.get(client_order_id)
 
