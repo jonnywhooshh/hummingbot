@@ -26,6 +26,8 @@ def accounting_context(operation):
 
     The outermost call swaps the context in. Nested calls reuse it. Keyword
     amounts widen the working precision; positional arguments are never amounts.
+    apply and value inline this swap, because the wrapper's argument tuple and
+    dict are garbage-collector work on a path run once per event.
     """
     @wraps(operation)
     def calculate(ledger, *args, **kwargs):
@@ -58,7 +60,9 @@ def _sub(a: Union[Decimal, Fraction], b: Union[Decimal, Fraction]) -> Union[Deci
 
 
 def _to_decimal(value: Union[Decimal, Fraction], context) -> Decimal:
-    return _ratio_decimal(*value.as_integer_ratio(), context)
+    if type(value) is Decimal:
+        return context.plus(value) if value else ZERO
+    return _ratio_decimal(value.numerator, value.denominator, context)
 
 
 def _ratio_decimal(n: int, d: int, context) -> Decimal:
@@ -86,7 +90,7 @@ def _ratio_decimal(n: int, d: int, context) -> Decimal:
     return context.plus(Decimal(f"{'-' if negative else ''}{q}E{-shift}"))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EquityPoint:
     t: int
     equity: Optional[Decimal]
@@ -248,8 +252,19 @@ class Ledger:
             cached = self._realized_cache = (self._context.prec, _to_decimal(realized, self._context))
         return cached[1]
 
-    @accounting_context
     def apply(self, event: Union[Fill, FundingPayment, Transfer]) -> None:
+        if self._active:
+            return self._apply(event)
+        caller = getcontext()
+        setcontext(self._context)
+        self._active = True
+        try:
+            self._apply(event)
+        finally:
+            self._active = False
+            setcontext(caller)
+
+    def _apply(self, event: Union[Fill, FundingPayment, Transfer]) -> None:
         if isinstance(event, Fill):
             kind = 0
         elif isinstance(event, FundingPayment):
@@ -381,29 +396,51 @@ class Ledger:
             else:
                 self._lots.append((q, cost))
 
-    @accounting_context
     def value(self, t: int, *, mark: Optional[Decimal] = None) -> EquityPoint:
+        if self._active:
+            return self._value(t, mark)
+        caller = getcontext()
+        setcontext(self._context)
+        self._active = True
+        try:
+            if mark is not None:
+                self._observe(mark)
+            return self._value(t, mark)
+        finally:
+            self._active = False
+            setcontext(caller)
+
+    def _value(self, t: int, mark: Optional[Decimal]) -> EquityPoint:
         venue_time(t)
         if t < self.last_t:
             raise ValueError("cannot value behind the last applied event")
         if mark is not None and decimal_amount(mark, "mark") <= ZERO:
             raise ValueError("mark must be positive")
-        mid = self.token_mid(self.instrument, t)
+        mid = instrument_mid = self.token_mid(self.instrument, t)
         mark_valued = mid is None and mark is not None
         if mid is None:
             mid = mark
-        missing = set()
+        missing = None
         token_value = ZERO
         for token, quantity in self._held.items():
             if not quantity:
                 continue
-            price = mid if self.market == "spot" and token == self.base_token else self.token_mid(token, t)
+            if self.market == "spot" and token == self.base_token:
+                price = mid
+            elif token == self.instrument:
+                price = instrument_mid
+            else:
+                price = self.token_mid(token, t)
             if price is None:
+                if missing is None:
+                    missing = set()
                 missing.add(token)
             else:
                 token_value += quantity * price
         exposure = self.opening.pos_open + self.trade_quantity
         if mid is None and exposure:
+            if missing is None:
+                missing = set()
             missing.add(self.instrument)
         equity = None
         if not missing:
@@ -412,9 +449,13 @@ class Ledger:
                       - self.trade_notional + token_value + self.funding)
         entry = None
         if self._lots and not self._unknown_cost_quantity:
-            notional_n, notional_d = self._cost_notional.as_integer_ratio()
-            quantity_n, quantity_d = self._cost_quantity.as_integer_ratio()
-            entry = _ratio_decimal(notional_n * quantity_d, notional_d * quantity_n, self._context)
+            notional = self._cost_notional
+            if type(notional) is Decimal:
+                entry = self._context.divide(notional, self._cost_quantity)
+            else:
+                quantity_n, quantity_d = self._cost_quantity.as_integer_ratio()
+                entry = _ratio_decimal(notional.numerator * quantity_d, notional.denominator * quantity_n,
+                                       self._context)
         flows = self.external_flows
         net_pnl = None if equity is None or flows is None else equity - self.opening.E_open - flows
         return EquityPoint(t, equity, mid, self._position(), self._realized_decimal(), entry, mark_valued,
