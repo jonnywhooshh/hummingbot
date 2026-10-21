@@ -10,7 +10,7 @@ from typing import Callable, List, NamedTuple, Optional, Tuple
 from hummingbot.analytics.recorder.queue import CaptureQueue, Item
 from hummingbot.analytics.recorder.segments import Abandoned, ActiveSegment, write_run_json
 
-BATCH_BYTES = 8 * 1024 * 1024
+BATCH_BYTES = 1024 * 1024
 BATCH_ITEMS = 1024
 logger = logging.getLogger(__name__)
 GapFactory = Callable[[str, int, Optional[int], Optional[int], bool], Tuple[int, bytes]]
@@ -57,7 +57,6 @@ class Writer:
         self._next_number = 1
         self._gaps_written = set()
         self._last_sync = time.monotonic()
-        self._last_disk_check = float("-inf")
         self._paused = False
         self._finish: Optional[Finish] = None
         self._lock = threading.Lock()
@@ -219,11 +218,6 @@ class Writer:
         self._last_sync = time.monotonic()
 
     def _check_disk(self) -> None:
-        """Check free space once per flush interval, because every syscall costs the trading thread a GIL handoff."""
-        now = time.monotonic()
-        if now - self._last_disk_check < self.interval:
-            return
-        self._last_disk_check = now
         stat = os.statvfs(self.run_dir)
         self.free_bytes = stat.f_bavail * stat.f_frsize
         before = self.state
