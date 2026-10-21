@@ -117,7 +117,6 @@ class PartialWriteTest(RunTestCase):
             segment.abandon()
         self.assertEqual(line, (self.root / "seg-000001.jsonl").read_bytes())
 
-
     def test_flush_completes_a_writev_that_stops_inside_a_later_line(self):
         segment = segments.ActiveSegment(self.root, 1)
         self.addCleanup(lambda: segment.fd >= 0 and os.close(segment.fd))
