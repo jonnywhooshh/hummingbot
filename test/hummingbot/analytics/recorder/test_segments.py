@@ -92,3 +92,27 @@ class SegmentRecoveryTest(RunTestCase):
         self.assertFalse((self.root / "manifest.jsonl").exists())
         chosen = segments.sources(self.root, [])
         self.assertEqual([Path("seg-000001.jsonl")], [source.path.relative_to(self.root) for source in chosen])
+
+
+class PartialWriteTest(RunTestCase):
+    def test_abandon_after_a_short_write_completes_the_line_instead_of_replaying_the_batch(self):
+        segment = segments.ActiveSegment(self.root, 1)
+        self.addCleanup(lambda: segment.fd >= 0 and os.close(segment.fd))
+        line = b'{"seq":1}\n'
+        segment.add(1, line)
+        real_write = os.write
+        calls = iter([lambda fd, view: real_write(fd, bytes(view)[:5]), OSError("disk error"), None])
+
+        def write(fd, view):
+            step = next(calls)
+            if step is None:
+                return real_write(fd, view)
+            if isinstance(step, OSError):
+                raise step
+            return step(fd, view)
+
+        with patch("hummingbot.analytics.recorder.segments.os.write", side_effect=write):
+            with self.assertRaises(OSError):
+                segment.flush()
+            segment.abandon()
+        self.assertEqual(line, (self.root / "seg-000001.jsonl").read_bytes())
