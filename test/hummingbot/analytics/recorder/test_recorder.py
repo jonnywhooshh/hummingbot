@@ -235,3 +235,42 @@ class OffThreadTest(RunTestCase):
         self.assertTrue(recorder.on_capture_thread())
         self.assertTrue(recorder.end_run({"path": "test"}))
         self.assertFalse(recorder.on_capture_thread())
+
+
+class DiscardedCountTest(RunTestCase):
+    def setUp(self):
+        super().setUp()
+        patcher = patch.object(recorder, "_discarded", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_run_start_reports_unknown_not_zero_when_no_record_call_arrived_before_the_run(self):
+        run_dir = self.start()
+        recorder.write_run_start({})
+        body = next(row["body"] for row in self.wait_records(run_dir, "run_start"))
+        self.assertIsNone(body["discarded_before_run"])
+        self.assertTrue(body["discarded_before_run_reason"])
+
+    def test_run_start_counts_record_calls_made_while_capture_was_inactive(self):
+        recorder.end_run({})
+        for _ in range(3):
+            self.record("clock", {})
+        run_dir = self.start()
+        recorder.write_run_start({})
+        body = next(row["body"] for row in self.wait_records(run_dir, "run_start"))
+        self.assertEqual(3, body["discarded_before_run"])
+        self.assertNotIn("discarded_before_run_reason", body)
+
+    def wait_records(self, run_dir, kind):
+        self.wait_for(lambda: any(row["kind"] == kind for row in self.records(run_dir)))
+        return [row for row in self.records(run_dir) if row["kind"] == kind]
+
+
+class PayloadBytesTest(RunTestCase):
+    def test_only_kinds_with_a_per_kib_allowance_measure_their_payload(self):
+        run_dir = self.start()
+        self.record("clock", {"text": "unrelated key"})
+        self.record("ws_in", {"text": "héllo"})
+        self.assertTrue(recorder.end_run({}))
+        sizes = {row["kind"]: row["payload_bytes"] for row in self.records(run_dir)}
+        self.assertEqual((0, 6), (sizes["clock"], sizes["ws_in"]))
