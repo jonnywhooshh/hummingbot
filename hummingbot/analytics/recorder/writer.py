@@ -3,10 +3,11 @@ import os
 import threading
 import time
 from enum import Enum
+from operator import itemgetter
 from pathlib import Path
-from typing import Callable, NamedTuple, Optional, Tuple
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
-from hummingbot.analytics.recorder.queue import CaptureQueue
+from hummingbot.analytics.recorder.queue import CaptureQueue, Item
 from hummingbot.analytics.recorder.segments import Abandoned, ActiveSegment, write_run_json
 
 BATCH_BYTES = 64 * 1024
@@ -126,18 +127,13 @@ class Writer:
     def _step(self) -> bool:
         self._check_disk()
         self._write_run_json(self.run_json)
-        size = 0
-        for _ in range(BATCH_ITEMS):
+        batch = self.queue.pop_batch(BATCH_ITEMS, BATCH_BYTES)
+        if batch:
             self._check_deadline()
-            item = self.queue.pop()
-            if item is None:
-                break
-            seq, priority, line = item
-            if self._admit(seq, priority):
-                self._append(seq, line)
-            size += len(line)
-            if size >= BATCH_BYTES:
-                break
+            if not self._append_batch(batch):
+                for seq, priority, line in batch:
+                    if self._admit(seq, priority):
+                        self._append(seq, line)
         if self.state not in (DiskState.FULL, DiskState.FAILED):
             for first, last, priority in self.queue.take_drops():
                 seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
@@ -166,6 +162,17 @@ class Writer:
         self._write_run_json(finish.run_json)
         self._check_deadline()
         self.clean = True
+        return True
+
+    def _append_batch(self, batch: List[Item]) -> bool:
+        """Append a whole batch when nothing needs a per-record decision, so the GIL is held for microseconds."""
+        segment = self._segment
+        if self.state is not DiskState.OK or segment is None:
+            return False
+        if segment.size + sum(map(len, map(itemgetter(2), batch))) > self.segment_max_bytes:
+            return False
+        segment.add_batch(batch)
+        self.written += len(batch)
         return True
 
     def _admit(self, seq: int, priority: bool) -> bool:
