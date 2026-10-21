@@ -5,8 +5,9 @@ in microseconds. Receipt-clock diffs require an explicit ``timestamp_ns`` on
 the bot's local clock.
 
 Backpack REST snapshots have no engine timestamp. Their ``timestamp_ns`` is
-receipt metadata, not a venue-time ordering constraint or a known-interval
-boundary. Feed snapshots in capture order and diffs in engine-time order.
+receipt metadata, recorded as ``snapshot_received_ns`` on known intervals,
+not a venue-time ordering constraint or interval boundary. Feed snapshots in
+capture order and diffs in engine-time order.
 Diffs received before a usable snapshot are buffered. A snapshot becomes
 known only at the first diff covering ``lastUpdateId + 1``, including buffered
 diffs that predate the response receipt. Equal or lagging snapshots cannot
@@ -44,6 +45,7 @@ class StreamState(Enum):
 class KnownInterval:
     start_ns: int
     end_ns: int
+    snapshot_received_ns: int
 
 
 @dataclass(frozen=True)
@@ -72,14 +74,13 @@ class _Snapshot:
 
 @dataclass
 class _Stretch:
+    snapshot_received_ns: int
     points: list[BookPoint] = field(default_factory=list)
     times: list[int] = field(default_factory=list)
-    end_ns: int = 0
 
     def append(self, point: BookPoint) -> None:
         self.points.append(point)
         self.times.append(point.timestamp_ns)
-        self.end_ns = point.timestamp_ns
 
 
 def _level(price: Any, quantity: Any) -> Tuple[Decimal, Decimal]:
@@ -180,7 +181,7 @@ class BookStream:
         self._update(self._bids, snapshot.bids.items())
         self._update(self._asks, snapshot.asks.items())
         self._last_update_id = snapshot.update_id
-        self._current = _Stretch()
+        self._current = _Stretch(snapshot.received_ns)
         buffered, self._buffer = self._buffer, deque(maxlen=self._buffer.maxlen)
         self.state = StreamState.AWAITING_DIFF
         for frame in buffered:
@@ -211,8 +212,6 @@ class BookStream:
         else:
             continuous = first == self._last_update_id + 1
         if not continuous:
-            if self._current is not None and self._current.times:
-                self._current.end_ns = min(self._current.end_ns, timestamp_ns - 1)
             self.state = StreamState.NEED_SNAPSHOT
             self._current = None
             self._buffer_diff(frame)
@@ -226,8 +225,6 @@ class BookStream:
         if self._pending_snapshot is not None and last >= self._pending_snapshot.update_id:
             self._pending_snapshot = None
         if self.state is StreamState.AWAITING_DIFF:
-            if self._stretches and self._stretches[-1].end_ns >= timestamp_ns:
-                self._stretches[-1].end_ns = timestamp_ns - 1
             self._stretches.append(self._current)
             self._starts.append(timestamp_ns)
             self.state = StreamState.CONTINUOUS
@@ -235,7 +232,7 @@ class BookStream:
 
     @property
     def known_intervals(self) -> Tuple[KnownInterval, ...]:
-        return tuple(KnownInterval(s.times[0], min(s.end_ns, s.times[-1] - 1))
+        return tuple(KnownInterval(s.times[0], s.times[-1] - 1, s.snapshot_received_ns)
                      for s in self._stretches if s.times[0] < s.times[-1])
 
     def _stretch_at(self, timestamp_ns: int, *, strictly_before: bool = False) -> Optional[_Stretch]:
@@ -244,9 +241,9 @@ class BookStream:
             return None
         stretch = self._stretches[index]
         if strictly_before:
-            confirmed = stretch.times[0] < timestamp_ns <= stretch.end_ns
+            confirmed = stretch.times[0] < timestamp_ns <= stretch.times[-1]
         else:
-            confirmed = timestamp_ns < stretch.times[-1] and timestamp_ns <= stretch.end_ns
+            confirmed = timestamp_ns < stretch.times[-1]
         return stretch if confirmed else None
 
     def known(self, timestamp_ns: int, *, strictly_before: bool = False) -> bool:
