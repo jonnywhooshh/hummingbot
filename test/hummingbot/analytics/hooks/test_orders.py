@@ -71,7 +71,7 @@ class OrderHooksTest(IsolatedAsyncioWrapperTestCase):
                       trading_pair="SOL-USDC", fill_timestamp=1700000002.125, fill_price=Decimal("149.5"),
                       fill_base_amount=Decimal("0.01"), fill_quote_amount=Decimal("1.495"),
                       fee=AddedToCostTradeFee(percent=Decimal("0.0002"), percent_token="USDC",
-                                             flat_fees=[TokenAmount("USDC", Decimal("0.000000123"))]))
+                                              flat_fees=[TokenAmount("USDC", Decimal("0.000000123"))]))
         fields.update(overrides)
         return TradeUpdate(**fields)
 
