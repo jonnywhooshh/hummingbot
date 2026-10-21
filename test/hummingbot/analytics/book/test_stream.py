@@ -340,3 +340,37 @@ class BookStreamTests(TestCase):
         stream.apply_diff(diff(102), timestamp_ns=3)
         self.assertEqual(StreamState.CONTINUOUS, stream.state)
         self.assertEqual(Decimal("99"), stream.mid_at(2))
+
+    def test_buffer_is_bounded_and_recovery_requires_a_snapshot_covering_dropped_updates(self):
+        for after_gap in (False, True):
+            with self.subTest(after_gap=after_gap):
+                stream = BookStream(max_buffered_diffs=2)
+                if after_gap:
+                    stream.apply_snapshot(snapshot(), timestamp_ns=0)
+                    stream.apply_diff(diff(11), timestamp_ns=1)
+                stream.apply_diff(diff(13, bids=[["99", "0"], ["97", "1"]]), timestamp_ns=2)
+                stream.apply_diff(diff(14), timestamp_ns=3)
+                stream.apply_diff(diff(15), timestamp_ns=4)
+                self.assertEqual(2, stream.buffered_diff_count)
+                self.assertEqual(13, stream.buffer_dropped_through_update_id)
+                stream.apply_snapshot(snapshot(uid=11), timestamp_ns=5)
+                self.assertEqual(StreamState.NEED_SNAPSHOT, stream.state)
+                self.assertFalse(stream.known(3))
+                stream.apply_snapshot(snapshot(uid=13, bids=[["97", "1"]]), timestamp_ns=6)
+                self.assertEqual(StreamState.CONTINUOUS, stream.state)
+                self.assertEqual(0, stream.buffered_diff_count)
+                self.assertEqual(Decimal("99"), stream.mid_at(3))
+                self.assertEqual(13, stream.buffer_dropped_through_update_id)
+
+    def test_default_buffer_stays_bounded_without_any_snapshot(self):
+        stream = BookStream()
+        for uid in range(1, 5_001):
+            stream.apply_diff(diff(uid), timestamp_ns=uid)
+        self.assertEqual(4_096, stream.buffered_diff_count)
+        self.assertEqual(904, stream.buffer_dropped_through_update_id)
+        self.assertEqual((), stream.known_intervals)
+
+    def test_buffer_limit_must_be_a_positive_integer(self):
+        for limit in (0, -1, 1.5):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                BookStream(max_buffered_diffs=limit)

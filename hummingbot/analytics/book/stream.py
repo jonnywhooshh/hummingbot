@@ -17,9 +17,14 @@ the book only after a gap. The same sequence rule applies on a receipt clock.
 Only a continuous frame stamped strictly after a query confirms its complete
 timestamp group. Strict-before queries may use a frame at the query time.
 Known intervals have inclusive nanosecond bounds and exclude the last frame.
+
+Recovery retains at most ``max_buffered_diffs`` frames, 4,096 by default.
+``buffer_dropped_through_update_id`` records the highest evicted update ID.
+A recovery snapshot must cover that watermark before replay can resume.
 """
 
 from bisect import bisect_left, bisect_right
+from collections import deque
 from dataclasses import dataclass, field
 from decimal import Context, Decimal, localcontext
 from enum import Enum
@@ -98,9 +103,11 @@ def _levels(rows: Iterable[Sequence[Any]]) -> Iterable[Tuple[Decimal, Decimal]]:
 
 
 class BookStream:
-    def __init__(self, *, clock_basis: ClockBasis = "venue") -> None:
+    def __init__(self, *, clock_basis: ClockBasis = "venue", max_buffered_diffs: int = 4096) -> None:
         if clock_basis not in ("venue", "receipt"):
             raise ValueError("clock_basis must be venue or receipt")
+        if not isinstance(max_buffered_diffs, int) or max_buffered_diffs <= 0:
+            raise ValueError("max_buffered_diffs must be a positive integer")
         self.clock_basis = clock_basis
         self.state = StreamState.NEED_SNAPSHOT
         self._bids: dict[Decimal, Decimal] = {}
@@ -110,8 +117,20 @@ class BookStream:
         self._current: Optional[_Stretch] = None
         self._stretches: list[_Stretch] = []
         self._starts: list[int] = []
-        self._buffer: list[_DepthDiff] = []
+        self._buffer: deque[_DepthDiff] = deque(maxlen=max_buffered_diffs)
+        self.buffer_dropped_through_update_id: Optional[int] = None
         self._pending_snapshot: Optional[_Snapshot] = None
+
+    @property
+    def buffered_diff_count(self) -> int:
+        return len(self._buffer)
+
+    def _buffer_diff(self, frame: _DepthDiff) -> None:
+        if len(self._buffer) == self._buffer.maxlen:
+            dropped = self._buffer.popleft()
+            previous = self.buffer_dropped_through_update_id
+            self.buffer_dropped_through_update_id = dropped.last if previous is None else max(previous, dropped.last)
+        self._buffer.append(frame)
 
     def _check_time(self, timestamp_ns: int) -> None:
         if not isinstance(timestamp_ns, int):
@@ -154,12 +173,15 @@ class BookStream:
         self._install_snapshot(snapshot)
 
     def _install_snapshot(self, snapshot: _Snapshot) -> None:
+        if (self.buffer_dropped_through_update_id is not None
+                and snapshot.update_id < self.buffer_dropped_through_update_id):
+            return
         self._bids, self._asks = {}, {}
         self._update(self._bids, snapshot.bids.items())
         self._update(self._asks, snapshot.asks.items())
         self._last_update_id = snapshot.update_id
         self._current = _Stretch()
-        buffered, self._buffer = self._buffer, []
+        buffered, self._buffer = self._buffer, deque(maxlen=self._buffer.maxlen)
         self.state = StreamState.AWAITING_DIFF
         for frame in buffered:
             self._apply_diff(frame)
@@ -180,7 +202,7 @@ class BookStream:
     def _apply_diff(self, frame: _DepthDiff) -> None:
         first, last, timestamp_ns = frame.first, frame.last, frame.timestamp_ns
         if self.state is StreamState.NEED_SNAPSHOT:
-            self._buffer.append(frame)
+            self._buffer_diff(frame)
             return
         if self.state is StreamState.AWAITING_DIFF:
             if last <= self._last_update_id:
@@ -193,7 +215,7 @@ class BookStream:
                 self._current.end_ns = min(self._current.end_ns, timestamp_ns - 1)
             self.state = StreamState.NEED_SNAPSHOT
             self._current = None
-            self._buffer.append(frame)
+            self._buffer_diff(frame)
             if self._pending_snapshot is not None:
                 snapshot, self._pending_snapshot = self._pending_snapshot, None
                 self._install_snapshot(snapshot)
