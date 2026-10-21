@@ -36,6 +36,23 @@ class CaptureQueueTest(unittest.TestCase):
         queue.seal_drops()
         self.assertEqual([], queue.take_drops())
 
+    def test_pop_batch_returns_the_oldest_items_in_order_and_releases_their_bytes(self):
+        queue = CaptureQueue(10_000, 10_000)
+        for seq in range(1, 6):
+            queue.offer(seq, seq % 2 == 0, LINE)
+        self.assertEqual([(1, False, LINE), (2, True, LINE), (3, False, LINE)], queue.pop_batch(3, 10_000))
+        self.assertEqual(200, queue.depth_bytes)
+        self.assertEqual([(4, True, LINE), (5, False, LINE)], queue.pop_batch(10, 10_000))
+        self.assertEqual([], queue.pop_batch(10, 10_000))
+        self.assertEqual(0, queue.depth_bytes)
+
+    def test_pop_batch_sizes_the_batch_by_bytes_but_always_returns_one_item(self):
+        queue = CaptureQueue(10_000, 10_000)
+        for seq in range(1, 8):
+            queue.offer(seq, False, LINE)
+        self.assertEqual([1, 2, 3], [item[0] for item in queue.pop_batch(256, 300)])
+        self.assertEqual([4], [item[0] for item in queue.pop_batch(256, 10)])
+
 
 class QueueFullGapTest(RunTestCase):
     def test_writer_reports_the_exact_dropped_range_without_waiting_for_another_hook(self):
