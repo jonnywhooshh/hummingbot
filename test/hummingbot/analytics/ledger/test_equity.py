@@ -8,6 +8,7 @@ from decimal import (
     ROUND_HALF_UP,
     ROUND_UP,
     Decimal as D,
+    Inexact,
     getcontext,
     localcontext,
 )
@@ -453,3 +454,78 @@ def test_equity_point_is_immutable_and_exposes_every_field_by_name():
     assert (point.t, point.equity, point.position, point.entry_price) == (1, D("1000"), D("1"), D("100"))
     with pytest.raises(AttributeError):
         point.equity = D("0")
+
+
+def test_wide_inputs_keep_equity_and_net_pnl_exact_at_the_working_precision():
+    rng = random.Random(11)
+    bnb = D("587.123456789012345678901234567")
+    final_mid = D("101.987654321098765432109876543")
+    for _ in range(40):
+        opening = Opening(D(rng.randrange(10 ** 30, 10 ** 31)), 0, D(rng.randrange(10 ** 29, 10 ** 30)))
+        mids = {("BNB", t): bnb for t in range(1, 25)}
+        mids[("SOL", 24)] = final_mid
+        ledger = Ledger(opening, Prices(mids))
+        position = Fraction(0)
+        expected = Fraction(opening.E_open) - Fraction(opening.pos_open) * Fraction(opening.mid_open)
+        for t in range(1, 25):
+            quantity = D(rng.randrange(10 ** 29, 10 ** 30))
+            price = D(rng.randrange(10 ** 29, 10 ** 30))
+            fee = D(rng.randrange(10 ** 29, 10 ** 30))
+            side = rng.choice(("buy", "sell"))
+            ledger.apply(Fill(t, side, quantity, price, fee, "BNB"))
+            signed = Fraction(quantity) if side == "buy" else -Fraction(quantity)
+            position += signed
+            expected += -signed * Fraction(price) - Fraction(fee) * Fraction(bnb)
+        expected += position * Fraction(final_mid)
+        point = ledger.value(24)
+        assert Fraction(point.equity) == expected
+        assert Fraction(point.net_pnl) == expected - Fraction(opening.E_open)
+
+
+def test_nested_value_widens_precision_for_its_mark():
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices({("SOL", 1): None}))
+    ledger.apply(Fill(1, "buy", D("1"), D("100")))
+    marks = [D("100.0000000000000000000000000000000000000001")]
+
+    @accounting_context
+    def value_at_listed_mark(ledger, t, mark_list):
+        return ledger.value(t, mark=mark_list[0])
+
+    assert Fraction(value_at_listed_mark(ledger, 1, marks).equity) == 1000 + Fraction(marks[0]) - 100
+
+
+def test_equity_point_arguments_widen_the_ledger_precision():
+    @accounting_context
+    def working_precision(ledger, point):
+        return ledger._context.prec
+
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices())
+    ledger.apply(Fill(1, "buy", D("1"), D("100")))
+    narrow = working_precision(ledger, ledger.value(1))
+    wide = working_precision(ledger, ledger.value(1)._replace(equity=D("0." + "1" * 60)))
+    assert wide >= 4 * 61
+    assert wide > narrow
+
+
+@pytest.mark.parametrize("setting", ["prec", "rounding", "traps"])
+def test_mids_provider_cannot_change_the_ledger_context(setting):
+    class Hostile:
+        def mid(self, token, t):
+            context = getcontext()
+            if setting == "prec":
+                context.prec = 6
+            elif setting == "rounding":
+                context.rounding = ROUND_DOWN
+            else:
+                context.traps[Inexact] = True
+            return D("100.123456789012345678901234567")
+
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Hostile())
+    for t in (1, 2):
+        ledger.apply(Fill(t, "buy", D("1"), D("99.987654321098765432109876543")))
+        point = ledger.value(t)
+    expected = 1000 + 2 * (Fraction(D("100.123456789012345678901234567")) - Fraction(D("99.987654321098765432109876543")))
+    assert Fraction(point.equity) == expected
+    assert ledger._context.prec >= 100
+    assert ledger._context.rounding == ROUND_HALF_EVEN
+    assert not ledger._context.traps[Inexact]

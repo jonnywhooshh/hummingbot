@@ -1,5 +1,5 @@
 import random
-from decimal import Decimal as D
+from decimal import Decimal as D, localcontext
 from fractions import Fraction
 from test.hummingbot.analytics.ledger import Prices
 
@@ -262,3 +262,11 @@ def test_cost_report_separates_gross_fees_from_rebates():
     assert result.fees == D("0.07")
     assert result.paid_fees_by_token == {"USDC": D("0.1")}
     assert result.rebates_by_token == {"USDC": D("0.03")}
+
+
+def test_drawdown_is_exact_beyond_the_callers_precision():
+    peak, trough = D("12345678901234567890.123456789012345678"), D("-1.000000000000000001")
+    with localcontext() as context:
+        context.prec = 28
+        result = drawdown([(0, D("0")), (1, peak), (2, trough)])
+    assert Fraction(result.max_drawdown) == Fraction(peak) - Fraction(trough)

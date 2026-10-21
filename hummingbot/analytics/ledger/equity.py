@@ -25,6 +25,8 @@ def _amounts(*values):
     for value in values:
         if is_dataclass(value):
             yield from (getattr(value, field.name) for field in fields(value))
+        elif isinstance(value, tuple):
+            yield from value
         else:
             yield value
 
@@ -33,7 +35,7 @@ def accounting_context(operation):
     """Run a ledger operation in the ledger's exact context, leaving the caller's untouched.
 
     The outermost call swaps the context in. Nested calls reuse it. Decimal
-    arguments and the Decimal fields of dataclass arguments widen the working precision.
+    arguments and the Decimal fields of dataclass or tuple arguments widen the working precision.
     apply and value inline this swap, because the wrapper's argument tuple and
     dict are garbage-collector work on a path run once per event.
     """
@@ -211,7 +213,12 @@ class Ledger:
     def token_mid(self, token: str, t: int) -> Optional[Decimal]:
         if token == self.quote_token:
             return ONE
-        price = self.mids.mid(token, t)
+        ledger_context = getcontext()
+        setcontext(ledger_context.copy())
+        try:
+            price = self.mids.mid(token, t)
+        finally:
+            setcontext(ledger_context)
         if price is not None:
             if type(price) is not Decimal or not price.is_finite():
                 decimal_amount(price, "mid")
@@ -411,6 +418,8 @@ class Ledger:
 
     def value(self, t: int, *, mark: Optional[Decimal] = None) -> EquityPoint:
         if self._active:
+            if mark is not None:
+                self._observe(mark)
             return self._value(t, mark)
         caller = getcontext()
         setcontext(self._context)

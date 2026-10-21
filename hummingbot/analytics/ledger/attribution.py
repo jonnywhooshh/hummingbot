@@ -1,11 +1,11 @@
 """Q1 attribution and drawdown over exact marked-equity observations."""
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Context, Decimal
 from typing import Iterable, Optional
 
 from hummingbot.analytics.ledger.equity import Ledger, accounting_context
-from hummingbot.analytics.ledger.model import ZERO, decimal_amount, venue_time
+from hummingbot.analytics.ledger.model import ZERO, amount_width, decimal_amount, venue_time
 
 
 @dataclass(frozen=True)
@@ -130,7 +130,7 @@ def drawdown(points: Iterable[tuple[int, Decimal]], *, t_open: Optional[int] = N
             underwater = False
         else:
             underwater = True
-            maximum = max(maximum, peak - pnl)
+            maximum = max(maximum, Context(prec=amount_width(peak, pnl) + 1).subtract(peak, pnl))
             current = t - peak_t
             longest = max(longest, current)
         last_t = t
