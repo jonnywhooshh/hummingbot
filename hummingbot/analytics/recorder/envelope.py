@@ -1,5 +1,6 @@
 import base64
 from decimal import Decimal
+from json.encoder import encode_basestring_ascii as _ascii
 from math import isfinite
 from time import monotonic_ns, time_ns
 from typing import Any, Dict, Optional, Union
@@ -49,17 +50,20 @@ def encode_body(body: Dict[str, Any]) -> str:
     return ujson.dumps(exact(body), ensure_ascii=True, escape_forward_slashes=False, default=_fallback)
 
 
+def _quote(value: Optional[str]) -> str:
+    return "null" if value is None else _ascii(value)
+
+
 def frame(seq: int, run_id: str, kind: str, t_wall_ns: int, t_mono_ns: int, hook_ns: int,
           connector: Optional[str], trading_pair: Optional[str], controller_id: Optional[str],
           executor_id: Optional[str], client_order_id: Optional[str], exchange_order_id: Optional[str],
           body_json: str, payload_bytes: int = 0) -> bytes:
-    head = ujson.dumps({
-        "seq": seq, "run_id": run_id, "kind": kind, "t_wall_ns": t_wall_ns, "t_mono_ns": t_mono_ns,
-        "hook_ns": hook_ns, "payload_bytes": payload_bytes, "connector": connector, "trading_pair": trading_pair,
-        "controller_id": controller_id, "executor_id": executor_id,
-        "client_order_id": client_order_id, "exchange_order_id": exchange_order_id,
-    }, ensure_ascii=True, escape_forward_slashes=False)
-    return f'{head[:-1]},"body":{body_json}}}\n'.encode("utf-8")
+    # run_id is a generated UUID and kind a KINDS key, so only the caller-supplied identifiers need escaping.
+    return (f'{{"seq":{seq},"run_id":"{run_id}","kind":"{kind}","t_wall_ns":{t_wall_ns},"t_mono_ns":{t_mono_ns},'
+            f'"hook_ns":{hook_ns},"payload_bytes":{payload_bytes},"connector":{_quote(connector)},'
+            f'"trading_pair":{_quote(trading_pair)},"controller_id":{_quote(controller_id)},'
+            f'"executor_id":{_quote(executor_id)},"client_order_id":{_quote(client_order_id)},'
+            f'"exchange_order_id":{_quote(exchange_order_id)},"body":{body_json}}}\n').encode("ascii")
 
 
 def gap_line(seq: int, run_id: str, gap_type: str, first_seq: int, last_seq: Optional[int],
@@ -78,10 +82,11 @@ def gap_line(seq: int, run_id: str, gap_type: str, first_seq: int, last_seq: Opt
 
 def payload_size(body: Dict[str, Any], body_json: str) -> int:
     if "text" in body:
-        return len(body["text"].encode("utf-8"))
+        text = body["text"]
+        return len(text) if text.isascii() else len(text.encode("utf-8"))
     if "b64" in body:
         return len(body["b64"]) * 3 // 4 - len(body["b64"]) + len(body["b64"].rstrip("="))
-    return len(body_json.encode("utf-8"))
+    return len(body_json)
 
 
 def payload(data: Union[str, bytes, bytearray, memoryview]) -> Dict[str, str]:
