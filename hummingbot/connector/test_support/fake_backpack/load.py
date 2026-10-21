@@ -175,6 +175,11 @@ def summarize(out, ctx, delivery, lag, cpu_seconds, seconds):
             "venue_process_separate": True}
 
 
+def memory_directory():
+    shared = Path("/dev/shm")
+    return shared if shared.is_dir() and os.access(shared, os.W_OK) else None
+
+
 async def reference_load(minutes, out, pre_start=None, post_stop=None, analytics_dir=None):
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -194,8 +199,8 @@ async def reference_load(minutes, out, pre_start=None, post_stop=None, analytics
 async def run_reference(out, seconds, controller, venue_cpus, pre_start, post_stop, analytics_dir):
     from hummingbot.connector.test_support.fake_backpack.harness import v2_headless
     async with VenueProcess(out / "venue", venue_cpus) as process:
-        async with v2_headless(controller, pre_start=pre_start, post_stop=post_stop,
-                               analytics_dir=analytics_dir, venue=process.venue) as (_, ctx):
+        async with v2_headless(controller, pre_start=pre_start, post_stop=post_stop, analytics_dir=analytics_dir,
+                               venue=process.venue, temp_dir=memory_directory()) as (_, ctx):
             await ctx.wait_ticks(1)
             process.connection.send(("load", seconds))
             lag = []

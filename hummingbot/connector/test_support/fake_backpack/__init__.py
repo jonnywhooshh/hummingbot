@@ -63,6 +63,13 @@ POST receipts join on client ID, not the closest tick.
 Only requests received within the load interval count toward metrics.
 Empty percentile inputs produce null, not zero. Request failures, controller
 errors, successful POST counts, and sample counts remain visible.
+On hosts with at least three CPUs, reference-load pins the venue process to the
+last CPU and the bot to the others. The bot's temporary root, which holds its
+SQLite database, lives in /dev/shm when that directory is writable. A disk fsync
+inside a SQLite commit blocked the event loop for tens of milliseconds and
+dominated loop-lag p99 on a host shared with other disk users. The measured
+loop lag therefore excludes disk commit latency. Compare runs made with the
+same harness only.
 
 Ordinary tests use event-controlled response bodies rather than wall-clock
 performance limits. Run the 100 ms unread-body and one-second flood checks with

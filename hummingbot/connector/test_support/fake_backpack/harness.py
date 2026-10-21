@@ -318,13 +318,13 @@ class V2Context:
 
 @asynccontextmanager
 async def v2_headless(controller_yaml, state_dir=None, pre_start=None, post_stop=None, analytics_dir=None,
-                      venue=None):
+                      venue=None, temp_dir=None):
     own_venue = venue is None
     if own_venue:
         venue = FakeBackpackVenue(state_dir=state_dir)
         await venue.start()
     try:
-        with tempfile.TemporaryDirectory(prefix="fake-backpack-v2-") as directory:
+        with tempfile.TemporaryDirectory(prefix="fake-backpack-v2-", dir=temp_dir) as directory:
             root = Path(directory)
             with bot_environment(venue, root, analytics_dir) as client:
                 (root / "conf/controllers/controller.yml").write_text(Path(controller_yaml).read_text())
