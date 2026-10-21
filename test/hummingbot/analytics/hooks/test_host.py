@@ -1,0 +1,140 @@
+import asyncio
+import cProfile
+import json
+import os
+import statistics
+import threading
+import time
+import unittest
+from pathlib import Path
+from test.hummingbot.analytics.recorder.support import RunTestCase
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from hummingbot.analytics import recorder
+from hummingbot.analytics.hooks.host import HostSampler
+
+
+class HostTest(RunTestCase, IsolatedAsyncioWrapperTestCase):
+    def test_body_and_process_reuse(self):
+        run_dir = self.start()
+        process = Mock()
+        process.cpu_percent.return_value = 12.5
+        process.memory_info.return_value = SimpleNamespace(rss=123456)
+        process.num_fds.return_value = 9
+        recorder.timing.observe("order_request", 1200)
+        with patch("hummingbot.analytics.hooks.host.psutil.Process", return_value=process) as create:
+            sampler = HostSampler(str(run_dir))
+            with patch("hummingbot.analytics.hooks.host.os.statvfs",
+                       return_value=SimpleNamespace(f_bavail=100, f_frsize=4096)):
+                sampler.sample(2.5)
+                sampler.sample(0.25)
+            create.assert_called_once_with()
+        recorder.end_run({"path": "test"})
+        rows = [row for row in self.records(run_dir) if row["kind"] == "host"]
+        self.assertEqual(len(rows), 2)
+        body = rows[0]["body"]
+        self.assertEqual(body["loop_lag_ms"], 2.5)
+        self.assertEqual(body["cpu_percent"], 12.5)
+        self.assertEqual(body["rss_bytes"], 123456)
+        self.assertEqual(body["open_files"], 9)
+        self.assertEqual(body["free_bytes"], 409600)
+        for key in ("queue_records", "queue_bytes", "dropped", "dropped_priority", "hook_errors", "writer_errors"):
+            self.assertIn(key, body)
+        self.assertEqual(body["timing"]["order_request"]["count"], 1)
+        self.assertEqual(sum(body["timing"]["order_request"]["buckets"]), 1)
+        self.assertNotIn("order_request", rows[1]["body"]["timing"])
+        self.assertEqual(rows[1]["body"]["timing"]["host"]["count"], 1)
+        self.assertEqual(process.cpu_percent.call_count, 3)
+
+    async def test_schedule_uses_actual_minus_expected_wake_time(self):
+        self.start()
+        sampler = HostSampler(str(self.root))
+        clock = Mock()
+        clock.time.side_effect = [10.0, 11.125]
+
+        async def wake(delay):
+            self.assertEqual(delay, 1.0)
+            recorder.end_run({"path": "test"})
+
+        with patch("hummingbot.analytics.hooks.host.asyncio.get_running_loop", return_value=clock), \
+                patch("hummingbot.analytics.hooks.host.asyncio.sleep", side_effect=wake), \
+                patch.object(sampler, "sample") as sample:
+            await sampler.run()
+        sample.assert_called_once_with(125.0)
+
+    async def test_task_cancellation_adds_no_final_sample(self):
+        self.start()
+        sampler = HostSampler(str(self.root))
+        with patch.object(sampler, "sample") as sample:
+            task = asyncio.create_task(sampler.run())
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            sample.assert_not_called()
+
+    def test_failures_and_off_thread_sampling_do_not_escape(self):
+        sampler = HostSampler(str(self.root))
+        sampler.sample(0)
+        self.start()
+        thread = threading.Thread(target=sampler.sample, args=(0,))
+        thread.start()
+        thread.join()
+        self.assertEqual(recorder.stats()["off_thread"], 0)
+        with patch("hummingbot.analytics.hooks.host.os.statvfs", side_effect=OSError("disk")):
+            sampler.sample(0)
+        self.assertEqual(recorder.stats()["hook_errors_by_hook"]["host"], 1)
+
+    @unittest.skipUnless(os.environ.get("MMA_HOST_BENCH") == "1", "Run only inside mma-slot perf")
+    def test_host_per_round_budget(self):
+        output = Path(os.environ["MMA_HOST_BENCH_DIR"])
+        output.mkdir(parents=True, exist_ok=True)
+        run_dir = self.start(queue_max_bytes=128 * 1024 * 1024)
+        sampler = HostSampler(str(run_dir))
+
+        def prepare():
+            for index in range(40):
+                recorder.timing.observe(f"fixture_{index}", 4000)
+
+        profiler = cProfile.Profile()
+        profiler.enable()
+        for _ in range(100):
+            prepare()
+            sampler.sample(-2)
+        profiler.disable()
+        profiler.dump_stats(str(output / "host-profile.pstats"))
+        for _ in range(100):
+            prepare()
+            sampler.sample(-1)
+        rounds = []
+        for round_id in range(5):
+            durations = []
+            for _ in range(1000):
+                prepare()
+                t0 = time.perf_counter_ns()
+                sampler.sample(round_id)
+                durations.append(time.perf_counter_ns() - t0)
+            durations.sort()
+            rounds.append({"round": round_id, "p99_us": durations[989] / 1000,
+                           "p50_us": durations[499] / 1000, "max_us": durations[-1] / 1000})
+        counters = recorder.stats()
+        self.assertEqual(counters["dropped"], 0)
+        self.assertEqual(counters["hook_errors"], 0)
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        hosts = [row for row in self.records(run_dir) if row["kind"] == "host"]
+        self.assertEqual(len(hosts), 5200)
+        for row in rounds:
+            measured = [record for record in hosts if record["body"]["loop_lag_ms"] == row["round"]]
+            self.assertEqual(len(measured), 1000)
+            self.assertTrue(all(len(record["body"]["timing"]) >= 40 for record in measured))
+            hook_ns = sorted(record["hook_ns"] for record in measured)
+            row["recorded_p99_us"] = hook_ns[989] / 1000
+            print("HOST_ROUND", json.dumps(row), flush=True)
+        report = {"rounds": rounds, "samples": len(hosts), "errors": counters["hook_errors"],
+                  "drops": counters["dropped"], "median_p99_us": statistics.median(row["p99_us"] for row in rounds),
+                  "claim": "Complete synchronous host sampling fits 1024 us per-round p99 in this five-round probe, not the one-hour gate."}
+        (output / "host-budget.json").write_text(json.dumps(report, indent=2) + "\n")
+        for row in rounds:
+            self.assertLessEqual(row["p99_us"], 1024, row)
