@@ -402,8 +402,9 @@ class BookStreamTests(TestCase):
         self.assertLess(intervals[0].end_ns, intervals[1].start_ns)
         self.assertEqual(Decimal("100"), stream.mid_at(1_999))
         self.assertEqual(Decimal("99"), stream.mid_at(2_000))
-        self.assertFalse(stream.known(2_000, strictly_before=True))
-        self.assertIsNone(stream.mid_at(2_000, strictly_before=True))
+        self.assertTrue(stream.known(2_000, strictly_before=True))
+        self.assertEqual(Decimal("100"), stream.mid_at(2_000, strictly_before=True))
+        self.assertEqual(Decimal("99"), stream.mid_at(2_001, strictly_before=True))
 
     def test_gap_frame_can_itself_cover_a_recovery_snapshot(self):
         stream = BookStream()

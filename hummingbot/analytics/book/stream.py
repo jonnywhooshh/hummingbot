@@ -16,7 +16,9 @@ recovery, while continuous diffs keep the existing stretch intact. It replaces
 the book only after a gap. The same sequence rule applies on a receipt clock.
 
 Only a continuous frame stamped strictly after a query confirms its complete
-timestamp group. Strict-before queries may use a frame at the query time.
+timestamp group. Strict-before queries may use a frame at the query time, and
+a stretch that ends at the query time still proves the book strictly before
+it even when a later stretch starts at that time.
 Known intervals have inclusive nanosecond bounds and exclude the last frame.
 
 Recovery retains at most ``max_buffered_diffs`` frames, 4,096 by default.
@@ -248,14 +250,14 @@ class BookStream:
                      for s in self._stretches if s.times[0] < s.times[-1])
 
     def _stretch_at(self, timestamp_ns: int, *, strictly_before: bool = False) -> Optional[_Stretch]:
-        index = bisect_right(self._starts, timestamp_ns) - 1
+        if strictly_before:
+            index = bisect_left(self._starts, timestamp_ns) - 1
+        else:
+            index = bisect_right(self._starts, timestamp_ns) - 1
         if index < 0:
             return None
         stretch = self._stretches[index]
-        if strictly_before:
-            confirmed = stretch.times[0] < timestamp_ns <= stretch.times[-1]
-        else:
-            confirmed = timestamp_ns < stretch.times[-1]
+        confirmed = timestamp_ns <= stretch.times[-1] if strictly_before else timestamp_ns < stretch.times[-1]
         return stretch if confirmed else None
 
     def known(self, timestamp_ns: int, *, strictly_before: bool = False) -> bool:

@@ -280,3 +280,46 @@ class BookReferenceTests(TestCase):
         self.assertEqual(Decimal("100"), observation.m0)
         self.assertEqual("bot", observation.m0_source)
         self.assertTrue(observation.m0_tie_uncertain)
+
+    def test_recovery_stretch_at_the_previous_last_timestamp_keeps_the_proven_m0(self):
+        bot = BookStream()
+        bot.apply_snapshot({"lastUpdateId": 10, "bids": [["99", "1"]], "asks": [["101", "1"]]}, timestamp_ns=0)
+        bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=SECOND)
+        bot.apply_diff({"U": 12, "u": 12, "b": [], "a": []}, timestamp_ns=2 * SECOND)
+        bot.apply_diff({"U": 14, "u": 14, "b": [["99", "0"], ["97", "1"]], "a": []}, timestamp_ns=2 * SECOND)
+        reference = BookReference(bot, run_end_ns=4 * SECOND)
+        before = reference.observe(2 * SECOND, SECOND // 2)
+        self.assertEqual("invalid", before.status)
+        self.assertEqual(Decimal("100"), before.m0)
+        bot.apply_snapshot({"lastUpdateId": 13, "bids": [["97", "1"]], "asks": [["101", "1"]]},
+                           timestamp_ns=5 * SECOND)
+        bot.apply_diff({"U": 15, "u": 15, "b": [], "a": []}, timestamp_ns=3 * SECOND)
+        after = reference.observe(2 * SECOND, SECOND // 2)
+        self.assertEqual("valid", after.status)
+        self.assertEqual(Decimal("100"), after.m0)
+        self.assertEqual(Decimal("99"), after.mh)
+        self.assertTrue(after.m0_tie_uncertain)
+
+    def test_known_follows_observe_when_asked_for_the_strict_before_book(self):
+        bot = BookStream()
+        bot.apply_snapshot({"lastUpdateId": 10, "bids": [["99", "1"]], "asks": [["101", "1"]]}, timestamp_ns=0)
+        bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=5 * SECOND)
+        bot.apply_diff({"U": 12, "u": 12, "b": [], "a": []}, timestamp_ns=7 * SECOND)
+        reference = BookReference(bot, run_end_ns=8 * SECOND)
+        for fill, known_m0 in ((5 * SECOND, False), (6 * SECOND, True), (7 * SECOND, True)):
+            with self.subTest(fill=fill):
+                observation = reference.observe(fill, 0)
+                self.assertEqual(known_m0, observation.m0_source is not None)
+                self.assertEqual(known_m0, reference.known(fill, strictly_before=True))
+                self.assertEqual(observation.m0, reference.mid_at(fill, strictly_before=True))
+        self.assertTrue(reference.known(5 * SECOND))
+        self.assertFalse(reference.known(7 * SECOND))
+        self.assertIsNone(reference.mid_at(7 * SECOND))
+
+    def test_strict_before_known_falls_back_to_the_sidecar(self):
+        side = stream_with_move()
+        reference = BookReference(BookStream(), sidecar=side, run_end_ns=4 * SECOND)
+        self.assertTrue(reference.known(4 * SECOND - 1, strictly_before=True))
+        self.assertTrue(reference.known(4 * SECOND, strictly_before=True))
+        self.assertFalse(reference.known(4 * SECOND))
+        self.assertEqual(Decimal("98"), reference.mid_at(4 * SECOND, strictly_before=True))

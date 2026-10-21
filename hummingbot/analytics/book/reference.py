@@ -10,6 +10,11 @@ first covering diff. ``mid_undefined`` means that the required book is known
 but a side is empty or the best bid exceeds the best ask. A known bot book
 with an undefined mid never falls back to the sidecar. An unknown fill is
 invalid even when its horizon is pending.
+
+``known`` and ``mid_at`` answer the horizon question by default. Pass
+``strictly_before=True`` for the pre-fill book ``m0``, which is what
+``observe`` uses at the fill time. A caller that selects fills with a known
+``m0`` MUST use that option.
 """
 
 from dataclasses import dataclass
@@ -65,11 +70,11 @@ class BookReference:
             return mid, source, tie
         return None, None, tie
 
-    def known(self, timestamp_ns: int) -> bool:
-        return self.bot.known(timestamp_ns) or (self.sidecar is not None and self.sidecar.known(timestamp_ns))
+    def known(self, timestamp_ns: int, *, strictly_before: bool = False) -> bool:
+        return self._mid(timestamp_ns, strictly_before=strictly_before)[1] is not None
 
-    def mid_at(self, timestamp_ns: int) -> Optional[Decimal]:
-        return self._mid(timestamp_ns)[0]
+    def mid_at(self, timestamp_ns: int, *, strictly_before: bool = False) -> Optional[Decimal]:
+        return self._mid(timestamp_ns, strictly_before=strictly_before)[0]
 
     def observe(self, fill_time_ns: int, horizon_ns: int) -> ReferenceObservation:
         if not isinstance(fill_time_ns, int) or not isinstance(horizon_ns, int):
