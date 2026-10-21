@@ -8,12 +8,18 @@ Backpack REST snapshots have no engine timestamp. Their ``timestamp_ns`` is
 receipt metadata, recorded as ``snapshot_received_ns`` on known intervals,
 not a venue-time ordering constraint or interval boundary. Feed snapshots in
 capture order and diffs in engine-time order.
-Diffs received before a usable snapshot are buffered. A snapshot becomes
-known only at the first diff covering ``lastUpdateId + 1``, including buffered
-diffs that predate the response receipt. Equal or lagging snapshots cannot
-replace a continuous or awaiting book. An advancing snapshot is retained for
-recovery, while continuous diffs keep the existing stretch intact. It replaces
-the book only after a gap. The same sequence rule applies on a receipt clock.
+
+A snapshot starts a stretch at the first diff covering ``lastUpdateId + 1``.
+Outside a stretch, diffs are buffered, so a snapshot that arrives later still
+starts a stretch at a buffered diff. Snapshots that no diff has covered yet
+are kept as candidates, at most ``max_snapshot_candidates`` of them, 8 by
+default. The lowest update ID is evicted first. When several candidates cover
+the same diff, the highest update ID supplies the book and the receipt time.
+Snapshots that cannot cover the buffer or any later diff are discarded.
+Inside a stretch, a snapshot beyond the last applied update is kept for
+recovery and never disturbs the running stretch. After a gap, the first diff
+that a candidate covers starts the next stretch. The same sequence rule applies
+on a receipt clock.
 
 Only a continuous frame stamped strictly after a query confirms its complete
 timestamp group. Strict-before queries may use a frame at the query time, and
@@ -21,9 +27,9 @@ a stretch that ends at the query time still proves the book strictly before
 it even when a later stretch starts at that time.
 Known intervals have inclusive nanosecond bounds and exclude the last frame.
 
-Recovery retains at most ``max_buffered_diffs`` frames, 4,096 by default.
-``buffer_dropped_through_update_id`` records the highest evicted update ID.
-A recovery snapshot must cover that watermark before replay can resume.
+Outside a stretch the buffer holds at most ``max_buffered_diffs`` frames,
+4,096 by default. ``buffer_dropped_through_update_id`` records the highest
+evicted update ID.
 
 String prices share a bounded cache of validated Decimals. Quantities change
 independently of prices, so every quantity is decoded and validated anew.
@@ -118,13 +124,16 @@ def _levels(rows: Iterable[Sequence[Any]]) -> Iterable[Tuple[Decimal, Decimal]]:
 
 
 class BookStream:
-    def __init__(self, *, clock_basis: ClockBasis = "venue", max_buffered_diffs: int = 4096) -> None:
+    def __init__(
+        self, *, clock_basis: ClockBasis = "venue", max_buffered_diffs: int = 4096, max_snapshot_candidates: int = 8,
+    ) -> None:
         if clock_basis not in ("venue", "receipt"):
             raise ValueError("clock_basis must be venue or receipt")
         if not isinstance(max_buffered_diffs, int) or max_buffered_diffs <= 0:
             raise ValueError("max_buffered_diffs must be a positive integer")
+        if not isinstance(max_snapshot_candidates, int) or max_snapshot_candidates <= 0:
+            raise ValueError("max_snapshot_candidates must be a positive integer")
         self.clock_basis = clock_basis
-        self.state = StreamState.NEED_SNAPSHOT
         self._bids: dict[Decimal, Decimal] = {}
         self._asks: dict[Decimal, Decimal] = {}
         self._last_update_id = 0
@@ -134,7 +143,14 @@ class BookStream:
         self._starts: list[int] = []
         self._buffer: deque[_DepthDiff] = deque(maxlen=max_buffered_diffs)
         self.buffer_dropped_through_update_id: Optional[int] = None
-        self._pending_snapshot: Optional[_Snapshot] = None
+        self._candidates: list[_Snapshot] = []
+        self._max_snapshot_candidates = max_snapshot_candidates
+
+    @property
+    def state(self) -> StreamState:
+        if self._current is not None:
+            return StreamState.CONTINUOUS
+        return StreamState.AWAITING_DIFF if self._candidates else StreamState.NEED_SNAPSHOT
 
     @property
     def buffered_diff_count(self) -> int:
@@ -178,27 +194,38 @@ class BookStream:
         update_id = int(message["lastUpdateId"])
         if not isinstance(timestamp_ns, int):
             raise TypeError("timestamp_ns must be an integer")
-        if self.state is not StreamState.NEED_SNAPSHOT and update_id <= self._last_update_id:
-            return
         snapshot = _Snapshot(update_id, bids, asks, timestamp_ns)
-        if self.state is StreamState.CONTINUOUS:
-            if self._pending_snapshot is None or update_id > self._pending_snapshot.update_id:
-                self._pending_snapshot = snapshot
+        if self._current is not None:
+            if update_id > self._last_update_id:
+                self._add_candidate(snapshot)
             return
-        self._install_snapshot(snapshot)
+        frames = list(self._buffer)
+        for index, frame in enumerate(frames):
+            if frame.first <= update_id + 1 <= frame.last:
+                self._start(snapshot, frames[index:])
+                return
+        if not frames or update_id + 1 > max(frame.last for frame in frames):
+            self._add_candidate(snapshot)
 
-    def _install_snapshot(self, snapshot: _Snapshot) -> None:
-        if (self.buffer_dropped_through_update_id is not None
-                and snapshot.update_id < self.buffer_dropped_through_update_id):
+    def _add_candidate(self, snapshot: _Snapshot) -> None:
+        if any(candidate.update_id == snapshot.update_id for candidate in self._candidates):
             return
+        self._candidates.append(snapshot)
+        self._candidates.sort(key=lambda candidate: candidate.update_id)
+        del self._candidates[:-self._max_snapshot_candidates]
+
+    def _start(self, snapshot: _Snapshot, frames: Sequence[_DepthDiff]) -> None:
         self._bids, self._asks = {}, {}
         self._update(self._bids, snapshot.bids.items())
         self._update(self._asks, snapshot.asks.items())
         self._last_update_id = snapshot.update_id
+        self._candidates = [c for c in self._candidates if c.update_id > snapshot.update_id]
+        self._buffer = deque(maxlen=self._buffer.maxlen)
         self._current = _Stretch(snapshot.received_ns)
-        buffered, self._buffer = self._buffer, deque(maxlen=self._buffer.maxlen)
-        self.state = StreamState.AWAITING_DIFF
-        for frame in buffered:
+        self._stretches.append(self._current)
+        self._starts.append(frames[0].timestamp_ns)
+        self._extend(frames[0])
+        for frame in frames[1:]:
             self._apply_diff(frame)
 
     def apply_diff(self, message: Mapping[str, Any], *, timestamp_ns: Optional[int] = None) -> None:
@@ -214,35 +241,25 @@ class BookStream:
         self._check_time(timestamp_ns)
         self._apply_diff(_DepthDiff(timestamp_ns, first, last, bids, asks))
 
-    def _apply_diff(self, frame: _DepthDiff) -> None:
-        first, last, timestamp_ns = frame.first, frame.last, frame.timestamp_ns
-        if self.state is StreamState.NEED_SNAPSHOT:
-            self._buffer_diff(frame)
-            return
-        if self.state is StreamState.AWAITING_DIFF:
-            if last <= self._last_update_id:
-                return
-            continuous = first <= self._last_update_id + 1 <= last
-        else:
-            continuous = first == self._last_update_id + 1
-        if not continuous:
-            self.state = StreamState.NEED_SNAPSHOT
-            self._current = None
-            self._buffer_diff(frame)
-            if self._pending_snapshot is not None:
-                snapshot, self._pending_snapshot = self._pending_snapshot, None
-                self._install_snapshot(snapshot)
-            return
+    def _extend(self, frame: _DepthDiff) -> None:
         self._update(self._bids, frame.bids)
         self._update(self._asks, frame.asks)
-        self._last_update_id = last
-        if self._pending_snapshot is not None and last >= self._pending_snapshot.update_id:
-            self._pending_snapshot = None
-        if self.state is StreamState.AWAITING_DIFF:
-            self._stretches.append(self._current)
-            self._starts.append(timestamp_ns)
-            self.state = StreamState.CONTINUOUS
-        self._current.append(self._point(timestamp_ns))
+        self._last_update_id = frame.last
+        if self._candidates:
+            self._candidates = [c for c in self._candidates if c.update_id > frame.last]
+        self._current.append(self._point(frame.timestamp_ns))
+
+    def _apply_diff(self, frame: _DepthDiff) -> None:
+        if self._current is not None:
+            if frame.first == self._last_update_id + 1:
+                self._extend(frame)
+                return
+            self._current = None
+        self._buffer_diff(frame)
+        self._candidates = [c for c in self._candidates if c.update_id + 1 >= frame.first]
+        covering = [c for c in self._candidates if c.update_id + 1 <= frame.last]
+        if covering:
+            self._start(covering[-1], [frame])
 
     @property
     def known_intervals(self) -> Tuple[KnownInterval, ...]:

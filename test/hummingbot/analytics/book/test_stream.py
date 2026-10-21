@@ -438,3 +438,79 @@ class BookStreamTests(TestCase):
         duration = sum(interval.end_ns - interval.start_ns + 1 for interval in intervals)
         self.assertEqual(intervals[-1].end_ns - intervals[0].start_ns + 1, duration)
         self.assertLess(intervals[0].end_ns, intervals[1].start_ns)
+
+    def test_advancing_snapshot_while_awaiting_does_not_displace_the_earlier_one(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(uid=10), timestamp_ns=1)
+        stream.apply_snapshot(snapshot(uid=15, bids=[["97", "1"]]), timestamp_ns=2)
+        for uid in range(11, 21):
+            stream.apply_diff(diff(uid), timestamp_ns=(uid - 10) * 1_000)
+        self.assertEqual((KnownInterval(1_000, 9_999, 1),), stream.known_intervals)
+        self.assertEqual(Decimal("100"), stream.mid_at(2_000))
+
+    def test_lagging_snapshot_while_awaiting_covers_diffs_buffered_before_it(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(uid=24), timestamp_ns=1)
+        stream.apply_diff(diff(20), timestamp_ns=1_000)
+        stream.apply_diff(diff(21, 22, bids=[["99", "0"], ["97", "1"]]), timestamp_ns=2_000)
+        stream.apply_diff(diff(23), timestamp_ns=3_000)
+        self.assertEqual(StreamState.AWAITING_DIFF, stream.state)
+        stream.apply_snapshot(snapshot(uid=20), timestamp_ns=2)
+        stream.apply_diff(diff(24, 25), timestamp_ns=4_000)
+        self.assertEqual((KnownInterval(2_000, 3_999, 2),), stream.known_intervals)
+        self.assertEqual(Decimal("99"), stream.mid_at(2_000))
+
+    def test_lowest_pending_snapshot_bridges_a_gap_that_a_higher_one_cannot(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(uid=10), timestamp_ns=0)
+        stream.apply_diff(diff(11), timestamp_ns=1_000)
+        stream.apply_snapshot(snapshot(uid=12, bids=[["97", "1"]]), timestamp_ns=1)
+        stream.apply_snapshot(snapshot(uid=20, bids=[["95", "1"]]), timestamp_ns=2)
+        stream.apply_diff(diff(13, bids=[["97", "0"], ["98", "1"]]), timestamp_ns=3_000)
+        stream.apply_diff(diff(14), timestamp_ns=4_000)
+        self.assertEqual(KnownInterval(3_000, 3_999, 1), stream.known_intervals[-1])
+        self.assertEqual(Decimal("99.5"), stream.mid_at(3_000))
+
+    def test_highest_covering_snapshot_supplies_the_book_and_receipt_time(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(uid=10, bids=[["97", "1"]]), timestamp_ns=1)
+        stream.apply_snapshot(snapshot(uid=12), timestamp_ns=2)
+        stream.apply_snapshot(snapshot(uid=11, bids=[["98", "1"]]), timestamp_ns=3)
+        stream.apply_diff(diff(11, 13), timestamp_ns=1_000)
+        stream.apply_diff(diff(14), timestamp_ns=2_000)
+        self.assertEqual((KnownInterval(1_000, 1_999, 2),), stream.known_intervals)
+        self.assertEqual(Decimal("100"), stream.mid_at(1_000))
+
+    def test_candidate_limit_evicts_the_lowest_update_id(self):
+        stream = BookStream(max_snapshot_candidates=2)
+        for uid, received in ((12, 1), (14, 2), (16, 3)):
+            stream.apply_snapshot(snapshot(uid=uid), timestamp_ns=received)
+        stream.apply_diff(diff(13), timestamp_ns=1_000)
+        self.assertEqual(StreamState.AWAITING_DIFF, stream.state)
+        stream.apply_diff(diff(15), timestamp_ns=2_000)
+        stream.apply_diff(diff(16), timestamp_ns=3_000)
+        self.assertEqual((KnownInterval(2_000, 2_999, 2),), stream.known_intervals)
+
+    def test_candidate_limit_must_be_a_positive_integer(self):
+        for limit in (0, -1, 1.5):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                BookStream(max_snapshot_candidates=limit)
+
+    def test_snapshot_behind_the_buffered_diffs_is_discarded(self):
+        stream = BookStream()
+        stream.apply_diff(diff(14), timestamp_ns=1_000)
+        stream.apply_snapshot(snapshot(uid=10), timestamp_ns=1)
+        self.assertEqual(StreamState.NEED_SNAPSHOT, stream.state)
+
+    def test_non_string_levels_read_price_before_quantity(self):
+        stream = BookStream()
+        stream.apply_snapshot({"lastUpdateId": 10, "bids": [[99, 2]], "asks": [[Decimal("101"), 3]]},
+                              timestamp_ns=0)
+        stream.apply_diff(diff(11, bids=[[99, 0], [Decimal("97"), Decimal("1")]]), timestamp_ns=1_000)
+        stream.apply_diff(diff(12), timestamp_ns=2_000)
+        self.assertEqual(Decimal("99"), stream.mid_at(1_000))
+
+    def test_diff_timestamp_must_be_an_integer(self):
+        for timestamp in (1.5, "1"):
+            with self.subTest(timestamp=timestamp), self.assertRaises(TypeError):
+                BookStream().apply_diff(diff(11), timestamp_ns=timestamp)
