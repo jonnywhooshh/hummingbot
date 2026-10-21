@@ -111,6 +111,7 @@ class FakeBackpackVenue:
         self.faults = defaultdict(deque)
         self.orders: dict[str, dict] = {}
         self.fills: list[dict] = []
+        self._accepted: dict[str, asyncio.Event] = {}
         self.funding: list[dict] = []
         self.deposits: list[dict] = []
         self.withdrawals: list[dict] = []
@@ -163,8 +164,8 @@ class FakeBackpackVenue:
             raise ValueError("The fake venue only binds to loopback")
         if self.state_dir is not None:
             self.state_dir.mkdir(parents=True, exist_ok=True)
-            self._rest_log = (self.state_dir / "requests.jsonl").open("a")
-            self._ws_log = (self.state_dir / "ws.jsonl").open("a")
+            self._rest_log = (self.state_dir / "requests.jsonl").open("w")
+            self._ws_log = (self.state_dir / "ws.jsonl").open("w")
             self._schedule(self._flush_logs_forever())
         app = web.Application()
         app.router.add_get("/", self._ws)
@@ -279,9 +280,10 @@ class FakeBackpackVenue:
     async def push_trade(self, price: Optional[str] = None, quantity: str = "0.10"):
         price = price or self.mid
         self._next_trade_id += 1
-        delivered = await self._public_trade(price, quantity, self._next_trade_id)
+        trade_id = self._next_trade_id
+        delivered = await self._public_trade(price, quantity, trade_id)
         if self.fill_policy == FillPolicy.CROSSING:
-            await self.match_resting(price, quantity)
+            await self.match_resting(price, quantity, trade_id)
         return delivered
 
     async def push_liquidation(self, **values):
@@ -340,11 +342,14 @@ class FakeBackpackVenue:
                 "S": order["side"], "o": order["orderType"].upper(), "f": order["timeInForce"],
                 "q": order["quantity"], "p": order["price"], "X": order["status"], "i": order["id"],
                 "z": order["executedQuantity"], "Z": order["executedQuoteQuantity"], "t": None,
-                "O": "USER", "y": order["postOnly"], "r": order.get("reduceOnly", False), **extra}
+                "O": "USER", **({"y": True} if order["postOnly"] else {}),
+                "r": order.get("reduceOnly", False), **extra}
 
     async def fill(self, order_id: str, qty: str, price: str, maker: bool = True,
-                   fee: Optional[str] = None, fee_symbol: str = "USDC") -> dict:
+                   fee: Optional[str] = None, fee_symbol: str = "USDC",
+                   public_trade_id: Optional[int] = None) -> dict:
         order = self.orders[str(order_id)]
+        await self._accepted[str(order_id)].wait()
         quantity = Decimal(qty)
         remaining = Decimal(order["quantity"]) - Decimal(order["executedQuantity"])
         if order["status"] not in ("New", "PartiallyFilled") or not 0 < quantity <= remaining:
@@ -354,20 +359,25 @@ class FakeBackpackVenue:
         order["executedQuoteQuantity"] = str(Decimal(order["executedQuoteQuantity"]) + quantity * Decimal(price))
         order["status"] = "Filled" if executed == Decimal(order["quantity"]) else "PartiallyFilled"
         fee = format((quantity * Decimal(price) * FEE_RATES[maker]).normalize(), "f") if fee is None else fee
-        self._next_trade_id += 1
-        frame = self._order_frame("orderFill", order, l=qty, L=price, m=maker, t=self._next_trade_id, n=fee, N=fee_symbol)
-        self.fills.append({"tradeId": self._next_trade_id, "orderId": str(order_id), "symbol": order["symbol"],
+        if public_trade_id is None:
+            self._next_trade_id += 1
+        trade_id = self._next_trade_id if public_trade_id is None else public_trade_id
+        frame = self._order_frame("orderFill", order, l=qty, L=price, m=maker, t=trade_id, n=fee, N=fee_symbol)
+        self.fills.append({"tradeId": trade_id, "orderId": str(order_id), "symbol": order["symbol"],
                            "clientId": order["clientId"], "price": price, "quantity": qty, "fee": fee,
                            "feeSymbol": fee_symbol, "isMaker": maker, "side": order["side"], "timestamp": timestamp()})
         await self.push("account.orderUpdate", frame)
-        buyer, seller = (order["id"], "0") if order["side"] == "Bid" else ("0", order["id"])
-        await self._public_trade(price, qty, self._next_trade_id, buyer, seller,
-                                 maker if order["side"] == "Bid" else not maker)
+        if public_trade_id is None:
+            buyer, seller = (order["id"], "0") if order["side"] == "Bid" else ("0", order["id"])
+            await self._public_trade(price, qty, trade_id, buyer, seller,
+                                     maker if order["side"] == "Bid" else not maker)
         return frame
 
-    async def match_resting(self, trade_price: Optional[str] = None, quantity: Optional[str] = None):
+    async def match_resting(self, trade_price: Optional[str] = None, quantity: Optional[str] = None,
+                            public_trade_id: Optional[int] = None):
         available = Decimal(quantity) if quantity is not None else None
         for order in list(self.orders.values()):
+            await self._accepted[order["id"]].wait()
             if order["status"] not in ("New", "PartiallyFilled") or order["orderType"] != "Limit":
                 continue
             side = self.book["asks" if order["side"] == "Bid" else "bids"]
@@ -380,7 +390,8 @@ class FakeBackpackVenue:
                 amount = Decimal(order["quantity"]) - Decimal(order["executedQuantity"])
                 amount = min(amount, available) if available is not None else amount
                 if amount > 0:
-                    await self.fill(order["id"], str(amount), order["price"])
+                    await self.fill(order["id"], str(amount), trade_price or order["price"],
+                                    public_trade_id=public_trade_id)
                     if available is not None:
                         available -= amount
 
@@ -503,12 +514,14 @@ class FakeBackpackVenue:
                  "status": "New", "executedQuantity": "0", "executedQuoteQuantity": "0", "createdAt": now_ms(),
                  "reduceOnly": params.get("reduceOnly", False)}
         self.orders[order_id] = order
+        self._accepted[order_id] = asyncio.Event()
         self._schedule(self._after_accept(order))
         return web.json_response(order)
 
     async def _after_accept(self, order):
         await asyncio.sleep(self.ack_delay)
         await self.push("account.orderUpdate", self._order_frame("orderAccepted", order))
+        self._accepted[order["id"]].set()
         if order["orderType"] == "Market":
             side = self.book["asks" if order["side"] == "Bid" else "bids"]
             if side:
@@ -526,7 +539,7 @@ class FakeBackpackVenue:
 
     def _order_cancel(self, request, params):
         order = self._find_order(params)
-        if order is None or order["status"] in ("Filled", "Cancelled"):
+        if order is None or order["status"] not in ("New", "PartiallyFilled"):
             return web.json_response({"code": "RESOURCE_NOT_FOUND", "message": "Not Found"}, status=404)
         order["status"] = "Cancelled"
         self._schedule(self.push("account.orderUpdate", self._order_frame("orderCancelled", order)))

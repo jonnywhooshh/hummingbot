@@ -111,7 +111,7 @@ class VenueProtocolTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("0.2", self.venue.orders[order["id"]]["executedQuantity"])
         await self.venue.fill(order["id"], "0.8", "149.90", fee="0")
         self.assertEqual("Filled", self.venue.orders[order["id"]]["status"])
-        self.assertEqual([9003, 9004], [row["tradeId"] for row in self.venue.fills])
+        self.assertEqual([9002, 9003], [row["tradeId"] for row in self.venue.fills])
         self.assertEqual("0", self.venue.fills[-1]["fee"])
         with self.assertRaises(ValueError):
             await self.venue.fill(order["id"], "1", "149.90")

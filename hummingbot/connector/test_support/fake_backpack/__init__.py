@@ -3,10 +3,14 @@
 FakeBackpackVenue keeps orders, fills, positions, and paged history in memory.
 REST receipts appear in requests.jsonl. WS frames appear in ws.jsonl. Both logs
 use t_mono_ns from time.monotonic_ns() for cross-process joins on Linux.
+Starting a venue replaces both logs in its state directory. Reusing a directory
+does not mix earlier runs or earlier boots into reference-load metrics.
 Fault queues are independent for each method and path. A held request receives
 no response and does not execute. A dropped request executes before disconnect.
 The default LIMIT fill policy is manual. MARKET orders fill at the touch or
 expire when the opposite book is empty.
+Private fills wait for orderAccepted. A CROSSING trade appears once on the public
+tape and shares its trade ID with any resulting private fill.
 Crossing post-only limits return INVALID_ORDER. The connector reports an order
 failure through its existing LIMIT_MAKER rejection path.
 
@@ -65,9 +69,11 @@ Public channel and history field names follow https://docs.backpack.exchange/.
 History bounds use ``from`` and ``to`` in milliseconds. Naive ISO timestamps are
 UTC. History defaults to 100 rows and caps each page at 1000 rows. Fill-history
 ``from`` is inclusive and ``to`` is exclusive, as documented by Backpack.
-Order queries return only resting orders. Filled and cancelled orders return
-404, so the stock connector takes its not-found path rather than learning a
-terminal status from that endpoint. Fill history remains available.
+Order queries and cancellations accept only resting orders. Filled, cancelled,
+and expired orders return 404. Fill history remains available. When the private
+stream misses a fill, the stock connector reports it from REST fill history but
+does not learn a terminal status from order queries. Repeated 404s exhaust its
+not-found limit of three and mark the fully REST-filled order FAILED.
 The markPrice ``n`` field is milliseconds. The stock connector converts it to
 seconds, as it does for the REST funding timestamp.
 Position updates use positionOpened, positionAdjusted, and positionClosed.

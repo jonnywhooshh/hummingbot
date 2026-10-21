@@ -12,7 +12,7 @@ from unittest.mock import patch
 from aiohttp import ClientSession, WSServerHandshakeError
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from hummingbot.connector.test_support.fake_backpack.venue import FakeBackpackVenue, keypair, signing_string
+from hummingbot.connector.test_support.fake_backpack.venue import FakeBackpackVenue, FillPolicy, keypair, signing_string
 
 
 class VenueFidelityTests(IsolatedAsyncioWrapperTestCase):
@@ -75,13 +75,17 @@ class VenueFidelityTests(IsolatedAsyncioWrapperTestCase):
                          [row["payload"] for row in rows if row["type"] in ("PING", "PONG")])
 
     async def test_closed_orders_are_not_resting_orders(self):
-        for status in ("Filled", "Cancelled"):
+        for status in ("Filled", "Cancelled", "Expired"):
             order = await self.order()
             self.venue.orders[order["id"]]["status"] = status
             params = {"orderId": order["id"]}
             async with self.session.get(self.url + "/api/v1/order", params=params,
                                         headers=self.headers("orderQuery", params)) as response:
                 self.assertEqual(404, response.status)
+            async with self.session.delete(self.url + "/api/v1/order", json=params,
+                                           headers=self.headers("orderCancel", params)) as response:
+                self.assertEqual(404, response.status)
+            self.assertEqual(status, self.venue.orders[order["id"]]["status"])
 
     async def test_history_uses_millisecond_bounds_and_utc_naive_dates(self):
         for suffix in ("Z", ""):
@@ -170,3 +174,46 @@ class VenueFidelityTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(order["id"], public["b"])
         accepted = self.venue._order_frame("orderAccepted", self.venue.orders[order["id"]])
         self.assertIsNone(accepted["t"])
+
+    async def test_crossing_fill_reuses_one_public_execution(self):
+        self.venue.fill_policy = FillPolicy.CROSSING
+        order = await self.order()
+        await self.venue.push_trade("149.90", "0.2")
+        trades = [data for _, _, data in self.venue.ws_outbound if data["e"] == "trade"]
+        fills = [data for _, _, data in self.venue.ws_outbound if data["e"] == "orderFill"]
+        self.assertEqual(1, len(trades))
+        self.assertEqual(1, len(fills))
+        self.assertEqual(Decimal("0.2"), sum(Decimal(trade["q"]) for trade in trades))
+        self.assertEqual(trades[0]["t"], fills[0]["t"])
+        self.assertEqual(trades[0]["t"], self.venue.fills[0]["tradeId"])
+        self.assertEqual("PartiallyFilled", self.venue.orders[order["id"]]["status"])
+
+    async def test_manual_fill_waits_for_acceptance(self):
+        self.venue.ack_delay = 0.05
+        order = await self.order()
+        await self.venue.fill(order["id"], "1", "149.90")
+        frames = [data for _, _, data in self.venue.ws_outbound if data.get("i") == order["id"]]
+        self.assertEqual(["orderAccepted", "orderFill"], [frame["e"] for frame in frames])
+        self.assertEqual("New", frames[0]["X"])
+
+    async def test_post_only_flag_is_absent_for_ordinary_orders(self):
+        order = await self.order(postOnly=False)
+        frame = await self.venue.fill(order["id"], "1", "149.90")
+        self.assertNotIn("y", frame)
+        self.assertNotIn("y", self.venue._order_frame("orderAccepted", order))
+
+    async def test_reused_state_directory_contains_only_current_run(self):
+        await self.order()
+        await self.venue.push_trade()
+        await self.venue.stop()
+        venue = FakeBackpackVenue(state_dir=self.directory.name)
+        try:
+            await venue.start()
+            self.assertEqual("", (Path(self.directory.name) / "requests.jsonl").read_text())
+            self.assertEqual("", (Path(self.directory.name) / "ws.jsonl").read_text())
+            async with self.session.get(f"http://127.0.0.1:{venue.port}/api/v1/ping") as response:
+                self.assertEqual(200, response.status)
+            rows = [json.loads(line) for line in (Path(self.directory.name) / "requests.jsonl").read_text().splitlines()]
+            self.assertEqual(["/api/v1/ping"], [row["path"] for row in rows])
+        finally:
+            await venue.stop()
