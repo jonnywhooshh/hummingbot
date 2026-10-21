@@ -286,3 +286,12 @@ def test_spot_reconciliation_values_the_reported_balances():
                         [position(2, "0")], [], Prices(), market="spot")
     response = balance(10, "1000", token_balances={"USDC": D("1000"), "SOL": D("1")})
     assert reconcile(start, [response], [], run_end=20).comparisons[0].equity.total == D("0")
+
+
+def test_response_fields_wider_than_the_default_context_stay_exact():
+    digits = "0.1234567890123456789012345678901234567"
+    untraded = D(digits)
+    start = opened()
+    report = reconcile(start, [balance(30, "101", untraded_assets=untraded, missing_fees_funding=D("0"))],
+                       [position(32, "0")], run_end=10)
+    assert report.comparisons[0].equity.unexplained == D("-" + digits)
