@@ -1,5 +1,5 @@
 from dataclasses import replace
-from decimal import Decimal as D
+from decimal import Decimal as D, localcontext
 
 import pytest
 
@@ -28,7 +28,7 @@ def position(t, quantity="1"):
 
 
 def opened(events=(), prices=None, opening_balance=None):
-    return open_ledger([opening_balance or balance(0)], [position(2)], events, prices or Prices())
+    return open_ledger([opening_balance or balance(0)], [position(2)], events, prices or Prices(), run_end=1000)
 
 
 def test_criterion_31_backfill_values_at_its_mark_and_includes_later_funding():
@@ -135,7 +135,7 @@ def test_equity_diagnostic_switches_only_on_a_strict_majority_of_flat_failures()
     assert result.definition == "netEquity_plus_unrealized"
     assert result.eligible_pairs == 3
     assert result.flat_mark_move_failures == 2
-    start = open_ledger([flat.before], [position(2)], [], Prices(), equity_definition=result.definition)
+    start = open_ledger([flat.before], [position(2)], [], Prices(), equity_definition=result.definition, run_end=1000)
     assert start.ledger.opening.E_open == D("102")
     result = reconcile(start, [replace(flat.after, untraded_assets=D("0"), missing_fees_funding=D("0"))],
                        [], run_end=20)
@@ -167,7 +167,7 @@ def test_boundaries_and_responses_before_opening():
     assert diagnose_equity([BalancePair(balance(10), balance(0), D("1"))], []).eligible_pairs == 0
     with pytest.raises(ValueError, match="attribution end"):
         reconcile(opened(), [], [], run_end=10, attribution_end=5)
-    unresolved = open_ledger([], [], [], Prices())
+    unresolved = open_ledger([], [], [], Prices(), run_end=1000)
     with pytest.raises(ValueError, match="unresolved"):
         reconcile(unresolved, [], [], run_end=10)
     assert reconcile(opened(), [balance(0)], [], run_end=10).comparisons == ()
@@ -205,7 +205,7 @@ def test_input_order_does_not_change_reconciliation_order():
 def test_base_token_fees_and_rebates_are_in_mark_and_timing_exposure(fee):
     event = Fill(5, "buy", D("1"), D("100"), fee, "SOL")
     prices = Prices({("SOL", 11): D("102")})
-    start = open_ledger([balance(0, "100")], [position(2, "0")], [event], prices)
+    start = open_ledger([balance(0, "100")], [position(2, "0")], [event], prices, run_end=1000)
     later = balance(10, "100", mid_range=D("2"), untraded_assets=D("0"), missing_fees_funding=D("0"))
     result = reconcile(start, [later], [], run_end=20).comparisons[0].equity
     exposure = D("1") - fee
@@ -219,7 +219,7 @@ def test_base_token_fees_and_rebates_are_in_mark_and_timing_exposure(fee):
                          [("1", "101.3", "0.4", "-0.7"), ("-1", "99.3", "-0.4", "0.1")])
 def test_signed_valuation_timing_is_a_residual_component(quantity, venue_equity, timing, unexplained):
     start = open_ledger([balance(0, "100")], [position(2, quantity)], [],
-                        Prices({("SOL", 11): D("101")}))
+                        Prices({("SOL", 11): D("101")}), run_end=1000)
     later = balance(10, venue_equity, "101", mid_range=D("0.4"),
                     untraded_assets=D("0"), missing_fees_funding=D("0"))
     result = reconcile(start, [later], [], run_end=20).comparisons[0].equity
@@ -241,14 +241,14 @@ def test_unknown_ranges_and_unknown_book_do_not_fabricate_timing():
 
 def test_equity_definition_is_inherited_from_the_opening():
     start = open_ledger([balance(0, "100", unrealized_pnl=D("1"))], [position(2)], [], Prices(),
-                        equity_definition="netEquity_plus_unrealized")
+                        equity_definition="netEquity_plus_unrealized", run_end=1000)
     later = balance(10, "100", unrealized_pnl=D("1"))
     assert reconcile(start, [later], [], run_end=20).comparisons[0].equity.total == D("0")
 
 
 def test_missing_unrealized_response_is_unresolved_without_stopping_later_comparisons():
     start = open_ledger([balance(0, "100", unrealized_pnl=D("1"))], [position(2)], [], Prices(),
-                        equity_definition="netEquity_plus_unrealized")
+                        equity_definition="netEquity_plus_unrealized", run_end=1000)
     report = reconcile(start, [balance(10), balance(20, "100", unrealized_pnl=D("1"))], [], run_end=30)
     assert report.comparisons[0].status == "valuation_unresolved"
     assert report.comparisons[0].equity.total is None
@@ -283,7 +283,7 @@ def test_diagnostic_without_window_mark_ranges_cannot_verify_a_definition():
 
 def test_spot_reconciliation_values_the_reported_balances():
     start = open_ledger([balance(0, "1000", token_balances={"USDC": D("1000"), "SOL": D("1")})],
-                        [position(2, "0")], [], Prices(), market="spot")
+                        [position(2, "0")], [], Prices(), market="spot", run_end=1000)
     response = balance(10, "1000", token_balances={"USDC": D("1000"), "SOL": D("1")})
     assert reconcile(start, [response], [], run_end=20).comparisons[0].equity.total == D("0")
 
@@ -295,3 +295,34 @@ def test_response_fields_wider_than_the_default_context_stay_exact():
     report = reconcile(start, [balance(30, "101", untraded_assets=untraded, missing_fees_funding=D("0"))],
                        [position(32, "0")], run_end=10)
     assert report.comparisons[0].equity.unexplained == D("-" + digits)
+
+
+def test_spot_reconciliation_values_both_sides_at_mids_whatever_the_response_mark():
+    held = {"USDC": D("1000"), "SOL": D("1")}
+    prices = Prices({("SOL", 1): D("100"), ("SOL", 11): D("110")})
+    start = open_ledger([balance(0, "1100", "100", token_balances=held)], [position(2, "0")], [], prices,
+                        market="spot", run_end=1000)
+    later = balance(10, "1110", "100", untraded_assets=D("0"), missing_fees_funding=D("0"), token_balances=held)
+    residual = reconcile(start, [later], [], run_end=20).comparisons[0].equity
+    assert (start.opening_valuation_difference, residual.total, residual.mark_versus_mid,
+            residual.unexplained) == (D("0"), D("0"), D("0"), D("0"))
+
+
+def test_mark_versus_mid_prices_held_base_tokens_at_their_own_mid_when_an_instrument_is_set():
+    prices = Prices({("SOL-PERP", t): D("100") for t in (1, 5, 11)})
+    start = open_ledger([balance(0, "1000", "100")], [position(2, "0")],
+                        [Fill(5, "buy", D("1"), D("100"), D("1"), "SOL")], prices,
+                        instrument="SOL-PERP", run_end=1000)
+    later = balance(10, "900", "101", untraded_assets=D("0"), missing_fees_funding=D("0"))
+    residual = reconcile(start, [later], [], run_end=20).comparisons[0].equity
+    assert residual.mark_versus_mid == D("-1")
+    assert residual.unexplained == D("1")
+
+
+def test_position_difference_is_exact_beyond_the_callers_precision():
+    wide = D("1234567890.1234567890123456789")
+    start = open_ledger([balance(0)], [PositionResponse(Window(2, 4), wide, D("99"))], [], Prices(), run_end=1000)
+    with localcontext() as context:
+        context.prec = 28
+        report = reconcile(start, [], [PositionResponse(Window(10, 12), D("0.1"), D("99"))], run_end=20)
+    assert report.comparisons[0].position_difference == D("1234567890.0234567890123456789")

@@ -1,5 +1,8 @@
 """Offline reconciliation uses signed ledger-minus-venue components.
 
+Spot valuation uses mids on both sides, so spot has no mark-versus-mid
+component. With an instrument set, held base tokens are valued at their own
+mid and only the contract position carries mark-versus-mid and timing.
 Valuation timing is signed exposure times the observed mid range at each
 balance window, including the opening window. unexplained subtracts every
 component, including timing, only when all components are known. Otherwise
@@ -128,6 +131,11 @@ class _ResponseMids:
 
 
 @accounting_context
+def _position_difference(ledger: Ledger, response: PositionResponse) -> Decimal:
+    return ledger.position - response.position
+
+
+@accounting_context
 def _reconcile_balance(ledger: Ledger, response: BalanceResponse, opened: OpenedLedger) -> Reconciliation:
     opening_balance = opened.selection.cut.balance
     ledger._observe(opening_balance.mark, opening_balance.mid_range)
@@ -138,9 +146,12 @@ def _reconcile_balance(ledger: Ledger, response: BalanceResponse, opened: Opened
                     else response.equity(opened.equity_definition))
     ledger._observe(venue_equity)
     residual = None if point.equity is None or venue_equity is None else point.equity - venue_equity
-    exposure = ledger.base_valuation_exposure
+    exposure = (ledger.base_valuation_exposure if ledger.market == "spot" or ledger.instrument == ledger.base_token
+                else ledger.position)
     mark_difference = None
-    if point.mid is not None:
+    if ledger.market == "spot":
+        mark_difference = ZERO
+    elif point.mid is not None:
         mark_difference = (exposure * (point.mid - response.mark)
                            - ledger.opening.pos_open * (ledger.opening.mid_open - opening_balance.mark))
     timing = None
@@ -209,7 +220,7 @@ def reconcile(opened: OpenedLedger, balances: Iterable[BalanceResponse], positio
             ledger.apply(index.events[cursor])
             cursor += 1
         if isinstance(response, PositionResponse):
-            difference = ledger.position - response.position
+            difference = _position_difference(ledger, response)
             comparisons.append(Reconciliation(response, t, "matched" if difference == ZERO else "unresolved_position",
                                               position_difference=difference))
         else:

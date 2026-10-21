@@ -1,9 +1,10 @@
 """Select the first usable, event-free opening pair from in-run responses.
 
 First means earliest pair completion, then balance and position input order.
-Backfill responses cannot open a run. Pass run_end when response provenance
-also includes ordinary responses outside the run. Unknown opening mids or
-venue equity skip that balance rather than inventing an opening valuation.
+Backfill responses cannot open a run. open_ledger requires run_end and refuses
+responses completed after it. Unknown opening mids, venue equity, or a
+perpetual position's entry price skip that response rather than inventing an
+opening valuation.
 Spot openings and comparisons value token_balances, not net_equity.
 """
 
@@ -194,8 +195,8 @@ class OpenedLedger:
 
 def open_ledger(balances: Iterable[BalanceResponse], positions: Iterable[PositionResponse],
                 events: Iterable[Event], mids: Mids, *, base_token: str = "SOL", quote_token: str = "USDC",
-                market: str = "perpetual", cost_method: str = "wac", equity_definition: str = "netEquity",
-                run_end: Optional[int] = None, instrument: Optional[str] = None) -> OpenedLedger:
+                run_end: int, market: str = "perpetual", cost_method: str = "wac",
+                equity_definition: str = "netEquity", instrument: Optional[str] = None) -> OpenedLedger:
     if equity_definition not in ("netEquity", "netEquity_plus_unrealized"):
         raise ValueError("unknown venue equity definition")
     ordered = EventIndex(events)
@@ -206,7 +207,7 @@ def open_ledger(balances: Iterable[BalanceResponse], positions: Iterable[Positio
     prepared = {}
     unavailable = None
     for response in balances:
-        if response.backfill or (run_end is not None and response.window.end > run_end):
+        if response.backfill or response.window.end > run_end:
             continue
         mid = mids.mid(instrument if instrument is not None else base_token, response.window.midpoint)
         if mid is None:
@@ -218,8 +219,12 @@ def open_ledger(balances: Iterable[BalanceResponse], positions: Iterable[Positio
             unavailable = "spot_balances_unavailable" if market == "spot" else "venue_equity_unavailable"
             continue
         prepared[id(response)] = (mid, equity)
+    usable = tuple(response for response in positions
+                   if market == "spot" or response.position == ZERO or response.entry_price is not None)
+    if len(usable) < len(positions) and unavailable is None:
+        unavailable = "position_entry_unavailable"
     selection = find_quiet_cut((response for response in balances if id(response) in prepared),
-                               positions, ordered.events, run_end=run_end)
+                               usable, ordered.events, run_end=run_end)
     if selection.cut is None:
         selection = CutSelection(None, initial.overlapping_events, unavailable)
         return OpenedLedger(selection, None, (), ordered.events, equity_definition, None)
@@ -231,9 +236,12 @@ def open_ledger(balances: Iterable[BalanceResponse], positions: Iterable[Positio
     ledger = Ledger(opening, mids, base_token=base_token, quote_token=quote_token,
                     market=market, cost_method=cost_method, instrument=instrument)
     boundary = bisect_right(ordered.times, t)
-    with localcontext() as context:
-        context.prec = max(context.prec, 2 * (len(mid.as_tuple().digits) + abs(mid.as_tuple().exponent)
-                                              + len(balance.mark.as_tuple().digits) + abs(balance.mark.as_tuple().exponent)))
-        difference = balance.mark - mid
+    difference = ZERO
+    if market != "spot":
+        with localcontext() as context:
+            context.prec = max(context.prec, 2 * (len(mid.as_tuple().digits) + abs(mid.as_tuple().exponent)
+                                                  + len(balance.mark.as_tuple().digits)
+                                                  + abs(balance.mark.as_tuple().exponent)))
+            difference = balance.mark - mid
     return OpenedLedger(selection, ledger, ordered.events[:boundary], ordered.events[boundary:],
                         equity_definition, difference)

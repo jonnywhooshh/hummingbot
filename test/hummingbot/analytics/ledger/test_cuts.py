@@ -38,7 +38,7 @@ def test_criterion_25_opens_at_next_quiet_cut_without_double_counting(case):
         equity, quantity, entry = "101", "1", "99"
     balances.append(balance(10, 12, equity))
     positions.append(position(11, 13, quantity, entry))
-    opened = open_ledger(balances, positions, events, Prices())
+    opened = open_ledger(balances, positions, events, Prices(), run_end=1000)
     assert opened.selection.cut.balance == balances[-1]
     assert opened.selection.cut.position == positions[0 if case == 3 else -1]
     assert opened.pre_opening == tuple(events)
@@ -50,14 +50,14 @@ def test_criterion_30_funding_between_responses_prevents_cut():
     events = [FundingPayment(5, D("-1"))]
     balances = [balance(0, 2), balance(10, 12, "99")]
     positions = [position(7, 8), position(11, 13)]
-    opened = open_ledger(balances, positions, events, Prices())
+    opened = open_ledger(balances, positions, events, Prices(), run_end=1000)
     assert opened.ledger.opening.E_open == D("99")
     assert opened.ledger.value(13).equity == D("99")
     assert opened.pre_opening == tuple(events)
 
 
 def test_criterion_35_balance_time_is_the_opening_price_anchor():
-    opened = open_ledger([balance(10, 12, "101")], [position(20, 22, "1", "99")], [], Prices())
+    opened = open_ledger([balance(10, 12, "101")], [position(20, 22, "1", "99")], [], Prices(), run_end=1000)
     assert opened.ledger.opening.E_open == D("101")
     assert opened.ledger.opening.t_open == 11
     assert opened.ledger.opening.mid_open == D("100")
@@ -67,7 +67,7 @@ def test_criterion_35_balance_time_is_the_opening_price_anchor():
 @pytest.mark.parametrize("event", [Fill(5, "buy", D("1"), D("99")),
                                    FundingPayment(5, D("-1")), Transfer(5, D("2"))])
 def test_opening_unresolved_reports_overlapping_facts(event):
-    opened = open_ledger([balance(0, 2)], [position(7, 8)], [event], Prices())
+    opened = open_ledger([balance(0, 2)], [position(7, 8)], [event], Prices(), run_end=1000)
     assert opened.selection.status == "opening_unresolved"
     assert opened.ledger is None
     assert opened.selection.overlapping_events == (event,)
@@ -82,7 +82,7 @@ def test_no_responses_and_missing_opening_mid():
         def mid(self, token, t):
             return None
 
-    result = open_ledger([balance(1, 2)], [position(3, 4)], [], Missing())
+    result = open_ledger([balance(1, 2)], [position(3, 4)], [], Missing(), run_end=1000)
     assert result.selection.status == "opening_unresolved"
     assert result.selection.reason == "opening_mid_unavailable"
 
@@ -90,7 +90,7 @@ def test_no_responses_and_missing_opening_mid():
 def test_cut_is_symmetric_and_preserves_post_opening_events():
     event = Transfer(8, D("4"))
     opened = open_ledger([balance(5, 6, token_balances={"USDC": D("100")})],
-                         [position(1, 2)], [event], Prices(), market="spot")
+                         [position(1, 2)], [event], Prices(), market="spot", run_end=1000)
     assert opened.selection.status == "resolved"
     assert opened.selection.cut.window == Window(1, 6)
     assert opened.events == (event,)
@@ -188,7 +188,7 @@ def test_position_and_equity_definition_boundaries():
 
 def test_equal_completion_uses_original_input_order_for_opening_anchor():
     balances = [balance(10, 20, "102"), balance(0, 5)]
-    opened = open_ledger(balances, [position(30, 40, "1", "99")], [], Prices())
+    opened = open_ledger(balances, [position(30, 40, "1", "99")], [], Prices(), run_end=1000)
     assert opened.selection.cut.balance == balances[0]
     assert opened.ledger.opening.t_open == 15
     assert opened.ledger.opening.E_open == opened.ledger.opening.mid_open == D("102")
@@ -197,7 +197,7 @@ def test_equal_completion_uses_original_input_order_for_opening_anchor():
 def test_opening_skips_balance_without_the_chosen_equity_definition():
     balances = [balance(0, 2), balance(10, 12, unrealized_pnl=D("1"))]
     opened = open_ledger(balances, [position(3, 4)], [], Prices(),
-                         equity_definition="netEquity_plus_unrealized")
+                         equity_definition="netEquity_plus_unrealized", run_end=1000)
     assert opened.selection.cut.balance == balances[1]
     assert opened.equity_definition == "netEquity_plus_unrealized"
     assert opened.ledger.opening.E_open == D("101")
@@ -209,7 +209,7 @@ def test_opening_skips_a_quiet_cut_without_a_mid():
             return None if t < 10 else D("100")
 
     balances = [balance(0, 2), balance(10, 12)]
-    opened = open_ledger(balances, [position(3, 4)], [], InitiallyUnknown())
+    opened = open_ledger(balances, [position(3, 4)], [], InitiallyUnknown(), run_end=1000)
     assert opened.selection.cut.balance == balances[1]
     assert opened.ledger.opening.mid_open == D("100")
 
@@ -218,7 +218,7 @@ def test_backfill_responses_cannot_resolve_an_in_run_opening():
     fill = Fill(1, "buy", D("1"), D("99"))
     balances = [balance(0, 2), balance(20, 22, backfill=True)]
     positions = [position(0, 2), replace(position(20, 22), backfill=True)]
-    opened = open_ledger(balances, positions, [fill], Prices())
+    opened = open_ledger(balances, positions, [fill], Prices(), run_end=1000)
     assert opened.selection.status == "opening_unresolved"
     assert opened.selection.overlapping_fills == (fill,)
     assert opened.events == (fill,)
@@ -231,13 +231,13 @@ def test_explicit_run_boundary_excludes_late_ordinary_responses():
 
 
 def test_opening_exposes_the_mark_minus_mid_difference():
-    opened = open_ledger([replace(balance(0, 2), mark=D("103"))], [position(3, 4)], [], Prices())
+    opened = open_ledger([replace(balance(0, 2), mark=D("103"))], [position(3, 4)], [], Prices(), run_end=1000)
     assert opened.opening_valuation_difference == D("3")
 
 
 def test_spot_opening_uses_reported_token_balances_not_net_equity_or_contract_position():
     response = balance(0, 2, "1000", token_balances={"SOL": D("1"), "USDC": D("1000")})
-    opened = open_ledger([response], [position(3, 4, "9", "99")], [], Prices(), market="spot")
+    opened = open_ledger([response], [position(3, 4, "9", "99")], [], Prices(), market="spot", run_end=1000)
     assert opened.ledger.opening.E_open == D("1100")
     assert opened.ledger.position == D("1")
     assert opened.ledger.value(5).equity == D("1100")
@@ -255,3 +255,23 @@ def test_estimated_clock_basis_reaches_the_response_window():
     window = clock.response_window("bot", 130, 132)
     assert (window.start, window.end) == (40, 42)
     assert window.basis == "offset_estimated"
+
+
+def test_perpetual_position_without_entry_price_skips_that_cut_as_unknown_input():
+    unknown = PositionResponse(Window(2, 4), D("1"))
+    result = open_ledger([balance(0, 2)], [unknown], [], Prices(), run_end=100)
+    assert (result.selection.status, result.selection.reason, result.ledger) == (
+        "opening_unresolved", "position_entry_unavailable", None)
+    later = open_ledger([balance(0, 2), balance(10, 12)], [unknown, position(11, 13, "1", "99")], [], Prices(),
+                        run_end=100)
+    assert later.selection.cut.position.window.start == 11
+    flat = open_ledger([balance(0, 2)], [position(2, 4, "0")], [], Prices(), run_end=100)
+    assert flat.ledger is not None
+    spot = open_ledger([balance(0, 2, token_balances={"USDC": D("100")})], [unknown], [], Prices(), market="spot",
+                       run_end=100)
+    assert spot.ledger is not None
+
+
+def test_open_ledger_requires_the_run_end():
+    with pytest.raises(TypeError):
+        open_ledger([balance(20, 22)], [position(20, 22)], [], Prices())
