@@ -15,6 +15,8 @@ def stream_with_move(*, gap=False, clock_basis="venue"):
     update_id = 14 if gap else 13
     stream.apply_diff({"U": update_id, "u": update_id, "b": [["99", "0"], ["97", "1"]],
                        "a": [["101", "0"], ["99", "1"]]}, timestamp_ns=3 * SECOND)
+    if not gap:
+        stream.apply_diff({"U": 14, "u": 14, "b": [], "a": []}, timestamp_ns=4 * SECOND)
     return stream
 
 
@@ -78,7 +80,7 @@ class BookReferenceTests(TestCase):
 
     def test_unchanged_book_for_ten_seconds_is_valid_with_later_continuous_frame(self):
         stream = stream_with_move()
-        stream.apply_diff({"U": 14, "u": 14, "b": [], "a": []}, timestamp_ns=13 * SECOND)
+        stream.apply_diff({"U": 15, "u": 15, "b": [], "a": []}, timestamp_ns=13 * SECOND + 1_000)
         observation = BookReference(stream, run_end_ns=14 * SECOND).observe(3 * SECOND, 10 * SECOND)
         self.assertEqual("valid", observation.status)
         self.assertEqual(Decimal("100"), observation.m0)
@@ -156,7 +158,8 @@ class BookReferenceTests(TestCase):
 
     def test_undefined_horizon_mid_is_not_an_unknown_book(self):
         bot = stream_with_move()
-        bot.apply_diff({"U": 14, "u": 14, "b": [["97", "0"]], "a": []}, timestamp_ns=4 * SECOND)
+        bot.apply_diff({"U": 15, "u": 15, "b": [["97", "0"]], "a": []}, timestamp_ns=4 * SECOND)
+        bot.apply_diff({"U": 16, "u": 16, "b": [], "a": []}, timestamp_ns=5 * SECOND)
         reference = BookReference(bot, sidecar=stream_with_move(), run_end_ns=5 * SECOND)
         observation = reference.observe(2 * SECOND, 2 * SECOND)
         self.assertTrue(reference.known(4 * SECOND))
@@ -176,6 +179,7 @@ class BookReferenceTests(TestCase):
                            timestamp_ns=2 * SECOND)
         bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=2 * SECOND)
         bot.apply_diff({"U": 12, "u": 12, "b": [], "a": []}, timestamp_ns=3 * SECOND)
+        bot.apply_diff({"U": 13, "u": 13, "b": [], "a": []}, timestamp_ns=4 * SECOND)
         observation = BookReference(bot, sidecar=stream_with_move(), run_end_ns=4 * SECOND).observe(
             SECOND + SECOND // 2, SECOND + SECOND // 2)
         self.assertEqual("valid", observation.status)
@@ -185,9 +189,9 @@ class BookReferenceTests(TestCase):
 
     def test_sidecar_same_time_diff_flags_a_bot_reference(self):
         sidecar = stream_with_move()
-        sidecar.apply_diff({"U": 14, "u": 14, "b": [], "a": []}, timestamp_ns=4 * SECOND)
+        sidecar.apply_diff({"U": 15, "u": 15, "b": [], "a": []}, timestamp_ns=4 * SECOND)
         bot = stream_with_move()
-        bot.apply_diff({"U": 14, "u": 14, "b": [], "a": []}, timestamp_ns=5 * SECOND)
+        bot.apply_diff({"U": 15, "u": 15, "b": [], "a": []}, timestamp_ns=5 * SECOND)
         observation = BookReference(bot, sidecar=sidecar, run_end_ns=5 * SECOND).observe(4 * SECOND, 0)
         self.assertEqual("bot", observation.source)
         self.assertTrue(observation.m0_tie_uncertain)
@@ -196,7 +200,7 @@ class BookReferenceTests(TestCase):
         bot = stream_with_move()
         bot.apply_snapshot({"lastUpdateId": 13, "bids": [["97", "1"]], "asks": [["99", "1"]]},
                            timestamp_ns=3 * SECOND)
-        bot.apply_diff({"U": 14, "u": 14, "b": [], "a": []}, timestamp_ns=4 * SECOND)
+        bot.apply_diff({"U": 15, "u": 15, "b": [], "a": []}, timestamp_ns=4 * SECOND + 1_000)
         observation = BookReference(bot, run_end_ns=4 * SECOND).observe(3 * SECOND, SECOND)
         self.assertEqual("valid", observation.status)
         self.assertEqual(Decimal("100"), observation.m0)
@@ -213,9 +217,9 @@ class BookReferenceTests(TestCase):
         self.assertEqual(Decimal("100"), observation.m0)
         self.assertIsNone(observation.mh)
 
-    def test_frame_one_nanosecond_after_horizon_confirms_ten_seconds_of_silence(self):
+    def test_frame_one_microsecond_after_horizon_confirms_ten_seconds_of_silence(self):
         bot = stream_with_move()
-        bot.apply_diff({"U": 14, "u": 14, "b": [], "a": []}, timestamp_ns=13 * SECOND + 1)
+        bot.apply_diff({"U": 15, "u": 15, "b": [], "a": []}, timestamp_ns=13 * SECOND + 1_000)
         observation = BookReference(bot, run_end_ns=30 * SECOND).observe(3 * SECOND, 10 * SECOND)
         self.assertEqual("valid", observation.status)
         self.assertIsNone(observation.reason)
@@ -223,8 +227,16 @@ class BookReferenceTests(TestCase):
 
     def test_same_time_gap_is_unknown_at_the_horizon(self):
         bot = stream_with_move()
-        bot.apply_diff({"U": 15, "u": 15, "b": [], "a": []}, timestamp_ns=3 * SECOND)
-        observation = BookReference(bot, run_end_ns=4 * SECOND).observe(2 * SECOND, SECOND)
+        bot.apply_diff({"U": 16, "u": 16, "b": [], "a": []}, timestamp_ns=4 * SECOND)
+        observation = BookReference(bot, run_end_ns=5 * SECOND).observe(2 * SECOND, 2 * SECOND)
+        self.assertEqual("invalid", observation.status)
+        self.assertEqual("book_unknown", observation.reason)
+        self.assertIsNone(observation.mh)
+
+    def test_frame_at_horizon_does_not_confirm_ten_seconds_of_silence(self):
+        bot = stream_with_move()
+        bot.apply_diff({"U": 15, "u": 15, "b": [], "a": []}, timestamp_ns=13 * SECOND)
+        observation = BookReference(bot, run_end_ns=30 * SECOND).observe(3 * SECOND, 10 * SECOND)
         self.assertEqual("invalid", observation.status)
         self.assertEqual("book_unknown", observation.reason)
         self.assertIsNone(observation.mh)

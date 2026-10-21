@@ -13,8 +13,9 @@ diffs that predate the response receipt. Equal or lagging snapshots cannot
 replace a continuous book. Advancing snapshots replace it and need a new
 covering diff. The same sequence rule applies on a receipt-clock stream.
 
-Only a later continuous frame can confirm silence. A gap stamped at the last
-confirmed timestamp revokes that timestamp, but not earlier nanoseconds.
+Only a continuous frame stamped strictly after a query confirms its complete
+timestamp group. Strict-before queries may use a frame at the query time.
+Known intervals have inclusive nanosecond bounds and exclude the last frame.
 """
 
 from bisect import bisect_left, bisect_right
@@ -189,27 +190,30 @@ class BookStream:
 
     @property
     def known_intervals(self) -> Tuple[KnownInterval, ...]:
-        return tuple(KnownInterval(s.times[0], s.end_ns) for s in self._stretches if s.times[0] <= s.end_ns)
+        return tuple(KnownInterval(s.times[0], min(s.end_ns, s.times[-1] - 1))
+                     for s in self._stretches if s.times[0] < s.times[-1])
 
-    def _stretch_at(self, timestamp_ns: int) -> Optional[_Stretch]:
+    def _stretch_at(self, timestamp_ns: int, *, strictly_before: bool = False) -> Optional[_Stretch]:
         index = bisect_right(self._starts, timestamp_ns) - 1
         if index < 0:
             return None
         stretch = self._stretches[index]
-        return stretch if timestamp_ns <= stretch.end_ns else None
+        confirmed = timestamp_ns <= stretch.end_ns if strictly_before else timestamp_ns < stretch.times[-1]
+        return stretch if confirmed and timestamp_ns <= stretch.end_ns else None
 
     def known(self, timestamp_ns: int) -> bool:
         return self._stretch_at(timestamp_ns) is not None
 
     def mid_at(self, timestamp_ns: int, *, strictly_before: bool = False) -> Optional[Decimal]:
-        stretch = self._stretch_at(timestamp_ns)
+        stretch = self._stretch_at(timestamp_ns, strictly_before=strictly_before)
         if stretch is None:
             return None
         index = (bisect_left if strictly_before else bisect_right)(stretch.times, timestamp_ns) - 1
         return stretch.points[index].mid if index >= 0 else None
 
     def has_diff_at(self, timestamp_ns: int) -> bool:
-        stretch = self._stretch_at(timestamp_ns)
+        index = bisect_right(self._starts, timestamp_ns) - 1
+        stretch = self._stretches[index] if index >= 0 else None
         if stretch is None:
             return False
         index = bisect_left(stretch.times, timestamp_ns)

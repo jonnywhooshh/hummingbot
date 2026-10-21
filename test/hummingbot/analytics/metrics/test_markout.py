@@ -9,7 +9,7 @@ from hummingbot.analytics.metrics.markout import compute_markout
 
 
 class MarkoutTests(TestCase):
-    def reference(self, *, run_end_ns=30, gap=False, clock_basis="venue"):
+    def reference(self, *, run_end_ns=40, gap=False, clock_basis="venue"):
         stream = BookStream(clock_basis=clock_basis)
         stream.apply_snapshot({"lastUpdateId": 10, "bids": [["99", "1"]], "asks": [["101", "1"]]},
                               timestamp_ns=0)
@@ -18,6 +18,8 @@ class MarkoutTests(TestCase):
         uid = 14 if gap else 13
         stream.apply_diff({"U": uid, "u": uid, "b": [["99", "0"], ["97", "1"]],
                            "a": [["101", "0"], ["99", "1"]]}, timestamp_ns=30)
+        if not gap:
+            stream.apply_diff({"U": 14, "u": 14, "b": [], "a": []}, timestamp_ns=40)
         return BookReference(stream, run_end_ns=run_end_ns).observe(15, 15)
 
     def test_criterion_14_buy(self):
