@@ -86,10 +86,19 @@ class ActiveSegment:
         self.last_seq = seq if self.last_seq is None else max(self.last_seq, seq)
 
     def flush(self) -> None:
-        if self._pending:
-            write_all(self.fd, b"".join(self._pending))
-            self._pending.clear()
-            self.dirty = True
+        if not self._pending:
+            return
+        data = b"".join(self._pending)
+        sent = 0
+        try:
+            while sent < len(data):
+                written = os.write(self.fd, memoryview(data)[sent:])
+                if written == 0:
+                    raise OSError("Analytics write made no progress")
+                sent += written
+                self.dirty = True
+        finally:
+            self._pending = [data[sent:]] if sent < len(data) else []
 
     def sync(self) -> None:
         self.flush()
