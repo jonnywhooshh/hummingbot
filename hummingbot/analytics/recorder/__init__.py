@@ -120,13 +120,17 @@ def record(kind: str, body: Dict[str, Any], *, t0_ns: int, hook: str, priority: 
             body = {**body, "account_id": accounts.get(connector)}
         body_json = encode_body(body)
         size = payload_size(body, body_json)
+        priority = priority or spec.priority
         seq = next(run.counter)
-        line = frame(seq, run.run_id, kind, t_wall_ns, t_mono_ns, perf_counter_ns() - t0_ns, connector, trading_pair,
-                     controller_id, executor_id, client_order_id, exchange_order_id, body_json, size)
-        run.queue.offer(seq, priority or spec.priority, line)
-        timing.observe(hook, perf_counter_ns() - t0_ns)
+        line = _framed(run, seq, priority, kind, t_wall_ns, t_mono_ns, perf_counter_ns() - t0_ns, connector,
+                       trading_pair, controller_id, executor_id, client_order_id, exchange_order_id, body_json, size)
+        run.queue.offer(seq, priority, line)
     except Exception as error:
         hook_error(hook, error)
+    try:
+        timing.observe(hook, perf_counter_ns() - t0_ns)
+    except Exception:
+        pass
 
 
 def write_run_start(body: Dict[str, Any]) -> None:
@@ -226,10 +230,19 @@ def _counters(run: _Run) -> Dict[str, Any]:
             "hook_errors": sum(_errors.values())}
 
 
+def _framed(run: _Run, seq: int, priority: bool, *fields: Any) -> bytes:
+    """Frame a record whose seq is already taken. A failure registers that seq as dropped, so no hole is left."""
+    try:
+        return frame(seq, run.run_id, *fields)
+    except Exception:
+        run.queue.lose(seq, priority)
+        raise
+
+
 def _push(run: _Run, kind: str, body_json: str, t0_ns: int) -> None:
     seq = next(run.counter)
-    run.queue.push(seq, frame(seq, run.run_id, kind, time_ns(), monotonic_ns(), perf_counter_ns() - t0_ns,
-                              None, None, None, None, None, None, body_json))
+    run.queue.push(seq, _framed(run, seq, True, kind, time_ns(), monotonic_ns(), perf_counter_ns() - t0_ns,
+                                None, None, None, None, None, None, body_json))
 
 
 def _run_json(run_id: str, start_json: Optional[str], end_json: Optional[str]) -> bytes:
