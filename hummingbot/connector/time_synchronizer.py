@@ -1,11 +1,14 @@
 import asyncio
 import logging
 import time
+import weakref
 from collections import deque
-from typing import Awaitable, Deque
+from typing import Awaitable, Deque, Optional
 
 import numpy
 
+from hummingbot.analytics import recorder
+from hummingbot.analytics.hooks import orders as order_hooks
 from hummingbot.logger import HummingbotLogger
 
 
@@ -23,6 +26,7 @@ class TimeSynchronizer:
     def __init__(self):
         self._time_offset_ms: Deque[float] = deque(maxlen=5)
         self._lock = asyncio.Lock()
+        self.owner_ref: Optional[weakref.ReferenceType] = None
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -43,6 +47,8 @@ class TimeSynchronizer:
 
     def add_time_offset_ms_sample(self, offset: float):
         self._time_offset_ms.append(offset)
+        if recorder.ACTIVE:
+            order_hooks.clock(self, offset)
 
     def clear_time_offset_ms_samples(self):
         self._time_offset_ms.clear()
