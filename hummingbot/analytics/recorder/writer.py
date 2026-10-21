@@ -10,8 +10,8 @@ from typing import Callable, List, NamedTuple, Optional, Tuple
 from hummingbot.analytics.recorder.queue import CaptureQueue, Item
 from hummingbot.analytics.recorder.segments import Abandoned, ActiveSegment, write_run_json
 
-BATCH_BYTES = 64 * 1024
-BATCH_ITEMS = 256
+BATCH_BYTES = 1024 * 1024
+BATCH_ITEMS = 1024
 logger = logging.getLogger(__name__)
 GapFactory = Callable[[str, int, Optional[int], Optional[int], bool], Tuple[int, bytes]]
 

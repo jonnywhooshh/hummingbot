@@ -12,6 +12,7 @@ MANIFEST = "manifest.jsonl"
 RUN_JSON = "run.json"
 GZIP_CHUNK = 256 * 1024
 GZIP_LEVEL = 1
+IOV_MAX = os.sysconf("SC_IOV_MAX")
 _SEGMENT = re.compile(r"^seg-(\d{6,})\.jsonl(\.gz)?$")
 
 
@@ -99,19 +100,22 @@ class ActiveSegment:
         self.last_seq = high if self.last_seq is None else max(self.last_seq, high)
 
     def flush(self) -> None:
-        if not self._pending:
-            return
-        data = b"".join(self._pending)
-        sent = 0
-        try:
-            while sent < len(data):
-                written = os.write(self.fd, memoryview(data)[sent:])
-                if written == 0:
-                    raise OSError("Analytics write made no progress")
-                sent += written
-                self.dirty = True
-        finally:
-            self._pending = [data[sent:]] if sent < len(data) else []
+        """Write pending lines with writev, which neither copies them nor holds the GIL while writing."""
+        while self._pending:
+            chunk = self._pending[:IOV_MAX]
+            written = os.writev(self.fd, chunk)
+            if written == 0:
+                raise OSError("Analytics write made no progress")
+            self.dirty = True
+            if written == sum(map(len, chunk)):
+                del self._pending[:len(chunk)]
+                continue
+            done = 0
+            while written >= len(chunk[done]):
+                written -= len(chunk[done])
+                done += 1
+            del self._pending[:done]
+            self._pending[0] = self._pending[0][written:]
 
     def sync(self) -> None:
         self.flush()
