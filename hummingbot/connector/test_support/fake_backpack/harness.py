@@ -6,6 +6,7 @@ import socket
 import tempfile
 import time
 from contextlib import ExitStack, asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -14,6 +15,7 @@ from unittest.mock import patch
 
 import aiohttp
 import yaml
+from yarl import URL
 
 import hummingbot
 import hummingbot.client.config.config_helpers as config_helpers
@@ -32,12 +34,15 @@ from hummingbot.core.connector_manager import ConnectorManager
 from hummingbot.core.data_type.common import OrderType, PositionAction
 from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
 from hummingbot.core.event.events import MarketEvent
+from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient
 from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.rate_oracle.sources.rate_source_base import RateSourceBase
 from hummingbot.core.web_assistant.connections.connections_factory import ConnectionsFactory
 from hummingbot.logger.logger import HummingbotLogger
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase
+from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction
 
 
 class FixedRateSource(RateSourceBase):
@@ -54,7 +59,8 @@ def require_loopback(host):
         address = ipaddress.ip_address(host.decode() if isinstance(host, bytes) else host)
     except ValueError:
         raise OSError(f"network guard: refused DNS for {host}") from None
-    if not address.is_loopback:
+    if not address.is_loopback and not (
+            isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped and address.ipv4_mapped.is_loopback):
         raise OSError(f"network guard: refused address {host}")
 
 
@@ -62,16 +68,62 @@ def require_loopback(host):
 def loopback_network():
     resolve = socket.getaddrinfo
     aiohttp_resolve = aiohttp.TCPConnector._resolve_host
+    client_request = aiohttp.ClientRequest.__init__
 
-    def guarded(host, *args, **kwargs):
+    def guarded_resolve(host, *args, **kwargs):
         require_loopback(host)
-        return resolve(host, *args, **kwargs)
+        results = resolve(host, *args, **kwargs)
+        for result in results:
+            require_loopback(result[4][0])
+        return results
 
     async def guarded_aiohttp(self, host, *args, **kwargs):
         require_loopback(host)
-        return await aiohttp_resolve(self, host, *args, **kwargs)
+        results = await aiohttp_resolve(self, host, *args, **kwargs)
+        for result in results:
+            require_loopback(result["host"])
+        return results
 
-    with patch.object(socket, "getaddrinfo", guarded), patch.object(aiohttp.TCPConnector, "_resolve_host", guarded_aiohttp):
+    def guarded_request(self, method, url, *args, **kwargs):
+        require_loopback(URL(url).host)
+        return client_request(self, method, url, *args, **kwargs)
+
+    def guard_socket(operation):
+        def guarded(self, *args, **kwargs):
+            address = args[-1] if args else kwargs["address"]
+            if self.family in (socket.AF_INET, socket.AF_INET6):
+                require_loopback(address[0])
+                if address[0] in ("localhost", b"localhost"):
+                    resolved = guarded_resolve(address[0], address[1], family=self.family, type=self.type)
+                    address = resolved[0][4]
+                    args = (*args[:-1], address)
+            return operation(self, *args, **kwargs)
+        return guarded
+
+    def guard_lookup(operation, result_kind):
+        def guarded(host, *args, **kwargs):
+            require_loopback(host)
+            result = operation(host, *args, **kwargs)
+            for address in result[2] if result_kind == "addresses" else [result] if result_kind == "address" else []:
+                require_loopback(address)
+            return result
+        return guarded
+
+    nameinfo = socket.getnameinfo
+
+    def guarded_nameinfo(address, *args, **kwargs):
+        require_loopback(address[0])
+        return nameinfo(address, *args, **kwargs)
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(socket, "getaddrinfo", guarded_resolve))
+        stack.enter_context(patch.object(socket, "getnameinfo", guarded_nameinfo))
+        for name, result_kind in (("gethostbyname", "address"), ("gethostbyname_ex", "addresses"), ("gethostbyaddr", "addresses")):
+            stack.enter_context(patch.object(socket, name, guard_lookup(getattr(socket, name), result_kind)))
+        for name in ("connect", "connect_ex", "sendto"):
+            stack.enter_context(patch.object(socket.socket, name, guard_socket(getattr(socket.socket, name))))
+        stack.enter_context(patch.object(aiohttp.TCPConnector, "_resolve_host", guarded_aiohttp))
+        stack.enter_context(patch.object(aiohttp.ClientRequest, "__init__", guarded_request))
         yield
 
 
@@ -112,30 +164,36 @@ async def drive_script(path, venue, ctx):
 @contextmanager
 def bot_environment(venue, root: Path, analytics_dir=None):
     api_key, secret = keypair()
-    client = ClientConfigMap(anonymized_metrics_mode=AnonymizedMetricsDisabledMode())
-    client_data = client.model_dump(mode="json")
-    if analytics_dir is not None:
-        client_data["analytics"] = {"enabled": True, "dir": str(Path(analytics_dir).resolve())}
-        if "analytics" in ClientConfigMap.model_fields:
-            client = ClientConfigMap(**client_data)
-    else:
-        client_data.pop("analytics", None)
     conf = root / "conf"
     for name in ("controllers", "scripts", "connectors"):
         (conf / name).mkdir(parents=True, exist_ok=True)
-    (conf / "conf_client.yml").write_text(yaml.safe_dump(client_data))
     (conf / "conf_fee_overrides.yml").write_text("{}\n")
     (root / "data").mkdir(exist_ok=True)
     with ExitStack() as stack:
         stack.enter_context(loopback_network())
+        stack.enter_context(patch.object(RateOracle, "_shared_instance", RateOracle(source=FixedRateSource())))
+        for name in ("_instance", "_shared_client", "_ws_independent_session"):
+            stack.enter_context(patch.object(ConnectionsFactory, name, None))
+        for name in ("_GatewayHttpClient__instance", "_shared_client", "_monitor_task"):
+            stack.enter_context(patch.object(GatewayHttpClient, name, None))
+        client = ClientConfigMap(anonymized_metrics_mode=AnonymizedMetricsDisabledMode())
+        client_data = client.model_dump(mode="json")
+        if analytics_dir is not None:
+            client_data["analytics"] = {"enabled": True, "dir": str(Path(analytics_dir).resolve())}
+            if "analytics" in ClientConfigMap.model_fields:
+                client = ClientConfigMap(**client_data)
+        else:
+            client_data.pop("analytics", None)
+        RateOracle.get_instance().source = FixedRateSource()
+        (conf / "conf_client.yml").write_text(yaml.safe_dump(client_data))
         stack.enter_context(patch.object(constants, "REST_URL", f"http://127.0.0.1:{venue.port}/"))
         stack.enter_context(patch.object(constants, "WSS_URL", f"ws://127.0.0.1:{venue.port}/"))
         stack.enter_context(patch.object(HummingbotLogger, "is_testing_mode", classmethod(lambda cls: True)))
-        stack.enter_context(patch.object(RateOracle, "_shared_instance", RateOracle(source=FixedRateSource())))
         stack.enter_context(patch.object(HummingbotApplication, "_main_app", None))
         stack.enter_context(patch.object(MarketsRecorder, "_shared_instance", None))
         stack.enter_context(patch.object(SQLConnectionManager, "_scm_trade_fills_instance", None))
         stack.enter_context(patch.object(hummingbot, "_data_path", str(root / "data")))
+        stack.enter_context(patch.object(config_helpers, "GATEWAY_SSL_CONF_FILE", conf / "ssl.yml"))
         for module in (settings, config_helpers, application):
             stack.enter_context(patch.object(module, "CLIENT_CONFIG_PATH", conf / "conf_client.yml"))
         for name, value in {"CONF_DIR_PATH": conf, "CONTROLLERS_CONF_DIR_PATH": conf / "controllers",
@@ -149,6 +207,21 @@ def bot_environment(venue, root: Path, analytics_dir=None):
         yield ClientConfigAdapter(client)
 
 
+async def close_http_clients():
+    gateway = GatewayHttpClient._GatewayHttpClient__instance
+    try:
+        if gateway is not None:
+            task = gateway._monitor_task
+            gateway.stop_monitor()
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
+        if GatewayHttpClient._shared_client is not None:
+            await GatewayHttpClient._shared_client.close()
+            GatewayHttpClient._shared_client = None
+    finally:
+        await ConnectionsFactory().close()
+
+
 @asynccontextmanager
 async def connected_backpack(pair: str = "SOL-USDC", state_dir=None, pre_start=None, post_stop=None,
                              analytics_dir=None):
@@ -158,8 +231,8 @@ async def connected_backpack(pair: str = "SOL-USDC", state_dir=None, pre_start=N
     try:
         with tempfile.TemporaryDirectory(prefix="fake-backpack-") as directory:
             with bot_environment(venue, Path(directory), analytics_dir) as client:
-                await run_callback(pre_start)
                 try:
+                    await run_callback(pre_start)
                     api_key, secret = keypair()
                     connector = ConnectorManager(client).create_connector(
                         "backpack_perpetual", [pair], True,
@@ -179,10 +252,14 @@ async def connected_backpack(pair: str = "SOL-USDC", state_dir=None, pre_start=N
                             clock_task.cancel()
                             await asyncio.gather(clock_task, return_exceptions=True)
                 finally:
-                    if connector is not None:
-                        await connector.stop_network()
-                    await ConnectionsFactory().close()
-                    await run_callback(post_stop)
+                    try:
+                        if connector is not None:
+                            await connector.stop_network()
+                    finally:
+                        try:
+                            await close_http_clients()
+                        finally:
+                            await run_callback(post_stop)
     finally:
         await venue.stop()
 
@@ -201,6 +278,9 @@ class V2Context:
     strategy: Any = None
     ticks: list[Tick] = field(default_factory=list)
     executors: list = field(default_factory=list)
+    decision_by_executor: dict[str, int] = field(default_factory=dict)
+    decision_by_order: dict[str, int] = field(default_factory=dict)
+    executor_by_order: dict[str, str] = field(default_factory=dict)
 
     @property
     def connectors(self):
@@ -242,43 +322,69 @@ async def v2_headless(controller_yaml, state_dir=None, pre_start=None, post_stop
                     {"script_file_name": "v2_with_controllers.py", "controllers_config": ["controller.yml"]}))
                 ctx = V2Context(root)
                 control_task = ControllerBase.control_task
+                send_actions = ControllerBase.send_actions
+                place_order = ExecutorBase.place_order
+                active_tick = ContextVar("fake_backpack_tick", default=None)
+
+                async def attributed_actions(controller, actions):
+                    tick = active_tick.get()
+                    if tick is not None:
+                        for action in actions:
+                            if isinstance(action, CreateExecutorAction):
+                                ctx.decision_by_executor[action.executor_config.id] = tick.t_mono_ns
+                    return await send_actions(controller, actions)
+
+                def attributed_order(executor, *args, **kwargs):
+                    client_id = place_order(executor, *args, **kwargs)
+                    ctx.executor_by_order[str(client_id)] = executor.config.id
+                    decision = ctx.decision_by_executor.get(executor.config.id)
+                    if decision is not None:
+                        ctx.decision_by_order[str(client_id)] = decision
+                    return client_id
 
                 async def counted(controller):
                     gate = None if controller.market_data_provider.ready and controller.executors_update_event.is_set() else (
                         "market_data_not_ready" if not controller.market_data_provider.ready else "waiting_executor_update")
                     tick = Tick(time.monotonic_ns(), gate)
+                    token = active_tick.set(tick)
                     try:
                         return await control_task(controller)
                     except Exception as error:
                         tick.error = repr(error)
                         raise
                     finally:
+                        active_tick.reset(token)
                         ctx.ticks.append(tick)
 
-                with patch.object(ControllerBase, "control_task", counted):
-                    await run_callback(pre_start)
+                with patch.object(ControllerBase, "control_task", counted), \
+                        patch.object(ControllerBase, "send_actions", attributed_actions), \
+                        patch.object(ExecutorBase, "place_order", attributed_order):
                     try:
+                        await run_callback(pre_start)
                         ctx.application = HummingbotApplication.main_application(client_config_map=client, headless_mode=True)
+                        ctx.application.trading_core.scripts_path = Path(hummingbot.__file__).resolve().parents[1] / "scripts"
                         if not await runner.load_and_start_strategy(ctx.application, v2_conf="v2.yml", headless=True):
                             raise RuntimeError("V2WithControllers did not start")
                         ctx.strategy = ctx.application.trading_core.strategy
                         yield venue, ctx
                     finally:
                         try:
-                            if ctx.application is not None:
-                                if ctx.strategy is not None:
-                                    ctx.collect_executors()
-                                await ctx.application.stop_loop()
-                                gateway = ctx.application.trading_core._gateway_monitor
-                                gateway.stop_monitor()
+                            try:
+                                if ctx.application is not None:
+                                    if ctx.strategy is not None:
+                                        ctx.collect_executors()
+                                    await ctx.application.stop_loop()
+                            finally:
                                 sql = SQLConnectionManager._scm_trade_fills_instance
                                 if sql is not None:
                                     sql.engine.dispose()
-                            RateOracle.get_instance().stop()
-                            await RateOracle.get_instance().stop_network()
-                            await ConnectionsFactory().close()
+                                RateOracle.get_instance().stop()
+                                await RateOracle.get_instance().stop_network()
                         finally:
-                            await run_callback(post_stop)
+                            try:
+                                await close_http_clients()
+                            finally:
+                                await run_callback(post_stop)
     finally:
         if own_venue:
             await venue.stop()

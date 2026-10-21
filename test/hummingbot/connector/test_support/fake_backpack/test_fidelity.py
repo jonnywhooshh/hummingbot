@@ -6,13 +6,13 @@ import time
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import patch
 
 from aiohttp import ClientSession, WSServerHandshakeError
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hummingbot.connector.test_support.fake_backpack.venue import FakeBackpackVenue, keypair, signing_string
-from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 
 
 class VenueFidelityTests(IsolatedAsyncioWrapperTestCase):
@@ -92,7 +92,7 @@ class VenueFidelityTests(IsolatedAsyncioWrapperTestCase):
                     time.tzset()
                     async with self.session.get(self.url + "/wapi/v1/history/fills", params=params,
                                                 headers=self.headers("fillHistoryQueryAll", params)) as response:
-                        self.assertEqual([2, 3], [row["id"] for row in await response.json()])
+                        self.assertEqual([2], [row["id"] for row in await response.json()])
             finally:
                 time.tzset()
 
@@ -102,6 +102,15 @@ class VenueFidelityTests(IsolatedAsyncioWrapperTestCase):
             async with self.session.get(self.url + "/wapi/v1/history/fills", params=params,
                                         headers=self.headers("fillHistoryQueryAll", params)) as response:
                 self.assertEqual(count, len(await response.json()))
+
+    async def test_crossing_post_only_order_is_rejected(self):
+        for side, price in (("Bid", "150.10"), ("Ask", "149.90")):
+            params = {"symbol": self.venue.symbol, "clientId": 42, "side": side, "quantity": "1",
+                      "orderType": "Limit", "price": price, "postOnly": True}
+            async with self.session.post(self.url + "/api/v1/order", json=params,
+                                         headers=self.headers("orderExecute", params)) as response:
+                self.assertEqual(400, response.status)
+        self.assertEqual({}, self.venue.orders)
 
     async def test_public_frames_match_documented_units_and_fields(self):
         await self.venue.push_mark_price()

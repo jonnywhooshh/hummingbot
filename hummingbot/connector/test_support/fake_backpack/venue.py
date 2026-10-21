@@ -149,7 +149,7 @@ class FakeBackpackVenue:
             ("GET", "/api/v1/orders"): lambda r, p: web.json_response(
                 [o for o in self.orders.values() if o["status"] in ("New", "PartiallyFilled")]),
             ("GET", "/wapi/v1/history/funding"): lambda r, p: self._history(self.funding, p),
-            ("GET", "/wapi/v1/history/fills"): lambda r, p: self._history(self.fills, p),
+            ("GET", "/wapi/v1/history/fills"): lambda r, p: self._history(self.fills, p, exclusive_to=True),
             ("GET", "/wapi/v1/history/orders"): lambda r, p: self._history(list(self.orders.values()), p),
             ("GET", "/wapi/v1/capital/deposits"): lambda r, p: self._history(self.deposits, p),
             ("GET", "/wapi/v1/capital/withdrawals"): lambda r, p: self._history(self.withdrawals, p),
@@ -406,7 +406,7 @@ class FakeBackpackVenue:
         return [r for r in self.requests if r.method == method.upper() and r.path == path]
 
     @staticmethod
-    def _history(rows: list, params: dict):
+    def _history(rows: list, params: dict, exclusive_to: bool = False):
         filtered = [r for r in rows if all(str(r.get(k)) == str(params[k]) for k in ("symbol", "orderId") if k in params)]
 
         def row_time(row):
@@ -421,7 +421,8 @@ class FakeBackpackVenue:
         if "from" in params:
             filtered = [r for r in filtered if row_time(r) >= int(params["from"])]
         if "to" in params:
-            filtered = [r for r in filtered if row_time(r) <= int(params["to"])]
+            end = int(params["to"])
+            filtered = [r for r in filtered if row_time(r) < end or (not exclusive_to and row_time(r) == end)]
         filtered.sort(key=row_time, reverse=params.get("sortDirection", "Asc") == "Desc")
         offset, limit = int(params.get("offset", 0)), min(1000, int(params.get("limit", 100)))
         return web.json_response(filtered[offset:offset + limit])
@@ -487,6 +488,13 @@ class FakeBackpackVenue:
         return web.Response(status=200)
 
     def _order_execute(self, request, params):
+        if params.get("postOnly") and params["orderType"] == "Limit":
+            opposite = self.book["asks" if params["side"] == "Bid" else "bids"]
+            crosses = opposite and (Decimal(params["price"]) >= Decimal(opposite[0][0]) if params["side"] == "Bid"
+                                    else Decimal(params["price"]) <= Decimal(opposite[0][0]))
+            if crosses:
+                return web.json_response({"code": "INVALID_ORDER", "message": "Order would immediately match and take"},
+                                         status=400)
         self._next_order_id += 1
         order_id = str(self._next_order_id)
         order = {"id": order_id, "clientId": params["clientId"], "symbol": params["symbol"], "side": params["side"],

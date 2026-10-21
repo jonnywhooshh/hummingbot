@@ -5,7 +5,10 @@ REST receipts appear in requests.jsonl. WS frames appear in ws.jsonl. Both logs
 use t_mono_ns from time.monotonic_ns() for cross-process joins on Linux.
 Fault queues are independent for each method and path. A held request receives
 no response and does not execute. A dropped request executes before disconnect.
-The default LIMIT fill policy is manual. MARKET orders always fill at the touch.
+The default LIMIT fill policy is manual. MARKET orders fill at the touch or
+expire when the opposite book is empty.
+Crossing post-only limits return INVALID_ORDER. The connector reports an order
+failure through its existing LIMIT_MAKER rejection path.
 
 Commands are available with ``python -m
 hummingbot.connector.test_support.fake_backpack``.
@@ -18,6 +21,11 @@ the signed order POST.
 V2WithControllers. Its venue script defines ``async def drive(venue, ctx)``.
 The context exposes the application, strategy, connectors, ticks, and executors.
 Only ungated controller iterations count toward --ticks. Shutdown uses stop_loop.
+Strategy discovery uses the checkout's scripts directory, not the caller's
+working directory. The harness isolates inherited HTTP factories and gateway
+sessions. It closes its own clients before restoring the original singletons.
+The guard checks socket destinations, DNS results, and each aiohttp request
+URL, including requests through a loopback proxy.
 
 All three bot commands accept --pre-start FILE and --post-stop FILE. Each file
 defines main(), which may be synchronous or asynchronous. Both callbacks run in
@@ -39,14 +47,24 @@ metrics.json records loop_lag_p99_ms, decision_to_post_p50_ms,
 decision_to_post_p99_ms, cpu_seconds_per_minute, and one
 delivered_depth_frames_per_second value per minute, including a partial minute.
 CPU time covers only the bot during load, not startup, shutdown, or the venue.
-Loop lag samples use a 10 ms schedule. Decision timestamps come from the runtime
-ControllerBase.control_task wrapper and join order receipts on Linux monotonic
-time. Empty percentile inputs produce null, not zero. Request failures,
-controller errors, successful POST counts, and sample counts remain visible.
+Loop lag samples use a 10 ms schedule. The runtime control_task wrapper associates
+CreateExecutorAction IDs with their decision timestamp. The place_order wrapper
+associates each returned client ID with its executor's decision. POST receipts
+join on client ID, not the closest tick. Unmatched orders have no latency sample.
+Only requests received within the load interval count toward metrics.
+Empty percentile inputs produce null, not zero. Request failures, controller
+errors, successful POST counts, and sample counts remain visible.
+
+Ordinary tests use event-controlled response bodies rather than wall-clock
+performance limits. Run the 100 ms unread-body and one-second flood checks with
+``mma-slot perf -- env MMA_PERF_TESTS=1 conda run -n hummingbot python -m pytest
+test/hummingbot/connector/test_support/fake_backpack/test_fake_backpack.py
+-k 'under_100ms or under_one_second' -q``.
 
 Public channel and history field names follow https://docs.backpack.exchange/.
 History bounds use ``from`` and ``to`` in milliseconds. Naive ISO timestamps are
-UTC. History defaults to 100 rows and caps each page at 1000 rows.
+UTC. History defaults to 100 rows and caps each page at 1000 rows. Fill-history
+``from`` is inclusive and ``to`` is exclusive, as documented by Backpack.
 Order queries return only resting orders. Filled and cancelled orders return
 404, so the stock connector takes its not-found path rather than learning a
 terminal status from that endpoint. Fill history remains available.
@@ -54,5 +72,11 @@ The markPrice ``n`` field is milliseconds. The stock connector converts it to
 seconds, as it does for the REST funding timestamp.
 Position updates use positionOpened, positionAdjusted, and positionClosed.
 Subscribing sends each open position without an event type.
+Positions and collateral remain script-controlled through set_position and
+refresh_balances. Fills do not run an account ledger. Headless drivers suppress
+application notifications through HummingbotLogger.is_testing_mode.
+one-fill starts a connector, not a strategy. Its analytics flag writes config
+but does not call a strategy-start capture hook. Use pre-start when that hook is
+not on the caller's execution path.
 The test keys are deterministic ED25519 keys, not credentials for a live account.
 """

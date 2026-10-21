@@ -1,5 +1,4 @@
 import asyncio
-import bisect
 import json
 import math
 import multiprocessing
@@ -79,16 +78,16 @@ async def venue_worker(connection, state_dir):
             await asyncio.sleep(0.01)
     finally:
         await venue.stop()
-        connection.close()
 
 
 def process_main(connection, state_dir):
     try:
         asyncio.run(venue_worker(connection, state_dir))
     except BaseException as error:
-        if not connection.closed:
-            connection.send({"error": repr(error)})
+        connection.send({"error": repr(error)})
         raise
+    finally:
+        connection.close()
 
 
 class VenueProcess:
@@ -120,7 +119,10 @@ class VenueProcess:
 
     async def __aexit__(self, *args):
         if self.process.is_alive():
-            self.connection.send(("stop",))
+            try:
+                self.connection.send(("stop",))
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             await asyncio.to_thread(self.process.join, 5)
             if self.process.is_alive():
                 self.process.terminate()
@@ -140,14 +142,14 @@ async def sample_lag(samples, stopped):
 
 def summarize(out, ctx, delivery, lag, cpu_seconds, seconds):
     requests = [json.loads(line) for line in (out / "venue/requests.jsonl").read_text().splitlines()]
-    posts = [row for row in requests if row["method"] == "POST" and row["path"] == "/api/v1/order"
-             and row["t_mono_ns"] <= delivery["end_mono_ns"]]
-    decisions = sorted(tick.t_mono_ns for tick in ctx.ticks if tick.gated is None and tick.error is None)
+    requests = [row for row in requests if delivery["start_mono_ns"] <= row["t_mono_ns"] <= delivery["end_mono_ns"]]
+    posts = [row for row in requests if row["method"] == "POST" and row["path"] == "/api/v1/order"]
     latencies = []
     for post in posts:
-        decision_index = bisect.bisect_right(decisions, post["t_mono_ns"]) - 1
-        if decision_index >= 0:
-            latencies.append((post["t_mono_ns"] - decisions[decision_index]) / 1e6)
+        client_id = str(json.loads(post["body"])["clientId"])
+        decision = ctx.decision_by_order.get(client_id)
+        if decision is not None:
+            latencies.append((post["t_mono_ns"] - decision) / 1e6)
     return {"duration_seconds": seconds, "loop_lag_p99_ms": percentile(lag, 99),
             "decision_to_post_p50_ms": percentile(latencies, 50),
             "decision_to_post_p99_ms": percentile(latencies, 99),
@@ -157,7 +159,8 @@ def summarize(out, ctx, delivery, lag, cpu_seconds, seconds):
             "configured_frames_per_second": REFERENCE_RATES, "order_posts": len(posts),
             "successful_order_posts": sum(row["status"] == 200 and row["sig_ok"] is True for row in posts),
             "failed_requests": sum(row["status"] is None or row["status"] >= 400 for row in requests),
-            "controller_errors": [tick.error for tick in ctx.ticks if tick.error],
+            "controller_errors": [tick.error for tick in ctx.ticks if tick.error
+                                  and delivery["start_mono_ns"] <= tick.t_mono_ns <= delivery["end_mono_ns"]],
             "decision_to_post_samples": len(latencies), "loop_lag_samples": len(lag),
             "venue_process_separate": True}
 
