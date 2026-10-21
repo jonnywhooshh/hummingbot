@@ -7,10 +7,12 @@ Only end_run waits for the writer, for at most two seconds after the strategy ha
 import itertools
 import logging
 import os
+import threading
+from collections import deque
 from pathlib import Path
 from threading import get_ident
 from time import monotonic, monotonic_ns, perf_counter_ns, time_ns
-from typing import Any, Dict, NamedTuple, Optional, Tuple, Union
+from typing import Any, Deque, Dict, NamedTuple, Optional, Tuple, Union
 from uuid import UUID
 
 from hummingbot.analytics.recorder import accounts, secrets, timing
@@ -20,7 +22,7 @@ from hummingbot.analytics.recorder.queue import CaptureQueue
 from hummingbot.analytics.recorder.writer import Writer
 
 __all__ = ["ACTIVE", "activate", "record", "payload", "write_run_start", "end_run", "hook_error", "stats",
-           "settings", "pause", "resume", "accounts", "secrets", "timing"]
+           "settings", "pause", "resume", "on_capture_thread", "accounts", "secrets", "timing"]
 END_RUN_TIMEOUT_S = 2.0
 LOGGED_ERRORS_PER_HOOK = 10
 logger = logging.getLogger(__name__)
@@ -49,7 +51,9 @@ class _Run:
         self.thread_id = get_ident()
         self.counter = itertools.count(1)
         self.queue = CaptureQueue(settings.queue_max_bytes, settings.queue_max_bytes + settings.priority_reserve_bytes)
-        self.writer = Writer(run_dir, settings, self.queue, self.writer_gap)
+        self.off_thread = 0
+        self.off_thread_lock = threading.Lock()
+        self.writer = Writer(run_dir, settings, self.queue, self.writer_gap, _emit_diagnostics)
         self.writer.run_json = _run_json(run_id, None, None)
         self.run_start_json: Optional[str] = None
 
@@ -61,6 +65,7 @@ class _Run:
 
 _run: Optional[_Run] = None
 _errors: Dict[str, int] = {}
+_diagnostics: Deque[Tuple[str, int, BaseException]] = deque()
 _discarded = 0
 
 
@@ -94,6 +99,7 @@ def activate(config: Any, root: Union[str, Path, None] = None) -> Optional[str]:
         return run_id
     except Exception as error:
         hook_error("activate", error)
+        _emit_diagnostics()
         return None
 
 
@@ -102,6 +108,10 @@ def record(kind: str, body: Dict[str, Any], *, t0_ns: int, hook: str, priority: 
            executor_id: Optional[str] = None, client_order_id: Optional[str] = None,
            exchange_order_id: Optional[str] = None) -> None:
     """Serialize body before assembly, stamp hook_ns, and enqueue. Capture exceptions never reach the caller.
+
+    A call from a thread other than the one that ran activate is counted in stats()["off_thread"] and recorded
+    nowhere. It does no logging, so a logging handler that calls record() cannot loop. Hooks that can fire off the
+    loop thread test on_capture_thread() first.
 
     t0_ns comes from perf_counter_ns at hook entry. connector adds body.account_id when absent, without changing
     the caller's body. priority promotes venue evidence into the reserved capacity; local evidence is always priority.
@@ -113,7 +123,9 @@ def record(kind: str, body: Dict[str, Any], *, t0_ns: int, hook: str, priority: 
         return
     try:
         if get_ident() != run.thread_id:
-            raise RuntimeError("record() must run on the thread that activated capture")
+            with run.off_thread_lock:
+                run.off_thread += 1
+            return
         spec = KINDS[kind]
         t_wall_ns, t_mono_ns = time_ns(), monotonic_ns()
         if connector is not None and "account_id" not in body:
@@ -171,7 +183,7 @@ def end_run(body: Dict[str, Any]) -> bool:
                         "dropped": run.queue.dropped + run.writer.disk_dropped,
                         "dropped_priority": run.queue.dropped_priority + run.writer.disk_dropped_priority,
                         "queue_records": 0, "queue_bytes": 0, "hook_errors": sum(_errors.values()),
-                        "writer_errors": run.writer.errors}
+                        "writer_errors": run.writer.errors, "off_thread": run.off_thread}
             body_json = encode_body({**body, "counters": counters})
             _push(run, "run_end", body_json, t0_ns)
             run_json = _run_json(run.run_id, run.run_start_json, body_json)
@@ -185,10 +197,29 @@ def end_run(body: Dict[str, Any]) -> bool:
 
 
 def hook_error(hook: str, error: BaseException) -> None:
-    """Count errors and log only the first ten per hook. Hook adapters call this from their except branch."""
+    """Count the error now and queue the first ten per hook for the writer thread to log.
+
+    The call never touches a logging handler, so a slow or locked handler cannot stall the trading thread.
+    Hook adapters call this from their except branch.
+    """
     count = _errors.get(hook, 0) + 1
     _errors[hook] = count
     if count <= LOGGED_ERRORS_PER_HOOK:
+        _diagnostics.append((hook, count, error))
+
+
+def on_capture_thread() -> bool:
+    """True on the thread that activated the current run, the only thread record() accepts calls from."""
+    run = _run
+    return run is not None and get_ident() == run.thread_id
+
+
+def _emit_diagnostics() -> None:
+    while True:
+        try:
+            hook, count, error = _diagnostics.popleft()
+        except IndexError:
+            return
         try:
             logger.error("Analytics hook %s failed, occurrence %d.", hook, count, exc_info=error)
         except Exception:
@@ -227,7 +258,7 @@ def _counters(run: _Run) -> Dict[str, Any]:
             "queue_records": len(queue), "queue_bytes": queue.depth_bytes, "written": writer.written,
             "disk_dropped": writer.disk_dropped, "disk": writer.state.value, "free_bytes": writer.free_bytes,
             "segments_closed": writer.segments_closed, "writer_errors": writer.errors,
-            "hook_errors": sum(_errors.values())}
+            "hook_errors": sum(_errors.values()), "off_thread": run.off_thread}
 
 
 def _framed(run: _Run, seq: int, priority: bool, *fields: Any) -> bytes:
