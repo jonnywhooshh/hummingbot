@@ -1,12 +1,12 @@
-"""Outbound redaction tables and the host table that attributes transport records to a connector.
+"""Outbound credential policy for web_assistant transport records.
 
-A URL host names its connector because a WSConnection or RESTConnection does not know one. A connector with a table
-entry has its credential names removed. Every other connector, and every unregistered host, gets no outbound headers,
-query strings, bodies, or WS payloads at all (spec 5.5).
+Host attribution cannot distinguish Backpack spot from perpetual accounts because they share endpoints.
+The production hosts and the fake venue's IPv4 loopback host use backpack_perpetual.
+Unknown hosts retain only outbound method, URL path, and timing. Inbound payloads stay verbatim.
 """
 from functools import lru_cache
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
-from urllib.parse import unquote_plus, urlsplit
+from urllib.parse import quote_plus, unquote_plus, urlsplit
 
 from hummingbot.analytics.recorder import secrets
 
@@ -24,15 +24,11 @@ class Rules(NamedTuple):
     rest_paths: Tuple[JsonPath, ...]
 
 
-# Backpack signs with headers on REST and with elements 0 and 1 of the `signature` array on WS subscribe.
-# X-Timestamp and X-Window stay because they explain request timing.
 TABLE: Dict[str, Rules] = {
     "backpack_perpetual": Rules(headers=("X-API-Key", "X-Signature"), query=(),
                                 ws_paths=(("signature", 0), ("signature", 1)), rest_paths=()),
 }
 
-# The loopback entry is the fake venue's host (hummingbot.connector.test_support.fake_backpack). Spot Backpack shares
-# the production hosts, so its records carry the perpetual connector name until a host can tell them apart.
 HOSTS: Dict[str, str] = {
     "api.backpack.exchange": "backpack_perpetual",
     "ws.backpack.exchange": "backpack_perpetual",
@@ -60,29 +56,38 @@ def _folded(names: Tuple[str, ...]) -> Dict[str, str]:
     return {name.casefold(): name for name in names}
 
 
-@lru_cache(maxsize=512)
 def clean_url(connector: Optional[str], url: str) -> Tuple[str, Tuple[str, ...]]:
-    """Return url without credentials in its authority, fragment, or (when the connector has no entry) query string.
-
-    With an entry, query values whose names are in the table become "<redacted>" and the names come back as well.
-    """
+    """Remove URL credentials and scrub decoded query values before URL encoding can hide a secure value."""
     parts = urlsplit(url)
     rules = rules_for(connector)
+    if rules is None:
+        return parts.path or "/", ()
+    removed: List[str] = []
+    if "@" in parts.netloc:
+        removed.append("url.userinfo")
+    if parts.fragment:
+        removed.append("url.fragment")
     base = f"{parts.scheme}://" if parts.scheme else ""
     base += f"{parts.netloc.rpartition('@')[2]}{parts.path}"
-    if rules is None or not parts.query:
-        return base, ()
+    if not parts.query:
+        return base, tuple(removed)
     folded = _folded(rules.query)
-    removed: List[str] = []
     pieces = []
     for piece in parts.query.split("&"):
-        key = piece.partition("=")[0]
+        key, _, value = piece.partition("=")
         name = folded.get(unquote_plus(key).casefold())
-        if name is None:
-            pieces.append(piece)
-        else:
-            pieces.append(f"{key}={REDACTED}")
+        if name is not None:
+            pieces.append(f"{key}={quote_plus(REDACTED)}")
             removed.append(name)
+        else:
+            decoded = unquote_plus(value)
+            scrubbed = secrets.scrub(decoded)
+            clean_key = secrets.scrub(unquote_plus(key))
+            if scrubbed is not decoded or clean_key != unquote_plus(key):
+                pieces.append(f"{quote_plus(clean_key)}={quote_plus(scrubbed)}")
+                removed.append(SECURE_VALUE)
+            else:
+                pieces.append(piece)
     return f"{base}?{'&'.join(pieces)}", tuple(removed)
 
 
@@ -134,16 +139,16 @@ def _path_name(path: JsonPath) -> str:
 
 
 def scrub_tree(node: Any) -> Tuple[Any, bool]:
-    """Pass every string in a dict/list tree through secrets.scrub. The flag says whether any value changed."""
-    if isinstance(node, str):
+    if isinstance(node, (str, bytes, bytearray, memoryview)):
         scrubbed = secrets.scrub(node)
-        return scrubbed, scrubbed is not node
+        return scrubbed, scrubbed != node
     if isinstance(node, Mapping):
         changed = False
         result = {}
         for key, value in node.items():
-            result[key], hit = scrub_tree(value)
-            changed = changed or hit
+            clean_key, key_hit = scrub_tree(key)
+            result[clean_key], hit = scrub_tree(value)
+            changed = changed or hit or key_hit
         return (result, True) if changed else (node, False)
     if isinstance(node, (list, tuple)):
         changed = False
