@@ -240,3 +240,40 @@ class BookReferenceTests(TestCase):
         self.assertEqual("invalid", observation.status)
         self.assertEqual("book_unknown", observation.reason)
         self.assertIsNone(observation.mh)
+
+    def test_fill_at_first_covering_diff_has_no_known_pre_fill_book(self):
+        for resync in (False, True):
+            with self.subTest(resync=resync):
+                bot = BookStream()
+                bot.apply_snapshot({"lastUpdateId": 10, "bids": [["99", "1"]], "asks": [["101", "1"]]},
+                                   timestamp_ns=0)
+                if resync:
+                    bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=SECOND)
+                    bot.apply_diff({"U": 13, "u": 13, "b": [], "a": []}, timestamp_ns=5 * SECOND)
+                    bot.apply_snapshot({"lastUpdateId": 12, "bids": [["99", "1"]], "asks": [["101", "1"]]},
+                                       timestamp_ns=6 * SECOND)
+                    uid = 14
+                else:
+                    bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=5 * SECOND)
+                    uid = 12
+                bot.apply_diff({"U": uid, "u": uid, "b": [], "a": []}, timestamp_ns=7 * SECOND)
+                observation = BookReference(bot, run_end_ns=8 * SECOND).observe(5 * SECOND, SECOND)
+                self.assertEqual("invalid", observation.status)
+                self.assertEqual("book_unknown", observation.reason)
+                self.assertIsNone(observation.m0)
+                self.assertIsNone(observation.m0_source)
+                self.assertEqual(Decimal("100"), observation.mh)
+                self.assertTrue(observation.m0_tie_uncertain)
+
+    def test_frame_at_fill_confirms_m0_even_without_a_later_timestamp(self):
+        bot = BookStream()
+        bot.apply_snapshot({"lastUpdateId": 10, "bids": [["99", "1"]], "asks": [["101", "1"]]},
+                           timestamp_ns=0)
+        bot.apply_diff({"U": 11, "u": 11, "b": [], "a": []}, timestamp_ns=SECOND)
+        bot.apply_diff({"U": 12, "u": 12, "b": [["99", "0"], ["97", "1"]], "a": []},
+                       timestamp_ns=2 * SECOND)
+        observation = BookReference(bot, run_end_ns=2 * SECOND).observe(2 * SECOND, SECOND)
+        self.assertEqual("pending", observation.status)
+        self.assertEqual(Decimal("100"), observation.m0)
+        self.assertEqual("bot", observation.m0_source)
+        self.assertTrue(observation.m0_tie_uncertain)

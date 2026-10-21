@@ -4,8 +4,12 @@
 clock. The run end is explicit. A later continuous depth frame must confirm
 silence. Only venue-clock streams can share a sidecar reference. Receipt-clock
 results use the bot's own clock and remain separate from venue-clock results.
-An unknown fill is invalid even when its horizon is pending. A known book
-without a usable mid has reason ``mid_undefined``, not ``book_unknown``.
+Phase 3 consumes two invalid reasons. ``book_unknown`` means that the stream
+cannot prove the required pre-fill or horizon book, including a fill at the
+first covering diff. ``mid_undefined`` means that the required book is known
+but a side is empty or the best bid exceeds the best ask. A known bot book
+with an undefined mid never falls back to the sidecar. An unknown fill is
+invalid even when its horizon is pending.
 """
 
 from dataclasses import dataclass
@@ -55,7 +59,7 @@ class BookReference:
     ) -> Tuple[Optional[Decimal], Optional[BookSource], bool]:
         tie = any(stream is not None and stream.has_diff_at(timestamp_ns) for stream in (self.bot, self.sidecar))
         for source, stream in (("bot", self.bot), ("sidecar", self.sidecar)):
-            if stream is None or not stream.known(timestamp_ns):
+            if stream is None or not stream.known(timestamp_ns, strictly_before=strictly_before):
                 continue
             mid = stream.mid_at(timestamp_ns, strictly_before=strictly_before)
             return mid, source, tie

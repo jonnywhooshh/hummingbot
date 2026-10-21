@@ -198,11 +198,14 @@ class BookStream:
         if index < 0:
             return None
         stretch = self._stretches[index]
-        confirmed = timestamp_ns <= stretch.end_ns if strictly_before else timestamp_ns < stretch.times[-1]
-        return stretch if confirmed and timestamp_ns <= stretch.end_ns else None
+        if strictly_before:
+            confirmed = stretch.times[0] < timestamp_ns <= stretch.end_ns
+        else:
+            confirmed = timestamp_ns < stretch.times[-1] and timestamp_ns <= stretch.end_ns
+        return stretch if confirmed else None
 
-    def known(self, timestamp_ns: int) -> bool:
-        return self._stretch_at(timestamp_ns) is not None
+    def known(self, timestamp_ns: int, *, strictly_before: bool = False) -> bool:
+        return self._stretch_at(timestamp_ns, strictly_before=strictly_before) is not None
 
     def mid_at(self, timestamp_ns: int, *, strictly_before: bool = False) -> Optional[Decimal]:
         stretch = self._stretch_at(timestamp_ns, strictly_before=strictly_before)
