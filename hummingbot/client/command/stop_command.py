@@ -2,6 +2,7 @@ import platform
 import threading
 from typing import TYPE_CHECKING
 
+from hummingbot.analytics.hooks import run
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 
@@ -65,3 +66,4 @@ class StopCommand:
         self.trading_core._config_data = None
 
         self.notify("Hummingbot stopped.")
+        run.finish("stop_command", "user")
