@@ -100,7 +100,7 @@ class VenueProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("0.2", self.venue.orders[order["id"]]["executedQuantity"])
         await self.venue.fill(order["id"], "0.8", "149.90", fee="0")
         self.assertEqual("Filled", self.venue.orders[order["id"]]["status"])
-        self.assertEqual([9001, 9002], [row["tradeId"] for row in self.venue.fills])
+        self.assertEqual([9003, 9004], [row["tradeId"] for row in self.venue.fills])
         self.assertEqual("0", self.venue.fills[-1]["fee"])
         with self.assertRaises(ValueError):
             await self.venue.fill(order["id"], "1", "149.90")
@@ -114,7 +114,7 @@ class VenueProtocolTests(unittest.IsolatedAsyncioTestCase):
         params = {"orderId": order["id"]}
         async with self.session.get(self.url + "/api/v1/order", params=params,
                                     headers=self.headers("GET", "/api/v1/order", params)) as response:
-            self.assertEqual("Filled", (await response.json())["status"])
+            self.assertEqual(404, response.status)
         async with self.session.delete(self.url + "/api/v1/order", json=params,
                                        headers=self.headers("DELETE", "/api/v1/order", params)) as response:
             self.assertEqual(404, response.status)
@@ -135,7 +135,7 @@ class VenueProtocolTests(unittest.IsolatedAsyncioTestCase):
             async with self.session.get(self.url + path, params=params,
                                         headers=self.headers("GET", path, params)) as response:
                 self.assertEqual([3, 2], [row["id"] for row in await response.json()])
-            params = {"startTime": "1792368002", "endTime": "1792368003"}
+            params = {"from": "1792368002000", "to": "1792368003000"}
             async with self.session.get(self.url + path, params=params,
                                         headers=self.headers("GET", path, params)) as response:
                 self.assertEqual([2, 3], [row["id"] for row in await response.json()])

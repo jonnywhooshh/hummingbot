@@ -258,29 +258,36 @@ class FakeBackpackVenue:
     async def push_book_ticker(self):
         t = now_ms() * 1000
         return await self.push(f"bookTicker.{self.symbol}",
-                               {"e": "bookTicker", "E": t, "T": t, "s": self.symbol, "u": self.update_id,
-                                "b": self.book["bids"][0][0], "B": self.book["bids"][0][1],
-                                "a": self.book["asks"][0][0], "A": self.book["asks"][0][1]})
+                               {"e": "bookTicker", "E": t, "T": t, "s": self.symbol, "u": str(self.update_id),
+                                "b": self.book["bids"][0][0] if self.book["bids"] else None,
+                                "B": self.book["bids"][0][1] if self.book["bids"] else None,
+                                "a": self.book["asks"][0][0] if self.book["asks"] else None,
+                                "A": self.book["asks"][0][1] if self.book["asks"] else None})
 
     async def push_mark_price(self):
         t = now_ms() * 1000
         return await self.push(f"markPrice.{self.symbol}",
-                               {"e": "markPrice", "E": t, "s": self.symbol, "p": self.mid,
-                                "i": self.mid, "f": "0.0000125", "n": self.mark_price()["nextFundingTimestamp"] * 1000})
+                               {"e": "markPrice", "E": t, "T": t, "s": self.symbol, "p": self.mid,
+                                "i": self.mid, "f": "0.0000125", "n": self.mark_price()["nextFundingTimestamp"]})
+
+    async def _public_trade(self, price, quantity, trade_id, buyer="0", seller="0", buyer_maker=True):
+        t = now_ms() * 1000
+        return await self.push(f"trade.{self.symbol}",
+                               {"e": "trade", "E": t, "T": t, "s": self.symbol, "p": price,
+                                "q": quantity, "m": buyer_maker, "t": trade_id, "b": buyer, "a": seller})
 
     async def push_trade(self, price: Optional[str] = None, quantity: str = "0.10"):
-        t = now_ms() * 1000
         price = price or self.mid
-        delivered = await self.push(f"trade.{self.symbol}",
-                                    {"e": "trade", "E": t, "T": t, "s": self.symbol, "p": price,
-                                     "q": quantity, "m": True, "t": t})
+        self._next_trade_id += 1
+        delivered = await self._public_trade(price, quantity, self._next_trade_id)
         if self.fill_policy == FillPolicy.CROSSING:
             await self.match_resting(price, quantity)
         return delivered
 
     async def push_liquidation(self, **values):
+        t = now_ms() * 1000
         return await self.push(f"liquidation.{self.symbol}",
-                               {"e": "liquidation", "E": now_ms() * 1000, "s": self.symbol,
+                               {"e": "liquidation", "E": t, "T": t, "s": self.symbol,
                                 "S": "Bid", "p": self.mid, "q": "1", **values})
 
     async def push_open_interest(self, quantity: str = "1000"):
@@ -290,15 +297,29 @@ class FakeBackpackVenue:
     async def set_position(self, quantity: str, entry_price: Optional[str] = None,
                            unrealized_pnl: str = "0", symbol: Optional[str] = None):
         symbol = symbol or self.symbol
+        previous = next((p for p in self.positions if p["symbol"] == symbol), None)
         row = {"symbol": symbol, "netQuantity": quantity, "entryPrice": entry_price or self.mid,
-               "pnlUnrealized": unrealized_pnl, "markPrice": self.mid}
+               "pnlUnrealized": unrealized_pnl, "markPrice": self.mid,
+               "positionId": previous["positionId"] if previous else str(now_ms())}
         self.positions = [p for p in self.positions if p["symbol"] != symbol]
         if Decimal(quantity) != 0:
             self.positions.append(row)
-        await self.push("account.positionUpdate", {"e": "positionUpdate", "E": now_ms() * 1000,
-                                                   "s": symbol, "q": quantity, "B": row["entryPrice"],
-                                                   "P": unrealized_pnl, "M": self.mid})
+        event = "positionClosed" if Decimal(quantity) == 0 else (
+            "positionAdjusted" if previous else "positionOpened")
+        await self.push("account.positionUpdate", {"e": event, **self._position_frame(row)})
         return row
+
+    def _position_frame(self, row):
+        t = now_ms() * 1000
+        quantity = abs(Decimal(row["netQuantity"]))
+        exposure = quantity + sum(Decimal(o["quantity"]) - Decimal(o["executedQuantity"])
+                                  for o in self.orders.values() if o["symbol"] == row["symbol"]
+                                  and o["status"] in ("New", "PartiallyFilled"))
+        return {"E": t, "T": t, "s": row["symbol"], "q": row["netQuantity"], "B": row["entryPrice"],
+                "b": row["entryPrice"], "f": format(Decimal(1) / Decimal(self.leverage), "f"),
+                "M": row["markPrice"], "m": "0.01", "Q": format(exposure, "f"),
+                "n": format(exposure * Decimal(row["markPrice"]), "f"), "i": row["positionId"],
+                "l": "0", "p": "0", "P": row["pnlUnrealized"]}
 
     def refresh_balances(self, net_equity: str = "100", available: Optional[str] = None, collateral=None):
         available = net_equity if available is None else available
@@ -318,7 +339,8 @@ class FakeBackpackVenue:
         return {"e": event, "E": t, "T": t, "s": order["symbol"], "c": order["clientId"],
                 "S": order["side"], "o": order["orderType"].upper(), "f": order["timeInForce"],
                 "q": order["quantity"], "p": order["price"], "X": order["status"], "i": order["id"],
-                "z": order["executedQuantity"], **extra}
+                "z": order["executedQuantity"], "Z": order["executedQuoteQuantity"], "t": None,
+                "O": "USER", "y": order["postOnly"], "r": order.get("reduceOnly", False), **extra}
 
     async def fill(self, order_id: str, qty: str, price: str, maker: bool = True,
                    fee: Optional[str] = None, fee_symbol: str = "USDC") -> dict:
@@ -331,13 +353,16 @@ class FakeBackpackVenue:
         order["executedQuantity"] = str(executed)
         order["executedQuoteQuantity"] = str(Decimal(order["executedQuoteQuantity"]) + quantity * Decimal(price))
         order["status"] = "Filled" if executed == Decimal(order["quantity"]) else "PartiallyFilled"
-        fee = str((quantity * Decimal(price) * FEE_RATES[maker]).normalize()) if fee is None else fee
+        fee = format((quantity * Decimal(price) * FEE_RATES[maker]).normalize(), "f") if fee is None else fee
         self._next_trade_id += 1
         frame = self._order_frame("orderFill", order, l=qty, L=price, m=maker, t=self._next_trade_id, n=fee, N=fee_symbol)
         self.fills.append({"tradeId": self._next_trade_id, "orderId": str(order_id), "symbol": order["symbol"],
-                           "price": price, "quantity": qty, "fee": fee, "feeSymbol": fee_symbol,
-                           "isMaker": maker, "side": order["side"], "timestamp": timestamp()})
+                           "clientId": order["clientId"], "price": price, "quantity": qty, "fee": fee,
+                           "feeSymbol": fee_symbol, "isMaker": maker, "side": order["side"], "timestamp": timestamp()})
         await self.push("account.orderUpdate", frame)
+        buyer, seller = (order["id"], "0") if order["side"] == "Bid" else ("0", order["id"])
+        await self._public_trade(price, qty, self._next_trade_id, buyer, seller,
+                                 maker if order["side"] == "Bid" else not maker)
         return frame
 
     async def match_resting(self, trade_price: Optional[str] = None, quantity: Optional[str] = None):
@@ -345,7 +370,10 @@ class FakeBackpackVenue:
         for order in list(self.orders.values()):
             if order["status"] not in ("New", "PartiallyFilled") or order["orderType"] != "Limit":
                 continue
-            touch = trade_price or self.book["asks" if order["side"] == "Bid" else "bids"][0][0]
+            side = self.book["asks" if order["side"] == "Bid" else "bids"]
+            if trade_price is None and not side:
+                continue
+            touch = trade_price or side[0][0]
             crossed = Decimal(order["price"]) >= Decimal(touch) if order["side"] == "Bid" else (
                 Decimal(order["price"]) <= Decimal(touch))
             if self.fill_policy == FillPolicy.IMMEDIATE or crossed:
@@ -363,16 +391,16 @@ class FakeBackpackVenue:
                 await ws.close()
 
     def fail_next(self, method: str, path: str, status: int, body: Any):
-        self.faults[(method.upper(), path)].append(Fault(status=status, body=body))
+        self.faults[(method.upper(), "/" + path.lstrip("/"))].append(Fault(status=status, body=body))
 
     def delay_body_next(self, method: str, path: str, seconds: float):
-        self.faults[(method.upper(), path)].append(Fault(body_delay=seconds))
+        self.faults[(method.upper(), "/" + path.lstrip("/"))].append(Fault(body_delay=seconds))
 
     def drop_next(self, method: str, path: str):
-        self.faults[(method.upper(), path)].append(Fault(drop_after_handling=True))
+        self.faults[(method.upper(), "/" + path.lstrip("/"))].append(Fault(drop_after_handling=True))
 
     def hold_next(self, method: str, path: str):
-        self.faults[(method.upper(), path)].append(Fault(hold=True))
+        self.faults[(method.upper(), "/" + path.lstrip("/"))].append(Fault(hold=True))
 
     def requests_to(self, method: str, path: str) -> list[RestRecord]:
         return [r for r in self.requests if r.method == method.upper() and r.path == path]
@@ -384,15 +412,18 @@ class FakeBackpackVenue:
         def row_time(row):
             value = row.get("timestamp", row.get("intervalEndTimestamp", row.get("createdAt", 0)))
             if isinstance(value, str) and "T" in value:
-                return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return int(parsed.timestamp() * 1000)
             return int(value)
 
-        if "startTime" in params:
-            filtered = [r for r in filtered if row_time(r) >= int(params["startTime"]) * 1000]
-        if "endTime" in params:
-            filtered = [r for r in filtered if row_time(r) <= int(params["endTime"]) * 1000]
+        if "from" in params:
+            filtered = [r for r in filtered if row_time(r) >= int(params["from"])]
+        if "to" in params:
+            filtered = [r for r in filtered if row_time(r) <= int(params["to"])]
         filtered.sort(key=row_time, reverse=params.get("sortDirection", "Asc") == "Desc")
-        offset, limit = int(params.get("offset", 0)), int(params.get("limit", 1000))
+        offset, limit = int(params.get("offset", 0)), min(1000, int(params.get("limit", 100)))
         return web.json_response(filtered[offset:offset + limit])
 
     def _finish(self, record, response):
@@ -427,9 +458,16 @@ class FakeBackpackVenue:
         handler = self._routes.get(key)
         if handler is None:
             return self._finish(record, web.json_response({"code": "NOT_FOUND", "message": "Not Found"}, status=404))
-        response = handler(request, params)
-        if asyncio.iscoroutine(response):
-            response = await response
+        try:
+            response = handler(request, params)
+            if asyncio.iscoroutine(response):
+                response = await response
+        except web.HTTPException as error:
+            self._finish(record, error)
+            raise
+        except Exception:
+            self._finish(record, web.Response(status=500))
+            raise
         self._finish(record, response)
         if fault.drop_after_handling:
             request.transport.close()
@@ -454,7 +492,8 @@ class FakeBackpackVenue:
         order = {"id": order_id, "clientId": params["clientId"], "symbol": params["symbol"], "side": params["side"],
                  "orderType": params["orderType"], "quantity": params["quantity"], "price": params.get("price"),
                  "postOnly": params.get("postOnly", False), "timeInForce": params.get("timeInForce", "GTC"),
-                 "status": "New", "executedQuantity": "0", "executedQuoteQuantity": "0", "createdAt": now_ms()}
+                 "status": "New", "executedQuantity": "0", "executedQuoteQuantity": "0", "createdAt": now_ms(),
+                 "reduceOnly": params.get("reduceOnly", False)}
         self.orders[order_id] = order
         self._schedule(self._after_accept(order))
         return web.json_response(order)
@@ -463,8 +502,12 @@ class FakeBackpackVenue:
         await asyncio.sleep(self.ack_delay)
         await self.push("account.orderUpdate", self._order_frame("orderAccepted", order))
         if order["orderType"] == "Market":
-            touch = self.book["asks" if order["side"] == "Bid" else "bids"][0][0]
-            await self.fill(order["id"], order["quantity"], touch, maker=False)
+            side = self.book["asks" if order["side"] == "Bid" else "bids"]
+            if side:
+                await self.fill(order["id"], order["quantity"], side[0][0], maker=False)
+            else:
+                order["status"] = "Expired"
+                await self.push("account.orderUpdate", self._order_frame("orderExpired", order, R="IOC"))
         elif self.fill_policy != FillPolicy.MANUAL:
             await self.match_resting()
 
@@ -483,20 +526,23 @@ class FakeBackpackVenue:
 
     def _order_query(self, request, params):
         order = self._find_order(params)
-        if order is None:
+        if order is None or order["status"] not in ("New", "PartiallyFilled"):
             return web.json_response({"code": "RESOURCE_NOT_FOUND", "message": "Not Found"}, status=404)
         return web.json_response(order)
 
     async def _ws(self, request):
         if time.monotonic() < self.ws_refused_until:
-            return web.Response(status=503)
+            record = RestRecord(time.monotonic_ns(), request.method, request.path, dict(request.query),
+                                dict(request.headers), "")
+            self.requests.append(record)
+            return self._finish(record, web.Response(status=503))
         ws = web.WebSocketResponse(autoping=False)
         await ws.prepare(request)
         self.subscriptions[ws] = set()
         try:
             async for msg in ws:
                 payload = json.loads(msg.data) if msg.type == WSMsgType.TEXT else (
-                    base64.b64encode(msg.data).decode() if isinstance(msg.data, bytes) else str(msg.data))
+                    base64.b64encode(msg.data).decode() if isinstance(msg.data, (bytes, bytearray)) else str(msg.data))
                 self._log_ws("in", id(ws), msg.type.name, payload)
                 if msg.type == WSMsgType.PING:
                     self._log_ws("out", id(ws), "PONG", base64.b64encode(msg.data).decode())
@@ -512,6 +558,11 @@ class FakeBackpackVenue:
                         await ws.send_json(error)
                         continue
                     self.subscriptions[ws] |= streams
+                    if "account.positionUpdate" in streams:
+                        for position in self.positions:
+                            frame = {"stream": "account.positionUpdate", "data": self._position_frame(position)}
+                            self._log_ws("out", id(ws), "TEXT", frame)
+                            await ws.send_json(frame)
                 elif payload.get("method") == "UNSUBSCRIBE":
                     self.subscriptions[ws] -= streams
                 self._sub_changed.set()

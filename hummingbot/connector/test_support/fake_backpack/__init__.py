@@ -45,5 +45,14 @@ time. Empty percentile inputs produce null, not zero. Request failures,
 controller errors, successful POST counts, and sample counts remain visible.
 
 Public channel and history field names follow https://docs.backpack.exchange/.
+History bounds use ``from`` and ``to`` in milliseconds. Naive ISO timestamps are
+UTC. History defaults to 100 rows and caps each page at 1000 rows.
+Order queries return only resting orders. Filled and cancelled orders return
+404, so the stock connector takes its not-found path rather than learning a
+terminal status from that endpoint. Fill history remains available.
+The markPrice ``n`` field is milliseconds. The stock connector converts it to
+seconds, as it does for the REST funding timestamp.
+Position updates use positionOpened, positionAdjusted, and positionClosed.
+Subscribing sends each open position without an event type.
 The test keys are deterministic ED25519 keys, not credentials for a live account.
 """
