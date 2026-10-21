@@ -10,8 +10,9 @@ boundary. Feed snapshots in capture order and diffs in engine-time order.
 Diffs received before a usable snapshot are buffered. A snapshot becomes
 known only at the first diff covering ``lastUpdateId + 1``, including buffered
 diffs that predate the response receipt. Equal or lagging snapshots cannot
-replace a continuous book. Advancing snapshots replace it and need a new
-covering diff. The same sequence rule applies on a receipt-clock stream.
+replace a continuous or awaiting book. An advancing snapshot is retained for
+recovery, while continuous diffs keep the existing stretch intact. It replaces
+the book only after a gap. The same sequence rule applies on a receipt clock.
 
 Only a continuous frame stamped strictly after a query confirms its complete
 timestamp group. Strict-before queries may use a frame at the query time.
@@ -54,6 +55,14 @@ class _DepthDiff:
     last: int
     bids: Tuple[Tuple[Decimal, Decimal], ...]
     asks: Tuple[Tuple[Decimal, Decimal], ...]
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    update_id: int
+    bids: dict[Decimal, Decimal]
+    asks: dict[Decimal, Decimal]
+    received_ns: int
 
 
 @dataclass
@@ -102,6 +111,7 @@ class BookStream:
         self._stretches: list[_Stretch] = []
         self._starts: list[int] = []
         self._buffer: list[_DepthDiff] = []
+        self._pending_snapshot: Optional[_Snapshot] = None
 
     def _check_time(self, timestamp_ns: int) -> None:
         if not isinstance(timestamp_ns, int):
@@ -134,12 +144,20 @@ class BookStream:
         update_id = int(message["lastUpdateId"])
         if not isinstance(timestamp_ns, int):
             raise TypeError("timestamp_ns must be an integer")
-        if self.state is StreamState.CONTINUOUS and update_id <= self._last_update_id:
+        if self.state is not StreamState.NEED_SNAPSHOT and update_id <= self._last_update_id:
             return
+        snapshot = _Snapshot(update_id, bids, asks, timestamp_ns)
+        if self.state is StreamState.CONTINUOUS:
+            if self._pending_snapshot is None or update_id > self._pending_snapshot.update_id:
+                self._pending_snapshot = snapshot
+            return
+        self._install_snapshot(snapshot)
+
+    def _install_snapshot(self, snapshot: _Snapshot) -> None:
         self._bids, self._asks = {}, {}
-        self._update(self._bids, bids.items())
-        self._update(self._asks, asks.items())
-        self._last_update_id = update_id
+        self._update(self._bids, snapshot.bids.items())
+        self._update(self._asks, snapshot.asks.items())
+        self._last_update_id = snapshot.update_id
         self._current = _Stretch()
         buffered, self._buffer = self._buffer, []
         self.state = StreamState.AWAITING_DIFF
@@ -176,10 +194,15 @@ class BookStream:
             self.state = StreamState.NEED_SNAPSHOT
             self._current = None
             self._buffer.append(frame)
+            if self._pending_snapshot is not None:
+                snapshot, self._pending_snapshot = self._pending_snapshot, None
+                self._install_snapshot(snapshot)
             return
         self._update(self._bids, frame.bids)
         self._update(self._asks, frame.asks)
         self._last_update_id = last
+        if self._pending_snapshot is not None and last >= self._pending_snapshot.update_id:
+            self._pending_snapshot = None
         if self.state is StreamState.AWAITING_DIFF:
             if self._stretches and self._stretches[-1].end_ns >= timestamp_ns:
                 self._stretches[-1].end_ns = timestamp_ns - 1

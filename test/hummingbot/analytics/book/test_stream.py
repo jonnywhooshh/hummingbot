@@ -304,3 +304,39 @@ class BookStreamTests(TestCase):
         stream.apply_diff(diff(14), timestamp_ns=3_000)
         self.assertEqual(Decimal("98"), stream.mid_at(2_000))
         self.assertEqual(Decimal("100"), stream.mid_at(2_000, strictly_before=True))
+
+    def test_advancing_snapshot_preserves_continuous_diffs_through_its_update_id(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(), timestamp_ns=0)
+        for uid in range(11, 16):
+            stream.apply_diff(diff(uid), timestamp_ns=(uid - 10) * 1_000)
+        stream.apply_snapshot(snapshot(bids=[["97", "1"]], uid=18), timestamp_ns=5_500)
+        for uid in range(16, 21):
+            stream.apply_diff(diff(uid, bids=[["99", "0"], ["97", "1"]]), timestamp_ns=(uid - 10) * 1_000)
+        self.assertEqual((KnownInterval(1_000, 9_999),), stream.known_intervals)
+        self.assertEqual(Decimal("100"), stream.mid_at(5_500))
+        self.assertEqual(Decimal("99"), stream.mid_at(7_000))
+        self.assertEqual(StreamState.CONTINUOUS, stream.state)
+
+    def test_advancing_snapshot_recovers_a_later_gap_without_erasing_earlier_coverage(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(), timestamp_ns=0)
+        stream.apply_diff(diff(11), timestamp_ns=1_000)
+        stream.apply_diff(diff(12), timestamp_ns=2_000)
+        stream.apply_snapshot(snapshot(bids=[["97", "1"]], uid=15), timestamp_ns=2_500)
+        stream.apply_diff(diff(13), timestamp_ns=3_000)
+        stream.apply_diff(diff(16), timestamp_ns=6_000)
+        stream.apply_diff(diff(17), timestamp_ns=7_000)
+        self.assertEqual((KnownInterval(1_000, 2_999), KnownInterval(6_000, 6_999)), stream.known_intervals)
+        self.assertEqual(Decimal("100"), stream.mid_at(2_500))
+        self.assertEqual(Decimal("99"), stream.mid_at(6_500))
+        self.assertIsNone(stream.mid_at(5_000))
+
+    def test_lagging_snapshot_cannot_replace_a_better_unconfirmed_snapshot(self):
+        stream = BookStream()
+        stream.apply_snapshot(snapshot(uid=100, bids=[["97", "1"]]), timestamp_ns=0)
+        stream.apply_snapshot(snapshot(uid=50), timestamp_ns=1)
+        stream.apply_diff(diff(101), timestamp_ns=2)
+        stream.apply_diff(diff(102), timestamp_ns=3)
+        self.assertEqual(StreamState.CONTINUOUS, stream.state)
+        self.assertEqual(Decimal("99"), stream.mid_at(2))
