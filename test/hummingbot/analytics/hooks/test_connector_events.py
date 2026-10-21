@@ -36,12 +36,12 @@ class ConnectorEventsTest(RunTestCase):
     def test_dataclass_and_namedtuple_fields_keep_decimal_fees_and_order_ids(self):
         run_dir = self.start()
         created = BuyOrderCreatedEvent(123, OrderType.LIMIT_MAKER, "SOL-USDC", Decimal("0.1"),
-                                      Decimal("123.456"), "client-id", 122, "exchange-id")
+                                       Decimal("123.456"), "client-id", 122, "exchange-id")
         filled = OrderFilledEvent(124, "client-id", "SOL-USDC", TradeType.BUY, OrderType.LIMIT_MAKER,
-                                 Decimal("123.456"), Decimal("0.1"),
-                                 AddedToCostTradeFee(percent=Decimal("0.001"),
-                                                    flat_fees=[TokenAmount("USDC", Decimal("0.000000123"))]),
-                                 "trade-id", "exchange-id")
+                                  Decimal("123.456"), Decimal("0.1"),
+                                  AddedToCostTradeFee(percent=Decimal("0.001"),
+                                                      flat_fees=[TokenAmount("USDC", Decimal("0.000000123"))]),
+                                  "trade-id", "exchange-id")
         self.connector.trigger_event(MarketEvent.BuyOrderCreated, created)
         self.connector.trigger_event(MarketEvent.OrderFilled, filled)
         recorder.end_run({"path": "test"})

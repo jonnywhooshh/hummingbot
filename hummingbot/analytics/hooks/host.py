@@ -4,6 +4,7 @@ from time import monotonic, perf_counter_ns, process_time
 from typing import Any, Dict
 
 import psutil
+import ujson
 
 from hummingbot.analytics import recorder
 
@@ -20,10 +21,7 @@ class _RawJson:
 
 
 def _timing_json(timing: Dict[str, Dict[str, Any]]) -> _RawJson:
-    # Hook names are recorder-owned identifiers, so they need no escaping.
-    rows = ",".join(f'"{hook}":{{"count":{row["count"]},"total_ns":{row["total_ns"]},"buckets":{row["buckets"]}}}'
-                    for hook, row in timing.items())
-    return _RawJson("{" + rows + "}")
+    return _RawJson(ujson.dumps(timing))
 
 
 class HostSampler:

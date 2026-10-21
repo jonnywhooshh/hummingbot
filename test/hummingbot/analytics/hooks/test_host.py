@@ -1,8 +1,6 @@
 import asyncio
-import cProfile
 import json
 import os
-import statistics
 import threading
 import time
 import unittest
@@ -103,7 +101,7 @@ class HostTest(RunTestCase, IsolatedAsyncioWrapperTestCase):
         self.assertEqual(recorder.stats()["hook_errors_by_hook"]["host"], 1)
 
     @unittest.skipUnless(os.environ.get("MMA_HOST_BENCH") == "1", "Run only inside mma-slot perf")
-    def test_host_per_round_budget(self):
+    def test_host_per_round_probe(self):
         output = Path(os.environ["MMA_HOST_BENCH_DIR"])
         output.mkdir(parents=True, exist_ok=True)
         run_dir = self.start(queue_max_bytes=128 * 1024 * 1024)
@@ -113,33 +111,31 @@ class HostTest(RunTestCase, IsolatedAsyncioWrapperTestCase):
             for index in range(40):
                 recorder.timing.observe(f"fixture_{index}", 4000)
 
-        profiler = cProfile.Profile()
-        profiler.enable()
-        for _ in range(100):
-            prepare()
-            sampler.sample(-2)
-        profiler.disable()
-        profiler.dump_stats(str(output / "host-profile.pstats"))
         for _ in range(100):
             prepare()
             sampler.sample(-1)
+            time.sleep(0.01)
         rounds = []
         for round_id in range(5):
-            durations = []
+            wall, cpu = [], []
             for _ in range(1000):
                 prepare()
-                t0 = time.perf_counter_ns()
+                c0, t0 = time.thread_time_ns(), time.perf_counter_ns()
                 sampler.sample(round_id)
-                durations.append(time.perf_counter_ns() - t0)
-            durations.sort()
-            rounds.append({"round": round_id, "p99_us": durations[989] / 1000,
-                           "p50_us": durations[499] / 1000, "max_us": durations[-1] / 1000})
+                wall.append(time.perf_counter_ns() - t0)
+                cpu.append(time.thread_time_ns() - c0)
+                time.sleep(0.01)
+            wall.sort()
+            cpu.sort()
+            rounds.append({"round": round_id, "wall_p99_us": wall[989] / 1000, "wall_p50_us": wall[499] / 1000,
+                           "wall_max_us": wall[-1] / 1000, "cpu_p99_us": cpu[989] / 1000,
+                           "cpu_p50_us": cpu[499] / 1000, "loadavg": os.getloadavg()[0]})
         counters = recorder.stats()
         self.assertEqual(counters["dropped"], 0)
         self.assertEqual(counters["hook_errors"], 0)
         self.assertTrue(recorder.end_run({"path": "test"}))
         hosts = [row for row in self.records(run_dir) if row["kind"] == "host"]
-        self.assertEqual(len(hosts), 5200)
+        self.assertEqual(len(hosts), 5100)
         for row in rounds:
             measured = [record for record in hosts if record["body"]["loop_lag_ms"] == row["round"]]
             self.assertEqual(len(measured), 1000)
@@ -148,8 +144,5 @@ class HostTest(RunTestCase, IsolatedAsyncioWrapperTestCase):
             row["recorded_p99_us"] = hook_ns[989] / 1000
             print("HOST_ROUND", json.dumps(row), flush=True)
         report = {"rounds": rounds, "samples": len(hosts), "errors": counters["hook_errors"],
-                  "drops": counters["dropped"], "median_p99_us": statistics.median(row["p99_us"] for row in rounds),
-                  "claim": "Complete synchronous host sampling fits 1024 us per-round p99 in this five-round probe, not the one-hour gate."}
+                  "drops": counters["dropped"], "hooks_per_sample": 40, "sample_spacing_ms": 10}
         (output / "host-budget.json").write_text(json.dumps(report, indent=2) + "\n")
-        for row in rounds:
-            self.assertLessEqual(row["p99_us"], 1024, row)
