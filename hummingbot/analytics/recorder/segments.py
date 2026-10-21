@@ -11,6 +11,7 @@ import ujson
 MANIFEST = "manifest.jsonl"
 RUN_JSON = "run.json"
 GZIP_CHUNK = 256 * 1024
+GZIP_LEVEL = 1
 _SEGMENT = re.compile(r"^seg-(\d{6,})\.jsonl(\.gz)?$")
 
 
@@ -113,22 +114,26 @@ class ActiveSegment:
         os.close(self.fd)
         self.fd = -1
         gz_path = self.path.with_name(self.path.name + ".gz")
-        with open(self.path, "rb") as source, open(gz_path, "wb") as raw:
-            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=6, mtime=0) as packed:
-                while chunk := source.read(GZIP_CHUNK):
-                    check()
-                    packed.write(chunk)
+        try:
+            with open(self.path, "rb") as source, open(gz_path, "wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=GZIP_LEVEL, mtime=0) as packed:
+                    while chunk := source.read(GZIP_CHUNK):
+                        check()
+                        packed.write(chunk)
+                check()
+                raw.flush()
+                os.fsync(raw.fileno())
             check()
-            raw.flush()
-            os.fsync(raw.fileno())
-        check()
-        fsync_dir(self.run_dir)
-        with open(gz_path, "rb") as packed_file:
-            sha256 = hashlib.file_digest(packed_file, "sha256").hexdigest()
-        check()
-        entry = (f'{{"file":"{gz_path.name}","first_seq":{self.first_seq},"last_seq":{self.last_seq},'
-                 f'"records":{self.records},"bytes":{gz_path.stat().st_size},"sha256":"{sha256}"}}\n')
-        append_line(self.run_dir / MANIFEST, entry.encode("ascii"))
+            fsync_dir(self.run_dir)
+            with open(gz_path, "rb") as packed_file:
+                sha256 = hashlib.file_digest(packed_file, "sha256").hexdigest()
+            check()
+            entry = (f'{{"file":"{gz_path.name}","first_seq":{self.first_seq},"last_seq":{self.last_seq},'
+                     f'"records":{self.records},"bytes":{gz_path.stat().st_size},"sha256":"{sha256}"}}\n')
+            append_line(self.run_dir / MANIFEST, entry.encode("ascii"))
+        except BaseException:
+            gz_path.unlink(missing_ok=True)
+            raise
         check()
         self.path.unlink()
         fsync_dir(self.run_dir)
