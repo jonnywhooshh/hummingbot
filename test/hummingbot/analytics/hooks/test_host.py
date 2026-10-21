@@ -12,6 +12,8 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import psutil
+
 from hummingbot.analytics import recorder
 from hummingbot.analytics.hooks.host import HostSampler
 
@@ -20,14 +22,16 @@ class HostTest(RunTestCase, IsolatedAsyncioWrapperTestCase):
     def test_body_and_process_reuse(self):
         run_dir = self.start()
         process = Mock()
-        process.cpu_percent.return_value = 12.5
         process.memory_info.return_value = SimpleNamespace(rss=123456)
         process.num_fds.return_value = 9
         recorder.timing.observe("order_request", 1200)
-        with patch("hummingbot.analytics.hooks.host.psutil.Process", return_value=process) as create:
+        module = "hummingbot.analytics.hooks.host"
+        with patch(f"{module}.psutil.Process", return_value=process) as create, \
+                patch(f"{module}.process_time", side_effect=[1.0, 1.25, 1.25]), \
+                patch(f"{module}.monotonic", side_effect=[100.0, 101.0, 101.5]), \
+                patch(f"{module}.os.open", side_effect=OSError("no procfs")):
             sampler = HostSampler(str(run_dir))
-            with patch("hummingbot.analytics.hooks.host.os.statvfs",
-                       return_value=SimpleNamespace(f_bavail=100, f_frsize=4096)):
+            with patch(f"{module}.os.statvfs", return_value=SimpleNamespace(f_bavail=100, f_frsize=4096)):
                 sampler.sample(2.5)
                 sampler.sample(0.25)
             create.assert_called_once_with()
@@ -36,17 +40,28 @@ class HostTest(RunTestCase, IsolatedAsyncioWrapperTestCase):
         self.assertEqual(len(rows), 2)
         body = rows[0]["body"]
         self.assertEqual(body["loop_lag_ms"], 2.5)
-        self.assertEqual(body["cpu_percent"], 12.5)
+        self.assertEqual(body["cpu_percent"], 25.0)
+        self.assertEqual(rows[1]["body"]["cpu_percent"], 0.0)
         self.assertEqual(body["rss_bytes"], 123456)
         self.assertEqual(body["open_files"], 9)
         self.assertEqual(body["free_bytes"], 409600)
         for key in ("queue_records", "queue_bytes", "dropped", "dropped_priority", "hook_errors", "writer_errors"):
             self.assertIn(key, body)
-        self.assertEqual(body["timing"]["order_request"]["count"], 1)
-        self.assertEqual(sum(body["timing"]["order_request"]["buckets"]), 1)
+        order = body["timing"]["order_request"]
+        self.assertEqual((order["count"], order["total_ns"]), (1, 1200))
+        self.assertEqual(sum(order["buckets"]), 1)
+        self.assertEqual(len(order["buckets"]), recorder.timing.BUCKETS)
         self.assertNotIn("order_request", rows[1]["body"]["timing"])
         self.assertEqual(rows[1]["body"]["timing"]["host"]["count"], 1)
-        self.assertEqual(process.cpu_percent.call_count, 3)
+        self.assertEqual(process.memory_info.call_count, 2)
+
+    def test_rss_reads_the_held_statm_descriptor_until_closed(self):
+        sampler = HostSampler(str(self.root))
+        reported = sampler._rss()
+        self.assertAlmostEqual(reported, psutil.Process().memory_info().rss, delta=reported * 0.5)
+        sampler.close()
+        sampler.close()
+        self.assertGreater(sampler._rss(), 0)
 
     async def test_schedule_uses_actual_minus_expected_wake_time(self):
         self.start()
