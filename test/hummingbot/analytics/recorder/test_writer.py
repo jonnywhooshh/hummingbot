@@ -78,6 +78,29 @@ class RotationTest(RunTestCase):
         self.assertNotIn("run_end", json.loads((run_dir / "run.json").read_bytes()))
 
 
+class WriterFailureTest(RunTestCase):
+    def test_a_dead_writer_turns_capture_off_and_releases_the_queue(self):
+        self.start(queue_max_bytes=1 << 20)
+        with patch("hummingbot.analytics.recorder.segments.os.write", side_effect=OSError(5, "EIO")):
+            self.record("clock", {})
+            self.wait_for(lambda: recorder.stats()["disk"] == "failed")
+        self.assertFalse(recorder.ACTIVE)
+        self.assertEqual(0, recorder.stats()["queue_bytes"])
+        for _ in range(100):
+            self.record("order_request", {"text": "x" * 1000})
+        stats = recorder.stats()
+        self.assertEqual((0, 0), (stats["queue_bytes"], stats["queue_records"]))
+        self.assertFalse(recorder.end_run({"path": "test"}))
+
+    def test_a_finished_run_that_died_late_cannot_turn_off_the_next_run(self):
+        self.start()
+        first = recorder._run
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        self.start()
+        first.writer_dead()
+        self.assertTrue(recorder.ACTIVE)
+
+
 class DiskFloorTest(RunTestCase):
     def setUp(self):
         super().setUp()
@@ -101,7 +124,7 @@ class DiskFloorTest(RunTestCase):
         self.wait_for(lambda: recorder.stats()["disk"] == "disk_full")
         self.record("order_request", {"client_order_id": "lost"})
         self.record("ws_in", {"text": "bulk while full"})
-        self.wait_for(lambda: recorder.stats()["queue_records"] == 0)
+        self.wait_for(lambda: recorder.stats()["queue_records"] == 0 and not recorder.ACTIVE)
         self.assertFalse(recorder.end_run({"path": "test"}))
         records = self.records(run_dir)
         self.assertEqual(["before"], [row["body"]["text"] for row in records if row["kind"] == "ws_in"])
