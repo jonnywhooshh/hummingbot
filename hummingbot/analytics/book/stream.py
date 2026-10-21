@@ -22,6 +22,9 @@ Known intervals have inclusive nanosecond bounds and exclude the last frame.
 Recovery retains at most ``max_buffered_diffs`` frames, 4,096 by default.
 ``buffer_dropped_through_update_id`` records the highest evicted update ID.
 A recovery snapshot must cover that watermark before replay can resume.
+
+String prices share a bounded cache of validated Decimals. Quantities change
+independently of prices, so every quantity is decoded and validated anew.
 """
 
 from bisect import bisect_left, bisect_right
@@ -93,14 +96,23 @@ def _level(price: Any, quantity: Any) -> Tuple[Decimal, Decimal]:
 
 
 @lru_cache(maxsize=16384)
-def _string_level(price: str, quantity: str) -> Tuple[Decimal, Decimal]:
-    return _level(price, quantity)
+def _string_price(price: str) -> Decimal:
+    value = Decimal(price)
+    if not value.is_finite() or value <= 0:
+        raise ValueError("Depth requires positive finite prices")
+    return value
 
 
 def _levels(rows: Iterable[Sequence[Any]]) -> Iterable[Tuple[Decimal, Decimal]]:
     for price, quantity in rows:
-        yield (_string_level(price, quantity) if isinstance(price, str) and isinstance(quantity, str)
-               else _level(price, quantity))
+        if isinstance(price, str) and isinstance(quantity, str):
+            price = _string_price(price)
+            quantity = Decimal(quantity)
+            if not quantity.is_finite() or quantity < 0:
+                raise ValueError("Depth requires nonnegative finite quantities")
+            yield price, quantity
+        else:
+            yield _level(price, quantity)
 
 
 class BookStream:
