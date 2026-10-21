@@ -2,6 +2,7 @@ import asyncio
 import json
 import math
 import multiprocessing
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,8 +81,10 @@ async def venue_worker(connection, state_dir):
         await venue.stop()
 
 
-def process_main(connection, state_dir):
+def process_main(connection, state_dir, cpus):
     try:
+        if cpus:
+            os.sched_setaffinity(0, cpus)
         asyncio.run(venue_worker(connection, state_dir))
     except BaseException as error:
         connection.send({"error": repr(error)})
@@ -90,11 +93,18 @@ def process_main(connection, state_dir):
         connection.close()
 
 
+def split_cpus():
+    available = sorted(os.sched_getaffinity(0))
+    if len(available) < 3:
+        return None, None
+    return set(available[:-1]), {available[-1]}
+
+
 class VenueProcess:
-    def __init__(self, state_dir):
+    def __init__(self, state_dir, cpus=None):
         context = multiprocessing.get_context("spawn")
         self.connection, child = context.Pipe()
-        self.process = context.Process(target=process_main, args=(child, str(state_dir)))
+        self.process = context.Process(target=process_main, args=(child, str(state_dir), cpus))
         self._child = child
         self.venue = None
 
@@ -166,13 +176,24 @@ def summarize(out, ctx, delivery, lag, cpu_seconds, seconds):
 
 
 async def reference_load(minutes, out, pre_start=None, post_stop=None, analytics_dir=None):
-    from hummingbot.connector.test_support.fake_backpack.harness import v2_headless
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     controller = out / "controller.yml"
     controller.write_text(yaml.safe_dump(REFERENCE_CONTROLLER))
     seconds = minutes * 60
-    async with VenueProcess(out / "venue") as process:
+    bot_cpus, venue_cpus = split_cpus()
+    previous = os.sched_getaffinity(0)
+    if bot_cpus:
+        os.sched_setaffinity(0, bot_cpus)
+    try:
+        return await run_reference(out, seconds, controller, venue_cpus, pre_start, post_stop, analytics_dir)
+    finally:
+        os.sched_setaffinity(0, previous)
+
+
+async def run_reference(out, seconds, controller, venue_cpus, pre_start, post_stop, analytics_dir):
+    from hummingbot.connector.test_support.fake_backpack.harness import v2_headless
+    async with VenueProcess(out / "venue", venue_cpus) as process:
         async with v2_headless(controller, pre_start=pre_start, post_stop=post_stop,
                                analytics_dir=analytics_dir, venue=process.venue) as (_, ctx):
             await ctx.wait_ticks(1)

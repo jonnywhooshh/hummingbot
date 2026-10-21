@@ -25,9 +25,13 @@ the signed order POST.
 V2WithControllers. Its venue script defines ``async def drive(venue, ctx)``.
 The context exposes the application, strategy, connectors, ticks, and executors.
 Only ungated controller iterations count toward --ticks. Shutdown uses stop_loop.
+After the requested ticks, run-v2 waits for its drive script to finish. There is
+no implicit post-tick timeout. Cancellation still stops the script and strategy.
 Strategy discovery uses the checkout's scripts directory, not the caller's
 working directory. The harness isolates inherited HTTP factories and gateway
 sessions. It closes its own clients before restoring the original singletons.
+The harness prevents the gateway monitor from starting. No local Gateway
+service participates in a bot run.
 The guard checks socket destinations, DNS results, and each aiohttp request
 URL, including requests through a loopback proxy.
 
@@ -53,8 +57,9 @@ delivered_depth_frames_per_second value per minute, including a partial minute.
 CPU time covers only the bot during load, not startup, shutdown, or the venue.
 Loop lag samples use a 10 ms schedule. The runtime control_task wrapper associates
 CreateExecutorAction IDs with their decision timestamp. The place_order wrapper
-associates each returned client ID with its executor's decision. POST receipts
-join on client ID, not the closest tick. Unmatched orders have no latency sample.
+consumes that timestamp for only the executor's first order. Take-profit, close,
+and retry orders have no controller creation decision and no latency sample.
+POST receipts join on client ID, not the closest tick.
 Only requests received within the load interval count toward metrics.
 Empty percentile inputs produce null, not zero. Request failures, controller
 errors, successful POST counts, and sample counts remain visible.
@@ -64,6 +69,8 @@ performance limits. Run the 100 ms unread-body and one-second flood checks with
 ``mma-slot perf -- env MMA_PERF_TESTS=1 conda run -n hummingbot python -m pytest
 test/hummingbot/connector/test_support/fake_backpack/test_fake_backpack.py
 -k 'under_100ms or under_one_second' -q``.
+The default suite also delivers all 20,000 depth frames and checks the private
+fill and final book without a performance threshold.
 
 Public channel and history field names follow https://docs.backpack.exchange/.
 History bounds use ``from`` and ``to`` in milliseconds. Naive ISO timestamps are

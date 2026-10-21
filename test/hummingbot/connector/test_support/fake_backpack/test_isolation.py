@@ -47,6 +47,32 @@ class HarnessIsolationTests(IsolatedAsyncioWrapperTestCase):
             with loopback_network(), self.assertRaises(OSError):
                 socket.getnameinfo(("198.51.100.1", 80), 0)
 
+    async def test_sendmsg_checks_explicit_destinations(self):
+        for family, host in ((socket.AF_INET, "198.51.100.1"), (socket.AF_INET6, "2001:db8::1")):
+            with patch.object(socket.socket, "sendmsg", side_effect=AssertionError("unguarded syscall")):
+                with loopback_network(), socket.socket(family, socket.SOCK_DGRAM) as sock:
+                    with self.assertRaises(OSError):
+                        sock.sendmsg([b"x"], [], 0, (host, 53))
+        with loopback_network(), socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+            server.bind(("127.0.0.1", 0))
+            server.settimeout(1)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                address = ("localhost", server.getsockname()[1])
+                self.assertEqual(1, client.sendmsg([b"a"], [], 0, address))
+                self.assertEqual(b"a", server.recv(1))
+                client.connect(address)
+                self.assertEqual(1, client.sendmsg([b"b"]))
+                self.assertEqual(b"b", server.recv(1))
+
+    async def test_environment_does_not_start_gateway_monitor(self):
+        original = GatewayHttpClient.start_monitor
+        with TemporaryDirectory() as directory:
+            with bot_environment(FakeBackpackVenue(), Path(directory)):
+                gateway = GatewayHttpClient.get_instance()
+                gateway.start_monitor()
+                self.assertIsNone(gateway._monitor_task)
+        self.assertIs(original, GatewayHttpClient.start_monitor)
+
     async def test_localhost_resolver_results_must_be_loopback(self):
         result = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.51.100.1", 80))]
         with patch.object(socket, "getaddrinfo", return_value=result):
@@ -133,13 +159,23 @@ class HarnessIsolationTests(IsolatedAsyncioWrapperTestCase):
             root = Path(directory)
             controller = root / "controller.yml"
             controller.write_text(yaml.safe_dump(REFERENCE_CONTROLLER))
+            marker = root / "drive-finished"
+            drive = root / "drive.py"
+            drive.write_text("import asyncio\nfrom pathlib import Path\n"
+                             "async def drive(venue, ctx):\n"
+                             "    await ctx.wait_ticks(1)\n"
+                             "    assert ctx.application.trading_core._gateway_monitor._monitor_task is None\n"
+                             "    await asyncio.sleep(11)\n"
+                             f"    Path({str(marker)!r}).write_text('complete')\n")
             command = [sys.executable, "-m", "hummingbot.connector.test_support.fake_backpack", "run-v2",
-                       "--controller-yaml", str(controller), "--ticks", "1", "--state-dir", str(root / "venue")]
+                       "--controller-yaml", str(controller), "--ticks", "1", "--venue-script", str(drive),
+                       "--state-dir", str(root / "venue")]
             result = await asyncio.to_thread(subprocess.run, command, cwd=root,
                                              env={**os.environ, "PYTHONPATH": str(checkout)},
                                              capture_output=True, text=True, timeout=90)
             self.assertEqual(0, result.returncode, result.stdout + result.stderr)
             self.assertIn("TICKS ungated=", result.stdout)
+            self.assertEqual("complete", marker.read_text())
 
     async def test_child_startup_error_reaches_parent(self):
         with TemporaryDirectory() as directory:

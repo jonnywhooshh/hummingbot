@@ -9,10 +9,10 @@ from unittest.mock import AsyncMock, patch
 
 
 class V2AcceptanceRegressionTests(IsolatedAsyncioWrapperTestCase):
-    async def test_initial_sell_entry_is_not_a_take_profit(self):
-        posts = [SimpleNamespace(sig_ok=True, t_mono_ns=1, body=json.dumps(
-            {"clientId": side, "side": side, "postOnly": True, "price": "150", "quantity": "1"}))
-            for side in ("Bid", "Ask")]
+    async def test_other_executor_sell_after_fill_is_not_a_take_profit(self):
+        posts = [SimpleNamespace(sig_ok=True, t_mono_ns=received, body=json.dumps(
+            {"clientId": side, "side": side, "postOnly": True, "price": "151", "quantity": "1"}))
+            for side, received in (("Bid", 1), ("Ask", 3_000_000_000))]
         venue = SimpleNamespace(requests_to=lambda *args: posts,
                                 orders={"1": {"id": "1", "clientId": "Bid", "side": "Bid", "price": "150"}},
                                 fills=[{"orderId": "1", "timestamp": "2026-10-19T00:00:00Z"}],

@@ -212,10 +212,18 @@ class ConnectorBehaviorTests(IsolatedAsyncioWrapperTestCase):
         return next(order for order in venue.orders.values() if str(order["clientId"]) == client_id)
 
     async def test_one_fill(self):
-        filled = await one_fill(state_dir=self.temp.name)
-        self.assertEqual("9001", filled.exchange_trade_id)
-        rows = [json.loads(row) for row in (Path(self.temp.name) / "requests.jsonl").read_text().splitlines()]
-        self.assertTrue(next(row for row in rows if row["method"] == "POST")["sig_ok"])
+        sequences = []
+        for _ in range(3):
+            filled = await one_fill(state_dir=self.temp.name)
+            self.assertEqual("9001", filled.exchange_trade_id)
+            rows = [json.loads(row) for row in (Path(self.temp.name) / "requests.jsonl").read_text().splitlines()]
+            self.assertTrue(next(row for row in rows if row["method"] == "POST")["sig_ok"])
+            sequence = [(row["method"], row["path"]) for row in rows]
+            self.assertEqual(("POST", "/api/v1/order"), sequence[-1])
+            self.assertEqual(1, sequence.count(("GET", "/api/v1/ticker")))
+            sequences.append(sequence)
+        self.assertEqual([sorted(sequences[0])] * 3, [sorted(sequence) for sequence in sequences])
+        self.assertEqual([sequences[0][-2:]] * 3, [sequence[-2:] for sequence in sequences])
 
     async def test_400_then_accepted_retry(self):
         async with connected_backpack() as (venue, connector, events):
@@ -344,6 +352,24 @@ class ConnectorBehaviorTests(IsolatedAsyncioWrapperTestCase):
             self.assertEqual(21000, book.last_diff_uid)
             print(f"FLOOD depth_frames=20000 fill_latency_ms={(received - sent) * 1000:.3f}")
 
+    async def test_20000_depth_frames_preserve_private_fill(self):
+        async with connected_backpack() as (venue, connector, events):
+            client_id = self.buy(connector)
+            await events.next(MarketEvent.BuyOrderCreated)
+            order = self.venue_order(venue, client_id)
+            for index in range(20000):
+                await venue.push_depth([["149.90", str(1 + index % 7)]], [])
+                if index == 10000:
+                    await venue.fill(order["id"], "0.10", "149.50")
+            _, filled = await events.next(MarketEvent.OrderFilled, timeout=60)
+            self.assertEqual(client_id, filled.order_id)
+            self.assertEqual("9001", filled.exchange_trade_id)
+            book = connector.get_order_book("SOL-USDC")
+            async with asyncio.timeout(60):
+                while book.last_diff_uid < venue.update_id:
+                    await asyncio.sleep(0.001)
+            self.assertEqual(21000, book.last_diff_uid)
+
     async def test_30_tick_v2_posts_and_stops_every_executor(self):
         controller = Path(self.temp.name) / "controller.yml"
         controller.write_text(yaml.safe_dump(REFERENCE_CONTROLLER))
@@ -370,22 +396,27 @@ class ConnectorBehaviorTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(all(executor.status.name == "TERMINATED" for executor in ctx.executors))
         self.assertTrue(all(executor.close_type.name == "EARLY_STOP" for executor in ctx.executors))
         self.assertTrue(ctx.decision_by_order)
+        first_order_by_executor = {}
+        for post in posts:
+            client_id = str(json.loads(post.body)["clientId"])
+            owner = ctx.executor_by_order[client_id]
+            first = first_order_by_executor.setdefault(owner, client_id)
+            self.assertEqual(client_id == first, client_id in ctx.decision_by_order)
 
     async def test_reference_load_separate_process_metrics(self):
-        metrics = await reference_load(0.05, Path(self.temp.name))
+        metrics = await reference_load(0.5, Path(self.temp.name))
         self.assertTrue((Path(self.temp.name) / "metrics.json").exists())
         self.assertTrue(metrics["venue_process_separate"])
-        self.assertGreaterEqual(metrics["order_posts"], 0)
+        self.assertGreater(metrics["order_posts"], 0)
         self.assertEqual(metrics["order_posts"], metrics["successful_order_posts"])
         self.assertEqual(0, metrics["failed_requests"])
         self.assertEqual([], metrics["controller_errors"])
         self.assertGreater(metrics["delivered_depth_frames_per_second"][0], 0)
         self.assertEqual(47, metrics["configured_frames_per_second"]["depth"])
         self.assertIsNotNone(metrics["loop_lag_p99_ms"])
-        if metrics["decision_to_post_samples"]:
-            self.assertIsNotNone(metrics["decision_to_post_p50_ms"])
-        else:
-            self.assertIsNone(metrics["decision_to_post_p50_ms"])
+        self.assertGreater(metrics["decision_to_post_samples"], 0)
+        self.assertIsNotNone(metrics["decision_to_post_p50_ms"])
+        self.assertIsNotNone(metrics["decision_to_post_p99_ms"])
         self.assertGreater(metrics["cpu_seconds_per_minute"], 0)
 
     async def test_callbacks_and_optional_analytics_config(self):
@@ -446,6 +477,7 @@ class LoopReuseTests(IsolatedAsyncioWrapperTestCase):
             async def run_with_order():
                 async with v2_headless(controller) as (venue, ctx):
                     await ctx.wait_ticks(1)
+                    self.assertIsNone(ctx.application.trading_core._gateway_monitor._monitor_task)
                     async with asyncio.timeout(30):
                         while not venue.orders:
                             await asyncio.sleep(0.01)

@@ -88,17 +88,25 @@ def loopback_network():
         require_loopback(URL(url).host)
         return client_request(self, method, url, *args, **kwargs)
 
+    def checked_address(sock, address):
+        if sock.family in (socket.AF_INET, socket.AF_INET6):
+            require_loopback(address[0])
+            if address[0] in ("localhost", b"localhost"):
+                return guarded_resolve(address[0], address[1], family=sock.family, type=sock.type)[0][4]
+        return address
+
     def guard_socket(operation):
         def guarded(self, *args, **kwargs):
-            address = args[-1] if args else kwargs["address"]
-            if self.family in (socket.AF_INET, socket.AF_INET6):
-                require_loopback(address[0])
-                if address[0] in ("localhost", b"localhost"):
-                    resolved = guarded_resolve(address[0], address[1], family=self.family, type=self.type)
-                    address = resolved[0][4]
-                    args = (*args[:-1], address)
-            return operation(self, *args, **kwargs)
+            address = checked_address(self, args[-1])
+            return operation(self, *args[:-1], address, **kwargs)
         return guarded
+
+    sendmsg = socket.socket.sendmsg
+
+    def guarded_sendmsg(self, buffers, ancdata=(), flags=0, address=None):
+        if address is None:
+            return sendmsg(self, buffers, ancdata, flags)
+        return sendmsg(self, buffers, ancdata, flags, checked_address(self, address))
 
     def guard_lookup(operation, result_kind):
         def guarded(host, *args, **kwargs):
@@ -122,6 +130,7 @@ def loopback_network():
             stack.enter_context(patch.object(socket, name, guard_lookup(getattr(socket, name), result_kind)))
         for name in ("connect", "connect_ex", "sendto"):
             stack.enter_context(patch.object(socket.socket, name, guard_socket(getattr(socket.socket, name))))
+        stack.enter_context(patch.object(socket.socket, "sendmsg", guarded_sendmsg))
         stack.enter_context(patch.object(aiohttp.TCPConnector, "_resolve_host", guarded_aiohttp))
         stack.enter_context(patch.object(aiohttp.ClientRequest, "__init__", guarded_request))
         yield
@@ -176,6 +185,7 @@ def bot_environment(venue, root: Path, analytics_dir=None):
             stack.enter_context(patch.object(ConnectionsFactory, name, None))
         for name in ("_GatewayHttpClient__instance", "_shared_client", "_monitor_task"):
             stack.enter_context(patch.object(GatewayHttpClient, name, None))
+        stack.enter_context(patch.object(GatewayHttpClient, "start_monitor", lambda self: None))
         client = ClientConfigMap(anonymized_metrics_mode=AnonymizedMetricsDisabledMode())
         client_data = client.model_dump(mode="json")
         if analytics_dir is not None:
@@ -278,7 +288,7 @@ class V2Context:
     strategy: Any = None
     ticks: list[Tick] = field(default_factory=list)
     executors: list = field(default_factory=list)
-    decision_by_executor: dict[str, int] = field(default_factory=dict)
+    pending_decision_by_executor: dict[str, int] = field(default_factory=dict)
     decision_by_order: dict[str, int] = field(default_factory=dict)
     executor_by_order: dict[str, str] = field(default_factory=dict)
 
@@ -331,13 +341,13 @@ async def v2_headless(controller_yaml, state_dir=None, pre_start=None, post_stop
                     if tick is not None:
                         for action in actions:
                             if isinstance(action, CreateExecutorAction):
-                                ctx.decision_by_executor[action.executor_config.id] = tick.t_mono_ns
+                                ctx.pending_decision_by_executor[action.executor_config.id] = tick.t_mono_ns
                     return await send_actions(controller, actions)
 
                 def attributed_order(executor, *args, **kwargs):
                     client_id = place_order(executor, *args, **kwargs)
                     ctx.executor_by_order[str(client_id)] = executor.config.id
-                    decision = ctx.decision_by_executor.get(executor.config.id)
+                    decision = ctx.pending_decision_by_executor.pop(executor.config.id, None)
                     if decision is not None:
                         ctx.decision_by_order[str(client_id)] = decision
                     return client_id
@@ -393,6 +403,13 @@ async def v2_headless(controller_yaml, state_dir=None, pre_start=None, post_stop
 async def one_fill(state_dir=None, pre_start=None, post_stop=None, analytics_dir=None):
     async with connected_backpack(state_dir=state_dir, pre_start=pre_start, post_stop=post_stop,
                                   analytics_dir=analytics_dir) as (venue, connector, events):
+        book = connector.get_order_book("SOL-USDC")
+        async with asyncio.timeout(5):
+            while book.last_trade_price_rest_updated == 0:
+                await asyncio.sleep(0.001)
+        poll = connector.order_book_tracker._update_last_trade_prices_task
+        poll.cancel()
+        await asyncio.gather(poll, return_exceptions=True)
         client_id = connector.buy("SOL-USDC", Decimal("0.10"), OrderType.LIMIT, Decimal("149.50"),
                                   position_action=PositionAction.OPEN)
         await events.next(MarketEvent.BuyOrderCreated)
@@ -414,7 +431,7 @@ async def run_v2(controller_yaml, ticks: int = 30, venue_script=None, state_dir=
         try:
             await ctx.wait_ticks(ticks)
             if drive is not None:
-                await asyncio.wait_for(drive, 10)
+                await drive
         finally:
             if drive is not None and not drive.done():
                 drive.cancel()

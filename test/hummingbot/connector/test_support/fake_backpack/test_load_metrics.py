@@ -1,11 +1,13 @@
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from hummingbot.connector.test_support.fake_backpack.harness import Tick
-from hummingbot.connector.test_support.fake_backpack.load import summarize
+from hummingbot.connector.test_support.fake_backpack.load import split_cpus, summarize
 
 
 class LoadMetricTests(unittest.TestCase):
@@ -50,3 +52,11 @@ class LoadMetricTests(unittest.TestCase):
         self.assertEqual(1, metrics["successful_order_posts"])
         self.assertEqual(1, metrics["failed_requests"])
         self.assertEqual(0, metrics["decision_to_post_p50_ms"])
+
+    def test_bot_and_venue_use_disjoint_cpus(self):
+        with patch.object(os, "sched_getaffinity", return_value={4, 2, 0, 1}):
+            self.assertEqual(({0, 1, 2}, {4}), split_cpus())
+
+    def test_two_cpu_host_is_not_pinned(self):
+        with patch.object(os, "sched_getaffinity", return_value={0, 1}):
+            self.assertEqual((None, None), split_cpus())
