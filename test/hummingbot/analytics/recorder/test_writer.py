@@ -71,7 +71,7 @@ class RotationTest(RunTestCase):
     def test_a_write_error_never_reaches_the_hook_and_end_run_reports_failure(self):
         run_dir = self.start()
         self.wait_for(lambda: (run_dir / "run.json").exists())
-        with patch("hummingbot.analytics.recorder.segments.os.write", side_effect=OSError("full disk")):
+        with patch("hummingbot.analytics.recorder.segments.os.writev", side_effect=OSError("full disk")):
             self.record("clock", {})
             self.wait_for(lambda: recorder.stats()["writer_errors"] > 0)
             self.assertFalse(recorder.end_run({"path": "test"}))
@@ -81,7 +81,7 @@ class RotationTest(RunTestCase):
 class WriterFailureTest(RunTestCase):
     def test_a_dead_writer_turns_capture_off_and_releases_the_queue(self):
         self.start(queue_max_bytes=1 << 20)
-        with patch("hummingbot.analytics.recorder.segments.os.write", side_effect=OSError(5, "EIO")):
+        with patch("hummingbot.analytics.recorder.segments.os.writev", side_effect=OSError(5, "EIO")):
             self.record("clock", {})
             self.wait_for(lambda: recorder.stats()["disk"] == "failed")
         self.assertFalse(recorder.ACTIVE)
