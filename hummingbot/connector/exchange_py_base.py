@@ -421,74 +421,74 @@ class ExchangePyBase(ExchangeBase, ABC):
         """
         if recorder.ACTIVE:
             order_hooks.order_request(self, trade_type, order_id, trading_pair, amount, order_type, price, kwargs)
-        trading_rule = self._trading_rules[trading_pair]
-
-        if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
-            price = self.quantize_order_price(trading_pair, price)
-        quantized_amount = self.quantize_order_amount(trading_pair=trading_pair, amount=amount)
-
-        self.start_tracking_order(
-            order_id=order_id,
-            exchange_order_id=None,
-            trading_pair=trading_pair,
-            order_type=order_type,
-            trade_type=trade_type,
-            price=price,
-            amount=quantized_amount,
-            **kwargs,
-        )
-        order = self._order_tracker.active_orders[order_id]
-        if not price or price.is_nan() or price == s_decimal_0:
-            current_price: Decimal = self.get_price(trading_pair, False)
-            notional_size = current_price * quantized_amount
-        else:
-            notional_size = price * quantized_amount
-
-        if order_type not in self.supported_order_types():
-            self.logger().error(f"{order_type} is not in the list of supported order types")
-            exception = ValueError(f"{order_type} is not in the list of supported order types")
-            if recorder.ACTIVE:
-                order_hooks.order_result(self, order_id, trading_pair, None, exception)
-            self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
-            return
-
-        elif quantized_amount < trading_rule.min_order_size:
-            exception = ValueError(f"Order amount {amount} is lower than minimum order size {trading_rule.min_order_size} "
-                                   f"for the pair {trading_pair}. The order will not be created.")
-            if recorder.ACTIVE:
-                order_hooks.order_result(self, order_id, trading_pair, None, exception)
-            self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
-            return
-
-        elif notional_size < trading_rule.min_notional_size:
-            exception = ValueError(f"Order notional {notional_size} is lower than minimum notional size {trading_rule.min_notional_size}"
-                                   f" for the pair {trading_pair}. The order will not be created.")
-            if recorder.ACTIVE:
-                order_hooks.order_result(self, order_id, trading_pair, None, exception)
-            self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
-            return
-        if recorder.ACTIVE:
-            order_hooks.order_dispatch(self, order_id, trading_pair, quantized_amount, price)
+        exchange_order_id = None
+        exception = None
         try:
-            exchange_order_id = await self._place_order_and_process_update(order=order, **kwargs,)
-            if recorder.ACTIVE:
-                order_hooks.order_result(self, order_id, trading_pair, exchange_order_id, None)
+            trading_rule = self._trading_rules[trading_pair]
 
-        except asyncio.CancelledError:
-            raise
-        except Exception as ex:
-            if recorder.ACTIVE:
-                order_hooks.order_result(self, order_id, trading_pair, None, ex)
-            self._on_order_failure(
+            if order_type in [OrderType.LIMIT, OrderType.LIMIT_MAKER]:
+                price = self.quantize_order_price(trading_pair, price)
+            quantized_amount = self.quantize_order_amount(trading_pair=trading_pair, amount=amount)
+
+            self.start_tracking_order(
                 order_id=order_id,
+                exchange_order_id=None,
                 trading_pair=trading_pair,
-                amount=quantized_amount,
-                trade_type=trade_type,
                 order_type=order_type,
+                trade_type=trade_type,
                 price=price,
-                exception=ex,
+                amount=quantized_amount,
                 **kwargs,
             )
+            order = self._order_tracker.active_orders[order_id]
+            if not price or price.is_nan() or price == s_decimal_0:
+                current_price: Decimal = self.get_price(trading_pair, False)
+                notional_size = current_price * quantized_amount
+            else:
+                notional_size = price * quantized_amount
+
+            if order_type not in self.supported_order_types():
+                self.logger().error(f"{order_type} is not in the list of supported order types")
+                exception = ValueError(f"{order_type} is not in the list of supported order types")
+                self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
+                return
+
+            elif quantized_amount < trading_rule.min_order_size:
+                exception = ValueError(f"Order amount {amount} is lower than minimum order size {trading_rule.min_order_size} "
+                                       f"for the pair {trading_pair}. The order will not be created.")
+                self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
+                return
+
+            elif notional_size < trading_rule.min_notional_size:
+                exception = ValueError(f"Order notional {notional_size} is lower than minimum notional size {trading_rule.min_notional_size}"
+                                       f" for the pair {trading_pair}. The order will not be created.")
+                self._update_order_after_failure(order_id=order_id, trading_pair=trading_pair, exception=exception)
+                return
+            if recorder.ACTIVE:
+                order_hooks.order_dispatch(self, order_id, trading_pair, quantized_amount, price)
+            try:
+                exchange_order_id = await self._place_order_and_process_update(order=order, **kwargs,)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                exception = ex
+                self._on_order_failure(
+                    order_id=order_id,
+                    trading_pair=trading_pair,
+                    amount=quantized_amount,
+                    trade_type=trade_type,
+                    order_type=order_type,
+                    price=price,
+                    exception=ex,
+                    **kwargs,
+                )
+        except BaseException as ex:
+            exception = ex
+            raise
+        finally:
+            if recorder.ACTIVE:
+                order_hooks.order_result(self, order_id, trading_pair, exchange_order_id, exception)
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
         exchange_order_id, update_timestamp = await self._place_order(
@@ -555,7 +555,7 @@ class ExchangePyBase(ExchangeBase, ABC):
             raise
         except asyncio.TimeoutError as ex:
             if recorder.ACTIVE:
-                order_hooks.cancel_error(order.client_order_id, ex)
+                order_hooks.cancel_error(ex)
             # some exchanges do not allow cancels with the client/user order id
             # so log a warning and wait for the creation of the order to complete
             self.logger().warning(
@@ -564,7 +564,7 @@ class ExchangePyBase(ExchangeBase, ABC):
             await self._order_tracker.process_order_not_found(order.client_order_id)
         except Exception as ex:
             if recorder.ACTIVE:
-                order_hooks.cancel_error(order.client_order_id, ex)
+                order_hooks.cancel_error(ex)
             if self._is_order_not_found_during_cancelation_error(cancelation_exception=ex):
                 self.logger().warning(f"Failed to cancel order {order.client_order_id} (order not found)")
                 await self._order_tracker.process_order_not_found(order.client_order_id)
@@ -596,21 +596,22 @@ class ExchangePyBase(ExchangeBase, ABC):
         :param trading_pair: the trading pair the order to cancel operates with
         :param order_id: the client id of the order to cancel
         """
+        capture = None
         if recorder.ACTIVE:
-            order_hooks.cancel_request(self, trading_pair, order_id)
+            capture = order_hooks.cancel_request(self, trading_pair, order_id)
         result = None
-        tracked_order = self._order_tracker.fetch_tracked_order(order_id)
-        if tracked_order is not None:
-            try:
+        exception = None
+        try:
+            tracked_order = self._order_tracker.fetch_tracked_order(order_id)
+            if tracked_order is not None:
                 result = await self._execute_order_cancel(order=tracked_order)
-            except BaseException as ex:
-                if recorder.ACTIVE:
-                    order_hooks.cancel_result(self, trading_pair, order_id, None, ex)
-                raise
-        if recorder.ACTIVE:
-            order_hooks.cancel_result(self, trading_pair, order_id, result, None)
-
-        return result
+            return result
+        except BaseException as ex:
+            exception = ex
+            raise
+        finally:
+            if recorder.ACTIVE or capture is not None:
+                order_hooks.cancel_result(self, trading_pair, order_id, result, exception, capture)
 
     # === Order Tracking ===
 
