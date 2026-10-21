@@ -116,3 +116,20 @@ class PartialWriteTest(RunTestCase):
                 segment.flush()
             segment.abandon()
         self.assertEqual(line, (self.root / "seg-000001.jsonl").read_bytes())
+
+
+class AbandonedCloseTest(RunTestCase):
+    def test_an_abandoned_close_removes_its_partial_gzip_and_keeps_the_original(self):
+        segment = segments.ActiveSegment(self.root, 1)
+        segment.add(1, b'{"seq":1}\n')
+        calls = []
+
+        def check():
+            calls.append(1)
+            if len(calls) == 3:
+                raise segments.Abandoned()
+
+        with self.assertRaises(segments.Abandoned):
+            segment.close(check)
+        self.assertEqual(["seg-000001.jsonl"], sorted(path.name for path in self.root.iterdir()))
+        self.assertEqual(b'{"seq":1}\n', (self.root / "seg-000001.jsonl").read_bytes())

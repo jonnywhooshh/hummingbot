@@ -163,3 +163,24 @@ class EndRunBoundTest(RunTestCase):
         self.assertTrue((run_dir / "seg-000001.jsonl").exists())
         self.assertEqual([], manifest(run_dir))
         self.assertNotIn("run_end", json.loads((run_dir / "run.json").read_bytes()))
+
+    def test_a_rotation_during_the_drain_stops_at_the_deadline_instead_of_finishing_afterwards(self):
+        run_dir = self.start(segment_max_bytes=2000)
+        self.record("ws_in", {"text": "x" * 1500})
+        self.wait_for(lambda: recorder.stats()["written"] == 1)
+        recorder.pause()
+        for _ in range(3):
+            self.record("ws_in", {"text": "y" * 1500})
+        real_digest = hashlib.file_digest
+
+        def slow_digest(*args, **kwargs):
+            time.sleep(0.5)
+            return real_digest(*args, **kwargs)
+
+        threading.Timer(0.05, recorder.resume).start()
+        with patch("hummingbot.analytics.recorder.segments.hashlib.file_digest", side_effect=slow_digest):
+            with patch.object(recorder, "END_RUN_TIMEOUT_S", 0.3):
+                self.assertFalse(recorder.end_run({"path": "test"}))
+            time.sleep(1.0)
+        self.assertEqual([], manifest(run_dir))
+        self.assertEqual(["seg-000001.jsonl"], sorted(path.name for path in run_dir.glob("seg-*")))
