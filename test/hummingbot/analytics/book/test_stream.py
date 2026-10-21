@@ -491,6 +491,14 @@ class BookStreamTests(TestCase):
         stream.apply_diff(diff(16), timestamp_ns=3_000)
         self.assertEqual((KnownInterval(2_000, 2_999, 2),), stream.known_intervals)
 
+    def test_repeated_snapshot_update_id_does_not_consume_candidate_slots(self):
+        stream = BookStream(max_snapshot_candidates=2)
+        for uid, received in ((12, 1), (14, 2), (14, 3)):
+            stream.apply_snapshot(snapshot(uid=uid), timestamp_ns=received)
+        stream.apply_diff(diff(13), timestamp_ns=1_000)
+        stream.apply_diff(diff(14), timestamp_ns=2_000)
+        self.assertEqual((KnownInterval(1_000, 1_999, 1),), stream.known_intervals)
+
     def test_candidate_limit_must_be_a_positive_integer(self):
         for limit in (0, -1, 1.5):
             with self.subTest(limit=limit), self.assertRaises(ValueError):
