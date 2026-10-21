@@ -15,7 +15,7 @@ from time import monotonic, monotonic_ns, perf_counter_ns, time_ns
 from typing import Any, Deque, Dict, NamedTuple, Optional, Tuple, Union
 from uuid import UUID
 
-from hummingbot.analytics.recorder import accounts, secrets, timing
+from hummingbot.analytics.recorder import accounts, heap, secrets, timing
 from hummingbot.analytics.recorder.envelope import encode_body, frame, gap_line, payload, payload_size
 from hummingbot.analytics.recorder.kinds import KINDS
 from hummingbot.analytics.recorder.queue import CaptureQueue
@@ -96,6 +96,7 @@ def activate(config: Any, root: Union[str, Path, None] = None) -> Optional[str]:
         run_id = str(_uuid7())
         run_dir = Path(settings.dir) / run_id
         run_dir.mkdir(parents=True, mode=0o700)
+        heap.keep_freed_memory()
         run = _Run(run_id, run_dir, settings)
         run.writer.start()
         timing.drain()
