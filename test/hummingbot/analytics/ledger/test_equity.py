@@ -442,3 +442,14 @@ def test_dataclass_arguments_widen_the_ledger_precision():
     wide = working_precision(ledger, Report(D("0." + "1" * 60)))
     assert wide >= 4 * 61
     assert wide > narrow
+
+
+def test_equity_point_is_immutable_and_exposes_every_field_by_name():
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices())
+    ledger.apply(Fill(1, "buy", D("1"), D("100")))
+    point = ledger.value(1)
+    assert point._fields == ("t", "equity", "mid", "position", "realized_pnl", "entry_price", "mark_valued",
+                             "missing_tokens", "external_flows", "net_pnl", "unvalued_transfer_tokens")
+    assert (point.t, point.equity, point.position, point.entry_price) == (1, D("1000"), D("1"), D("100"))
+    with pytest.raises(AttributeError):
+        point.equity = D("0")

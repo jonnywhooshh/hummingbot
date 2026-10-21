@@ -1,11 +1,11 @@
 """Incremental marked equity, independent of realized cost-basis allocation."""
 
 from collections import deque
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from decimal import Decimal, getcontext, setcontext
 from fractions import Fraction
 from functools import wraps
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 from hummingbot.analytics.ledger.model import (
     ONE,
@@ -97,8 +97,7 @@ def _ratio_decimal(n: int, d: int, context) -> Decimal:
     return context.plus(Decimal(f"{'-' if negative else ''}{q}E{-shift}"))
 
 
-@dataclass(frozen=True, slots=True)
-class EquityPoint:
+class EquityPoint(NamedTuple):
     t: int
     equity: Optional[Decimal]
     mid: Optional[Decimal]
@@ -168,10 +167,10 @@ class Ledger:
         self.fees_by_token = {}
         self._held = {}
         self._realized_cache = None
+        self._spot = market == "spot"
         self.paid_fees_by_token = {}
         self.rebates_by_token = {}
         self.fee_quote_values = {}
-        self.fee_valuation_basis = {}
         self.fees_at_fill = ZERO
         self.unvalued_fees = set()
         self._unvalued_fee_quantities = {}
@@ -214,7 +213,9 @@ class Ledger:
             return ONE
         price = self.mids.mid(token, t)
         if price is not None:
-            if decimal_amount(price, "mid") <= ZERO:
+            if type(price) is not Decimal or not price.is_finite():
+                decimal_amount(price, "mid")
+            if price <= ZERO:
                 raise ValueError("mid must be positive")
             if price is not self._last_mid:
                 self._last_mid = price
@@ -242,6 +243,11 @@ class Ledger:
     def _base_valuation_exposure(self) -> Decimal:
         return (self.opening.pos_open + self.trade_quantity - self.fees_by_token.get(self.base_token, ZERO)
                 + self.transfers_by_token.get(self.base_token, ZERO))
+
+    @property
+    def fee_valuation_basis(self) -> dict[str, str]:
+        return {token: "mid_unavailable" if token in self.unvalued_fees else
+                "quote" if token == self.quote_token else "token_mid_at_fill" for token in self.fees_by_token}
 
     @property
     def external_flows(self) -> Optional[Decimal]:
@@ -311,7 +317,7 @@ class Ledger:
                 else:
                     self._external_flows += event.amount * transfer_mid
             self.has_transfers = True
-            if self.market == "spot" and token == self.base_token:
+            if self._spot and token == self.base_token:
                 self._apply_cost(event.amount, transfer_mid, realize=False)
         else:
             quantity = event.quantity
@@ -349,10 +355,8 @@ class Ledger:
                     cost = fee * fee_mid
                     self.fees_at_fill += cost
                     self.fee_quote_values[token] = self.fee_quote_values.get(token, ZERO) + cost
-                self.fee_valuation_basis[token] = ("mid_unavailable" if token in self.unvalued_fees else
-                                                   "quote" if token == self.quote_token else "token_mid_at_fill")
             self._apply_cost(q, price)
-            if self.market == "spot" and fee and (event.fee_token or self.quote_token) == self.base_token:
+            if self._spot and fee and (event.fee_token or self.quote_token) == self.base_token:
                 self._apply_cost(-fee, price, realize=False)
 
     def _apply_cost(self, q: Decimal, price: Optional[Decimal], *, realize: bool = True) -> None:
@@ -420,7 +424,8 @@ class Ledger:
             setcontext(caller)
 
     def _value(self, t: int, mark: Optional[Decimal]) -> EquityPoint:
-        venue_time(t)
+        if type(t) is not int:
+            venue_time(t)
         if t < self.last_t:
             raise ValueError("cannot value behind the last applied event")
         if mark is not None and decimal_amount(mark, "mark") <= ZERO:
@@ -434,7 +439,7 @@ class Ledger:
         for token, quantity in self._held.items():
             if not quantity:
                 continue
-            if self.market == "spot" and token == self.base_token:
+            if self._spot and token == self.base_token:
                 price = mid
             elif token == self.instrument:
                 price = instrument_mid
@@ -466,7 +471,7 @@ class Ledger:
                                        self._context)
         flows = None if self.unvalued_transfers else self._external_flows
         net_pnl = None if equity is None or flows is None else equity - self.opening.E_open - flows
-        return EquityPoint(t, equity, mid, self._base_valuation_exposure() if self.market == "spot" else exposure,
+        return EquityPoint(t, equity, mid, self._base_valuation_exposure() if self._spot else exposure,
                            self._realized_decimal(), entry, mark_valued,
                            tuple(sorted(missing)) if missing else (), flows, net_pnl,
                            tuple(sorted(self.unvalued_transfers)) if self.unvalued_transfers else ())
