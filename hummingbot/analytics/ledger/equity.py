@@ -142,6 +142,8 @@ class Ledger:
         self._event_count = 0
         self._observe(opening.E_open, opening.mid_open, opening.pos_open, opening.entry_price)
         self.opening = opening
+        self._open_basis = self._context.subtract(opening.E_open, self._context.multiply(opening.pos_open,
+                                                                                         opening.mid_open))
         self.mids = mids
         self.base_token = base_token
         self.quote_token = quote_token
@@ -444,8 +446,7 @@ class Ledger:
             missing.add(self.instrument)
         equity = None
         if not missing:
-            equity = (self.opening.E_open + (exposure * mid if exposure else ZERO)
-                      - self.opening.pos_open * self.opening.mid_open
+            equity = ((self._open_basis + exposure * mid if exposure else self._open_basis)
                       - self.trade_notional + token_value + self.funding)
         entry = None
         if self._lots and not self._unknown_cost_quantity:
@@ -456,8 +457,9 @@ class Ledger:
                 quantity_n, quantity_d = self._cost_quantity.as_integer_ratio()
                 entry = _ratio_decimal(notional.numerator * quantity_d, notional.denominator * quantity_n,
                                        self._context)
-        flows = self.external_flows
+        flows = None if self.unvalued_transfers else self._external_flows
         net_pnl = None if equity is None or flows is None else equity - self.opening.E_open - flows
-        return EquityPoint(t, equity, mid, self._position(), self._realized_decimal(), entry, mark_valued,
+        return EquityPoint(t, equity, mid, self._base_valuation_exposure() if self.market == "spot" else exposure,
+                           self._realized_decimal(), entry, mark_valued,
                            tuple(sorted(missing)) if missing else (), flows, net_pnl,
                            tuple(sorted(self.unvalued_transfers)) if self.unvalued_transfers else ())
