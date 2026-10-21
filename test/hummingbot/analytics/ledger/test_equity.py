@@ -1,10 +1,23 @@
+import random
 from dataclasses import FrozenInstanceError, replace
-from decimal import Decimal as D
+from decimal import (
+    ROUND_CEILING,
+    ROUND_DOWN,
+    ROUND_FLOOR,
+    ROUND_HALF_EVEN,
+    ROUND_HALF_UP,
+    ROUND_UP,
+    Decimal as D,
+    getcontext,
+    localcontext,
+)
+from fractions import Fraction
 from test.hummingbot.analytics.ledger import Prices
 
 import pytest
 
 from hummingbot.analytics.ledger import Fill, FundingPayment, Ledger, Opening, Transfer
+from hummingbot.analytics.ledger.equity import _ratio_decimal
 
 
 def test_spot_criterion_10():
@@ -280,3 +293,136 @@ def test_token_identifiers_reject_non_strings(field):
 def test_fee_identifier_rejects_non_string():
     with pytest.raises(TypeError):
         Fill(1, "buy", D("1"), D("100"), fee_token=0.5)
+
+
+class ReferenceCosts:
+    """Plain Fraction lots, no incremental shortcuts. Returns realized P&L and entry price exactly."""
+
+    def __init__(self, opening, method, spot):
+        self.method = method
+        self.spot = spot
+        self.lots = []
+        self.realized = Fraction(0)
+        self.known = True
+        if opening.pos_open:
+            self.lots.append([Fraction(opening.pos_open), None if opening.entry_price is None
+                              else Fraction(opening.pos_open) * Fraction(opening.entry_price)])
+
+    def close_and_open(self, q, price, realize=True):
+        q = Fraction(q)
+        while q and self.lots and (q > 0) != (self.lots[0][0] > 0):
+            lot_q, cost = self.lots.pop(0)
+            closed = min(abs(q), abs(lot_q))
+            sign = 1 if lot_q > 0 else -1
+            closed_cost = None if cost is None else cost * closed / abs(lot_q)
+            if realize and self.known:
+                if closed_cost is None:
+                    self.known = False
+                else:
+                    self.realized += closed * sign * Fraction(price) - closed_cost
+            lot_q -= closed * sign
+            q += closed * sign
+            if lot_q:
+                self.lots.insert(0, [lot_q, None if cost is None else cost - closed_cost])
+        if q:
+            cost = None if price is None else q * Fraction(price)
+            if self.method == "wac" and self.lots:
+                lot_q, old_cost = self.lots.pop()
+                self.lots.append([lot_q + q, None if cost is None or old_cost is None else cost + old_cost])
+            else:
+                self.lots.append([q, cost])
+
+    def entry(self):
+        if not self.lots or any(cost is None for _, cost in self.lots):
+            return None
+        return sum(cost for _, cost in self.lots) / sum(lot_q for lot_q, _ in self.lots)
+
+
+def correctly_rounded(ratio, prec):
+    with localcontext() as context:
+        context.prec = prec
+        return D(ratio.numerator) / D(ratio.denominator)
+
+
+@pytest.mark.parametrize("market", ["perpetual", "spot"])
+@pytest.mark.parametrize("method", ["wac", "fifo"])
+@pytest.mark.parametrize("seed", range(4))
+def test_realized_and_entry_match_independent_fraction_costs(market, method, seed):
+    rng = random.Random(seed)
+    opening = Opening(D("1000"), 0, D("100"), D("2.5"), D("99.7")) if seed % 2 else Opening(D("1000"), 0, D("100"))
+    ledger = Ledger(opening, Prices(), market=market, cost_method=method)
+    reference = ReferenceCosts(opening, method, market == "spot")
+    for t in range(1, 400):
+        quantity = D(rng.randrange(1, 4000)) / D(1000)
+        price = D(rng.randrange(9000, 11000)) / D(100)
+        side = rng.choice(["buy", "sell"])
+        base_fee = market == "spot" and rng.random() < 0.3
+        fee = D("0.001") if base_fee else D(0)
+        ledger.apply(Fill(t, side, quantity, price, fee, "SOL" if base_fee else None))
+        reference.close_and_open(quantity if side == "buy" else -quantity, price)
+        if base_fee:
+            reference.close_and_open(-fee, price, realize=False)
+        point = ledger.value(t)
+        prec = ledger._context.prec
+        assert point.realized_pnl == correctly_rounded(reference.realized, prec)
+        want_entry = reference.entry()
+        assert point.entry_price == (None if want_entry is None else correctly_rounded(want_entry, prec))
+
+
+def test_unpriced_base_transfer_wipes_cost_and_keeps_prior_realized_pnl():
+    opening = Opening(D("1000"), 0, D("100"))
+    ledger = Ledger(opening, Prices(), market="spot")
+    ledger.apply(Fill(1, "buy", D("3"), D("100")))
+    ledger.apply(Fill(2, "sell", D("1"), D("110")))
+    assert ledger.value(2).realized_pnl == D("10")
+    ledger.apply(Transfer(3, D("1"), "SOL"))
+    point = ledger.value(3)
+    assert point.realized_pnl == D("10")
+    assert point.entry_price == D("100")
+    ledger = Ledger(opening, Prices({("SOL", 3): None}), market="spot")
+    ledger.apply(Fill(1, "buy", D("3"), D("100")))
+    ledger.apply(Fill(2, "sell", D("1"), D("110")))
+    ledger.apply(Transfer(3, D("1"), "SOL"))
+    assert ledger.value(3).realized_pnl == D("10")
+    assert ledger.value(3).entry_price is None
+    ledger.apply(Fill(4, "sell", D("1"), D("120")))
+    assert ledger.value(4).realized_pnl is None
+
+
+@pytest.mark.parametrize("rounding", [ROUND_HALF_EVEN, ROUND_HALF_UP, ROUND_DOWN, ROUND_UP, ROUND_FLOOR, ROUND_CEILING])
+@pytest.mark.parametrize("sign", [1, -1])
+def test_wide_ratio_rounds_like_decimal_division(rounding, sign):
+    rng = random.Random(7)
+    with localcontext() as context:
+        context.prec = 40
+        context.rounding = rounding
+        for _ in range(60):
+            denominator = rng.randrange(10 ** 300, 10 ** 301)
+            numerator = sign * rng.randrange(1, 10 ** rng.randrange(290, 312))
+            if rng.random() < 0.2:
+                numerator = sign * denominator * rng.randrange(1, 10 ** 8) // 10 ** 3 * 10 ** 3 or sign
+            assert _ratio_decimal(numerator, denominator, context) == D(numerator) / D(denominator)
+
+
+def test_long_wac_run_keeps_exact_cost_basis_and_the_callers_context():
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices())
+    reference = ReferenceCosts(Opening(D("1000"), 0, D("100")), "wac", False)
+    before = repr(getcontext())
+    for t in range(1, 300):
+        side = "buy" if t % 3 else "sell"
+        quantity = D(7 + t % 5) / D(10)
+        price = D(10000 + 7 * t) / D(100)
+        ledger.apply(Fill(t, side, quantity, price))
+        reference.close_and_open(quantity if side == "buy" else -quantity, price)
+    point = ledger.value(299)
+    assert point.realized_pnl == correctly_rounded(reference.realized, ledger._context.prec)
+    assert point.entry_price == correctly_rounded(reference.entry(), ledger._context.prec)
+    assert repr(getcontext()) == before
+
+
+def test_wide_opening_position_cost_is_exact():
+    opening = Opening(D("1000"), 0, D("100"), D("1234567890123456789012345.678"), D("98765432109876543210.987654321"))
+    ledger = Ledger(opening, Prices())
+    ledger.apply(Fill(1, "sell", D("1234567890123456789012345.678"), D("99")))
+    expected = Fraction(opening.pos_open) * (Fraction(99) - Fraction(opening.entry_price))
+    assert ledger.value(1).realized_pnl == correctly_rounded(expected, ledger._context.prec)

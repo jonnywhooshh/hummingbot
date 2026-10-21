@@ -1,45 +1,89 @@
 """Incremental marked equity, independent of realized cost-basis allocation."""
 
 from collections import deque
-from dataclasses import dataclass, fields, is_dataclass
-from decimal import Decimal, localcontext
+from dataclasses import dataclass
+from decimal import Decimal, getcontext, setcontext
 from fractions import Fraction
 from functools import wraps
 from typing import Optional, Union
 
 from hummingbot.analytics.ledger.model import (
+    ONE,
     ZERO,
     Fill,
     FundingPayment,
     Mids,
     Opening,
     Transfer,
+    amount_width,
     decimal_amount,
     venue_time,
 )
 
 
 def accounting_context(operation):
-    """Keep finite sums and products exact without changing the caller's context."""
+    """Run a ledger operation in the ledger's exact context, leaving the caller's untouched.
+
+    The outermost call swaps the context in. Nested calls reuse it. Keyword
+    amounts widen the working precision; positional arguments are never amounts.
+    """
     @wraps(operation)
     def calculate(ledger, *args, **kwargs):
-        previous = ledger._context
-        with localcontext() as context:
-            ledger._context = context
-            try:
-                amounts = []
-                for value in (*args, *kwargs.values()):
-                    if is_dataclass(value):
-                        amounts.extend(getattr(value, field.name) for field in fields(value))
-                    else:
-                        amounts.append(value)
-                ledger._observe(*amounts)
-                return operation(ledger, *args, **kwargs)
-            finally:
-                if previous is not None:
-                    previous.prec = max(previous.prec, context.prec)
-                ledger._context = previous
+        if ledger._active:
+            return operation(ledger, *args, **kwargs)
+        caller = getcontext()
+        setcontext(ledger._context)
+        ledger._active = True
+        try:
+            if kwargs:
+                ledger._observe(*kwargs.values())
+            return operation(ledger, *args, **kwargs)
+        finally:
+            ledger._active = False
+            setcontext(caller)
     return calculate
+
+
+def _exact(value: Union[Decimal, Fraction]) -> Fraction:
+    return value if type(value) is Fraction else Fraction(value)
+
+
+def _add(a: Union[Decimal, Fraction], b: Union[Decimal, Fraction]) -> Union[Decimal, Fraction]:
+    """Add exactly. Decimal sums are exact at the ledger precision. Fractions carry what division produced."""
+    return a + b if type(a) is Decimal and type(b) is Decimal else _exact(a) + _exact(b)
+
+
+def _sub(a: Union[Decimal, Fraction], b: Union[Decimal, Fraction]) -> Union[Decimal, Fraction]:
+    return a - b if type(a) is Decimal and type(b) is Decimal else _exact(a) - _exact(b)
+
+
+def _to_decimal(value: Union[Decimal, Fraction], context) -> Decimal:
+    return _ratio_decimal(*value.as_integer_ratio(), context)
+
+
+def _ratio_decimal(n: int, d: int, context) -> Decimal:
+    """Round a rational to the context precision without converting its full width.
+
+    The truncated quotient carries a sticky digit, so the context rounds as
+    it would the exact ratio under any rounding mode.
+    """
+    if not n:
+        return ZERO
+    if d < 0:
+        n, d = -n, -d
+    if n.bit_length() < 512 and d.bit_length() < 512:
+        return context.divide(Decimal(n), Decimal(d))
+    negative = n < 0
+    n = abs(n)
+    shift = context.prec + 4 - ((n.bit_length() - d.bit_length() - 1) * 30103) // 100000
+    q, r = divmod(n * 10 ** shift, d) if shift >= 0 else divmod(n, d * 10 ** -shift)
+    if r:
+        q, shift = q * 10 + 1, shift + 1
+    else:
+        while shift > 0 and not q % 10:
+            q //= 10
+            shift -= 1
+    return context.plus(Decimal(f"{'-' if negative else ''}{q}E{-shift}"))
 
 
 @dataclass(frozen=True)
@@ -86,8 +130,11 @@ class Ledger:
             raise ValueError("base and quote tokens must be different")
         if market == "perpetual" and opening.pos_open and opening.entry_price is None:
             raise ValueError("an opening perpetual position requires entry_price")
-        self._context = None
+        self._context = getcontext().copy()
+        self._active = False
         self._input_width = 1
+        self._last_mid = None
+        self._count_limit = 10
         self._event_count = 0
         self._observe(opening.E_open, opening.mid_open, opening.pos_open, opening.entry_price)
         self.opening = opening
@@ -106,6 +153,8 @@ class Ledger:
         self.unvalued_transfers = set()
         self.has_transfers = False
         self.fees_by_token = {}
+        self._held = {}
+        self._realized_cache = None
         self.paid_fees_by_token = {}
         self.rebates_by_token = {}
         self.fee_quote_values = {}
@@ -120,46 +169,64 @@ class Ledger:
         self.spread = ZERO
         self.turnover = ZERO
         self.unknown_turnover = ZERO
-        self._realized_pnl = Fraction(0)
+        self._realized_known = True
+        self._proceeds = ZERO
+        self._added_cost = ZERO
+        self._lost_cost = ZERO
         self._lots = deque()
         self._cost_quantity = opening.pos_open
-        self._cost_notional = Fraction(0)
+        self._cost_notional = ZERO
         self._unknown_cost_quantity = ZERO
         if opening.pos_open:
-            cost = None if opening.entry_price is None else Fraction(opening.pos_open) * Fraction(opening.entry_price)
+            cost = None if opening.entry_price is None else self._context.multiply(opening.pos_open, opening.entry_price)
             self._lots.append((opening.pos_open, cost))
             if cost is None:
                 self._unknown_cost_quantity = opening.pos_open
             else:
-                self._cost_notional = cost
+                self._cost_notional = self._added_cost = cost
 
     def _observe(self, *amounts) -> None:
-        for amount in amounts:
-            if isinstance(amount, Decimal) and amount.is_finite():
-                digits = amount.as_tuple()
-                self._input_width = max(self._input_width, len(digits.digits) + abs(digits.exponent))
-        if self._context is not None:
-            self._context.prec = max(self._context.prec, 4 * self._input_width + len(str(self._event_count)) + 16)
+        width = max((amount_width(amount) for amount in amounts if isinstance(amount, Decimal)), default=1)
+        if width > self._input_width:
+            self._input_width = width
+            self._refresh_precision()
+
+    def _refresh_precision(self) -> None:
+        needed = 4 * self._input_width + len(str(self._event_count)) + 16
+        if needed > self._context.prec:
+            self._context.prec = needed
 
     def token_mid(self, token: str, t: int) -> Optional[Decimal]:
         if token == self.quote_token:
-            return Decimal("1")
+            return ONE
         price = self.mids.mid(token, t)
-        if price is not None and decimal_amount(price, "mid") <= ZERO:
-            raise ValueError("mid must be positive")
-        self._observe(price)
+        if price is not None:
+            if decimal_amount(price, "mid") <= ZERO:
+                raise ValueError("mid must be positive")
+            if price is not self._last_mid:
+                self._last_mid = price
+                width = amount_width(price)
+                if width > self._input_width:
+                    self._input_width = width
+                    self._refresh_precision()
         return price
 
     @property
     @accounting_context
     def position(self) -> Decimal:
+        return self._position()
+
+    def _position(self) -> Decimal:
         if self.market == "spot":
-            return self.base_valuation_exposure
+            return self._base_valuation_exposure()
         return self.opening.pos_open + self.trade_quantity
 
     @property
     @accounting_context
     def base_valuation_exposure(self) -> Decimal:
+        return self._base_valuation_exposure()
+
+    def _base_valuation_exposure(self) -> Decimal:
         return (self.opening.pos_open + self.trade_quantity - self.fees_by_token.get(self.base_token, ZERO)
                 + self.transfers_by_token.get(self.base_token, ZERO))
 
@@ -170,29 +237,50 @@ class Ledger:
     @property
     @accounting_context
     def realized_pnl(self) -> Optional[Decimal]:
-        if self._realized_pnl is None:
+        return self._realized_decimal()
+
+    def _realized_decimal(self) -> Optional[Decimal]:
+        if not self._realized_known:
             return None
-        return Decimal(self._realized_pnl.numerator) / Decimal(self._realized_pnl.denominator)
+        cached = self._realized_cache
+        if cached is None or cached[0] != self._context.prec:
+            realized = _add(_add(self._proceeds - self._added_cost, self._lost_cost), self._cost_notional)
+            cached = self._realized_cache = (self._context.prec, _to_decimal(realized, self._context))
+        return cached[1]
 
     @accounting_context
     def apply(self, event: Union[Fill, FundingPayment, Transfer]) -> None:
-        if not isinstance(event, (Fill, FundingPayment, Transfer)):
+        if isinstance(event, Fill):
+            kind = 0
+        elif isinstance(event, FundingPayment):
+            kind = 1
+        elif isinstance(event, Transfer):
+            kind = 2
+        else:
             raise TypeError("expected Fill, FundingPayment, or Transfer")
-        if event.t <= self.opening.t_open or event.t < self.last_t:
+        t = event.t
+        if t <= self.opening.t_open or t < self.last_t:
             raise ValueError("events must follow the opening cut in venue order")
         fee_mid = transfer_mid = None
-        if isinstance(event, Fill) and event.fee:
-            fee_mid = self.token_mid(event.fee_token or self.quote_token, event.t)
-        if isinstance(event, Transfer):
-            transfer_mid = self.token_mid(event.token or self.quote_token, event.t)
-        self.last_t = event.t
+        if kind == 0:
+            if event.fee:
+                fee_mid = self.token_mid(event.fee_token or self.quote_token, t)
+        elif kind == 2:
+            transfer_mid = self.token_mid(event.token or self.quote_token, t)
+        self.last_t = t
         self._event_count += 1
-        self._observe()
-        if isinstance(event, FundingPayment):
+        if event._width > self._input_width:
+            self._input_width = event._width
+            self._refresh_precision()
+        if self._event_count >= self._count_limit:
+            self._count_limit *= 10
+            self._refresh_precision()
+        if kind == 1:
             self.funding += event.amount
-        elif isinstance(event, Transfer):
+        elif kind == 2:
             token = event.token or self.quote_token
-            self.transfers_by_token[token] = self.transfers_by_token.get(token, ZERO) + event.amount
+            self.transfers_by_token[token] = held = self.transfers_by_token.get(token, ZERO) + event.amount
+            self._held[token] = held - self.fees_by_token.get(token, ZERO)
             if event.amount:
                 if transfer_mid is None:
                     self.unvalued_transfers.add(token)
@@ -202,74 +290,93 @@ class Ledger:
             if self.market == "spot" and token == self.base_token:
                 self._apply_cost(event.amount, transfer_mid, realize=False)
         else:
-            q = event.signed_quantity
+            quantity = event.quantity
+            price = event.price
+            notional = quantity * price
+            if event.side == "buy":
+                q, signed_notional = quantity, notional
+            else:
+                q, signed_notional = -quantity, -notional
             self.trade_quantity += q
-            self.trade_notional += q * event.price
-            notional = event.quantity * event.price
+            self.trade_notional += signed_notional
             self.turnover += notional
-            if event.m0 is None:
+            m0 = event.m0
+            if m0 is None:
                 self._unknown_quantity += q
-                self._unknown_notional += q * event.price
+                self._unknown_notional += signed_notional
                 self.unknown_turnover += notional
             else:
-                self.spread += q * (event.m0 - event.price)
+                self.spread += q * (m0 - price)
                 self._known_quantity += q
-                self._known_mid_notional += q * event.m0
-            if event.fee:
+                self._known_mid_notional += q * m0
+            fee = event.fee
+            if fee:
                 token = event.fee_token or self.quote_token
-                self.fees_by_token[token] = self.fees_by_token.get(token, ZERO) + event.fee
-                if event.fee < ZERO:
-                    self.rebates_by_token[token] = self.rebates_by_token.get(token, ZERO) - event.fee
+                self.fees_by_token[token] = fees = self.fees_by_token.get(token, ZERO) + fee
+                self._held[token] = self.transfers_by_token.get(token, ZERO) - fees
+                if fee < ZERO:
+                    self.rebates_by_token[token] = self.rebates_by_token.get(token, ZERO) - fee
                 else:
-                    self.paid_fees_by_token[token] = self.paid_fees_by_token.get(token, ZERO) + event.fee
+                    self.paid_fees_by_token[token] = self.paid_fees_by_token.get(token, ZERO) + fee
                 if fee_mid is None:
                     self.unvalued_fees.add(token)
-                    self._unvalued_fee_quantities[token] = self._unvalued_fee_quantities.get(token, ZERO) + event.fee
+                    self._unvalued_fee_quantities[token] = self._unvalued_fee_quantities.get(token, ZERO) + fee
                 else:
-                    cost = event.fee * fee_mid
+                    cost = fee * fee_mid
                     self.fees_at_fill += cost
                     self.fee_quote_values[token] = self.fee_quote_values.get(token, ZERO) + cost
                 self.fee_valuation_basis[token] = ("mid_unavailable" if token in self.unvalued_fees else
                                                    "quote" if token == self.quote_token else "token_mid_at_fill")
-            self._apply_cost(q, event.price)
-            if self.market == "spot" and event.fee and (event.fee_token or self.quote_token) == self.base_token:
-                self._apply_cost(-event.fee, event.price, realize=False)
+            self._apply_cost(q, price)
+            if self.market == "spot" and fee and (event.fee_token or self.quote_token) == self.base_token:
+                self._apply_cost(-fee, price, realize=False)
 
     def _apply_cost(self, q: Decimal, price: Optional[Decimal], *, realize: bool = True) -> None:
         while q and self._lots and (q > ZERO) != (self._lots[0][0] > ZERO):
             old_q, old_cost = self._lots.popleft()
             closed = min(abs(q), abs(old_q))
-            sign = Decimal("1") if old_q > ZERO else Decimal("-1")
-            closed_cost = None if old_cost is None else old_cost * Fraction(closed) / Fraction(abs(old_q))
-            if realize and self._realized_pnl is not None:
+            sign = ONE if old_q > ZERO else -ONE
+            remaining_cost = ZERO
+            if old_cost is None or closed == abs(old_q):
+                closed_cost = old_cost
+            else:
+                average = _exact(old_cost) / Fraction(abs(old_q))
+                closed_cost = average * Fraction(closed)
+                remaining_cost = average * Fraction(abs(old_q) - closed)
+            if realize and self._realized_known:
+                self._realized_cache = None
                 if closed_cost is None:
-                    self._realized_pnl = None
+                    self._realized_known = False
                 else:
-                    self._realized_pnl += Fraction(closed * sign) * Fraction(price) - closed_cost
+                    self._proceeds += closed * sign * price
+            elif not realize and closed_cost is not None:
+                self._lost_cost = _add(self._lost_cost, closed_cost)
             self._cost_quantity -= closed * sign
             if closed_cost is None:
                 self._unknown_cost_quantity -= closed * sign
             else:
-                self._cost_notional -= closed_cost
+                self._cost_notional = _sub(self._cost_notional, closed_cost) if self._lots else remaining_cost
             old_q -= closed * sign
             q += closed * sign
             if old_q:
-                self._lots.appendleft((old_q, None if old_cost is None else old_cost - closed_cost))
+                self._lots.appendleft((old_q, None if old_cost is None else remaining_cost))
         if q:
             self._cost_quantity += q
-            cost = None if price is None else Fraction(q) * Fraction(price)
+            cost = None if price is None else q * price
             if cost is None:
                 self._unknown_cost_quantity += q
             else:
-                self._cost_notional += cost
+                self._cost_notional = _add(self._cost_notional, cost)
+                self._added_cost += cost
             if self.cost_method == "wac" and self._lots:
                 old_q, old_cost = self._lots.pop()
                 if old_cost is None or cost is None:
                     self._unknown_cost_quantity = self._cost_quantity
-                    self._cost_notional = Fraction(0)
+                    self._lost_cost = _add(self._lost_cost, self._cost_notional)
+                    self._cost_notional = ZERO
                     cost = None
                 else:
-                    cost += old_cost
+                    cost = _add(cost, old_cost)
                 self._lots.append((old_q + q, cost))
             else:
                 self._lots.append((q, cost))
@@ -287,8 +394,7 @@ class Ledger:
             mid = mark
         missing = set()
         token_value = ZERO
-        for token in self.fees_by_token.keys() | self.transfers_by_token.keys():
-            quantity = self.transfers_by_token.get(token, ZERO) - self.fees_by_token.get(token, ZERO)
+        for token, quantity in self._held.items():
             if not quantity:
                 continue
             price = mid if self.market == "spot" and token == self.base_token else self.token_mid(token, t)
@@ -306,9 +412,11 @@ class Ledger:
                       - self.trade_notional + token_value + self.funding)
         entry = None
         if self._lots and not self._unknown_cost_quantity:
-            entry_cost = self._cost_notional / Fraction(self._cost_quantity)
-            entry = Decimal(entry_cost.numerator) / Decimal(entry_cost.denominator)
+            notional_n, notional_d = self._cost_notional.as_integer_ratio()
+            quantity_n, quantity_d = self._cost_quantity.as_integer_ratio()
+            entry = _ratio_decimal(notional_n * quantity_d, notional_d * quantity_n, self._context)
         flows = self.external_flows
         net_pnl = None if equity is None or flows is None else equity - self.opening.E_open - flows
-        return EquityPoint(t, equity, mid, self.position, self.realized_pnl, entry, mark_valued,
-                           tuple(sorted(missing)), flows, net_pnl, tuple(sorted(self.unvalued_transfers)))
+        return EquityPoint(t, equity, mid, self._position(), self._realized_decimal(), entry, mark_valued,
+                           tuple(sorted(missing)) if missing else (), flows, net_pnl,
+                           tuple(sorted(self.unvalued_transfers)) if self.unvalued_transfers else ())

@@ -21,7 +21,8 @@ base_valuation_exposure includes base-token fees and transfers without
 changing perpetual contract position.
 
 Finite accounting sums and products use precision derived from input digit
-width and event count in a local Decimal context. Cost lots retain rational
+width and event count in a Decimal context the ledger copies from the
+caller's at construction and never writes back. Cost lots retain rational
 total costs. Recurring cost-basis and ratio outputs round only on conversion
 to Decimal, without rounding the stored costs.
 """

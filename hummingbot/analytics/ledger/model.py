@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Optional, Protocol
 
 ZERO = Decimal("0")
+ONE = Decimal("1")
 
 
 def decimal_amount(value: Decimal, name: str) -> Decimal:
@@ -13,6 +14,17 @@ def decimal_amount(value: Decimal, name: str) -> Decimal:
     if not value.is_finite():
         raise ValueError(f"{name} must be finite")
     return value
+
+
+def amount_width(*amounts: Optional[Decimal]) -> int:
+    """Digits needed to write the widest finite amount without an exponent."""
+    width = 1
+    for amount in amounts:
+        if amount is not None:
+            _, digits, exponent = amount.as_tuple()
+            if type(exponent) is int:
+                width = max(width, len(digits) + abs(exponent))
+    return width
 
 
 def venue_time(value: int) -> int:
@@ -52,6 +64,7 @@ class Fill:
                 raise TypeError("fee_token must be a string or None for the ledger quote")
             if not self.fee_token:
                 raise ValueError("fee_token must not be empty")
+        object.__setattr__(self, "_width", amount_width(self.quantity, self.price, self.fee, self.m0))
 
     @property
     def signed_quantity(self) -> Decimal:
@@ -68,6 +81,7 @@ class FundingPayment:
     def __post_init__(self):
         venue_time(self.t)
         decimal_amount(self.amount, "amount")
+        object.__setattr__(self, "_width", amount_width(self.amount))
 
 
 @dataclass(frozen=True)
@@ -86,6 +100,7 @@ class Transfer:
                 raise TypeError("token must be a string or None for the ledger quote")
             if not self.token:
                 raise ValueError("token must not be empty")
+        object.__setattr__(self, "_width", amount_width(self.amount))
 
 
 @dataclass(frozen=True)
