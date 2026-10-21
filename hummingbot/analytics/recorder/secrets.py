@@ -15,10 +15,15 @@ def add(value: str) -> None:
 
 
 def scrub(data: AnyStr) -> AnyStr:
-    """Replace exact secure values, longest first. Unchanged input retains its identity."""
+    """Replace exact secure values, longest first. Unchanged str or bytes retains its identity.
+
+    A memoryview is copied to bytes first, because `in` on a memoryview compares elements, not subsequences.
+    """
     if isinstance(data, str):
         values, mark = _text, REDACTED
     else:
+        if isinstance(data, memoryview):
+            data = data.tobytes()
         values, mark = _raw, REDACTED.encode("utf-8")
     for secret in values:
         if secret in data:
