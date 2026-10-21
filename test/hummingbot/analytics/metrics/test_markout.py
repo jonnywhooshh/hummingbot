@@ -165,3 +165,16 @@ class MarkoutTests(TestCase):
             value = getattr(result, name)
             self.assertEqual(Decimal("0"), value, name)
             self.assertFalse(value.is_signed(), name)
+
+    def test_extreme_decimal_exponents_do_not_use_integer_string_conversion(self):
+        for exponent in (5_000, -5_000):
+            with self.subTest(exponent=exponent):
+                base = Decimal((0, (1,), exponent))
+                price = Decimal((0, (1,), exponent - 1))
+                reference = replace(self.reference(), m0=base, mh=base)
+                result = compute_markout(side="buy", quantity=Decimal("1"), price=price,
+                                         reference=reference, fee_quote=Decimal("0"))
+                self.assertEqual(Decimal("9000"), result.edge_bps)
+                self.assertEqual(Fraction(base) - Fraction(price), Fraction(result.edge_value))
+                self.assertEqual(result.edge_value, result.markout_value)
+                self.assertEqual(result.markout_value, result.fee_adjusted_markout_value)

@@ -51,7 +51,8 @@ def _decimal(value: Fraction) -> Decimal:
     if denominator == 1:
         scale = max(twos, fives)
         coefficient = value.numerator * 2 ** (scale - twos) * 5 ** (scale - fives)
-        return Decimal((int(coefficient < 0), tuple(map(int, str(abs(coefficient)))), -scale))
+        digits = Decimal(coefficient).as_tuple()
+        return Decimal((digits.sign, digits.digits, -scale))
     with localcontext(Context(prec=80, rounding=ROUND_HALF_EVEN)):
         return Decimal(value.numerator) / Decimal(value.denominator)
 
