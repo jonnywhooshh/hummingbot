@@ -115,15 +115,14 @@ class RESTResponse:
         headers_ = self._aiohttp_response.headers
         return headers_
 
-    async def _read_body(self) -> bytes:
-        body = await self._aiohttp_response.read()
+    def _record_body(self, body: bytes) -> None:
         capture, self.capture = self.capture, None
         if capture is not None and recorder.ACTIVE:
             transport.rest_body(capture, body)
-        return body
 
     async def json(self) -> Any:
-        byte_string = await self._read_body()
+        byte_string = await self._aiohttp_response.read()
+        self._record_body(byte_string)
         if self._aiohttp_response.content_type == "text/plain" or self._aiohttp_response.content_type == "text/html":
             # aiohttp does not support decoding of text/plain or text/html content types
             # so we need to read the response as bytes and decode it manually
@@ -141,7 +140,8 @@ class RESTResponse:
         return json_
 
     async def text(self) -> str:
-        await self._read_body()
+        byte_string = await self._aiohttp_response.read()
+        self._record_body(byte_string)
         text_ = await self._aiohttp_response.text()
         return text_
 
