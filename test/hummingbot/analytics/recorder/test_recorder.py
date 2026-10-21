@@ -3,6 +3,7 @@ import enum
 import hashlib
 import io
 import json
+import logging
 import threading
 import time
 from decimal import Decimal
@@ -70,30 +71,44 @@ class RecorderTest(RunTestCase):
 
     def test_capture_faults_are_counted_and_logged_only_ten_times_per_hook(self):
         run_dir = self.start()
-        with patch("hummingbot.analytics.recorder.encode_body", side_effect=ValueError("broken capture")):
-            with self.assertLogs("hummingbot.analytics.recorder", level="ERROR") as logs:
+        with self.assertLogs("hummingbot.analytics.recorder", level="ERROR") as logs:
+            with patch("hummingbot.analytics.recorder.encode_body", side_effect=ValueError("broken capture")):
                 for _ in range(12):
                     self.record("clock", {})
+            self.record("clock", {"still": "works"})
+            self.assertTrue(recorder.end_run({"path": "test"}))
         self.assertEqual(10, len(logs.records))
         self.assertEqual(12, recorder.stats()["hook_errors"])
-        self.record("clock", {"still": "works"})
-        self.assertTrue(recorder.end_run({"path": "test"}))
         self.assertEqual("works", self.records(run_dir)[0]["body"]["still"])
 
-    def test_a_failing_log_handler_cannot_raise_into_the_trading_caller(self):
+    def test_capture_faults_are_logged_off_the_calling_thread(self):
         self.start()
+        logged = []
+        with patch.object(recorder.logger, "error", side_effect=lambda *args, **kwargs: logged.append(
+                threading.get_ident())):
+            recorder.hook_error("clock", ValueError("capture"))
+            self.assertEqual([], logged)
+            self.wait_for(lambda: logged)
+        self.assertNotEqual(threading.get_ident(), logged[0])
+
+    def test_a_failing_log_handler_cannot_raise_into_the_trading_caller_or_stop_the_writer(self):
+        run_dir = self.start()
         with patch.object(recorder.logger, "error", side_effect=RuntimeError("bad handler")):
             recorder.hook_error("clock", ValueError("capture"))
+            self.record("clock", {"after": "handler"})
+            self.assertTrue(recorder.end_run({"path": "test"}))
         self.assertEqual(1, recorder.stats()["hook_errors"])
+        self.assertEqual("handler", self.records(run_dir)[0]["body"]["after"])
 
-    def test_hook_name_owns_the_timing_bucket_and_foreign_threads_cannot_change_observation_order(self):
+    def test_hook_name_owns_the_timing_bucket_and_foreign_threads_are_counted_not_recorded(self):
         self.start()
         recorder.record("clock", {}, t0_ns=time.perf_counter_ns(), hook="test_hook")
         self.assertEqual(1, timing.drain()["test_hook"]["count"])
         thread = threading.Thread(target=self.record, args=("clock", {}))
         thread.start()
         thread.join()
-        self.assertEqual(1, recorder.stats()["hook_errors"])
+        self.assertEqual(0, recorder.stats()["hook_errors"])
+        self.assertEqual(1, recorder.stats()["off_thread"])
 
     def test_run_start_or_end_encoding_failure_does_not_escape(self):
         run_dir = self.start()
@@ -188,3 +203,35 @@ class SequenceAccountingTest(RunTestCase):
         row = timing.drain()["clock"]
         self.assertEqual(1, row["count"])
         self.assertGreater(row["total_ns"], 0)
+
+
+class OffThreadTest(RunTestCase):
+    def test_a_log_handler_that_records_from_a_worker_thread_causes_no_error_storm(self):
+        self.start()
+        logger = logging.getLogger("hummingbot.test_off_thread")
+        logger.setLevel(logging.INFO)
+
+        class Handler(logging.Handler):
+            def emit(self, log):
+                recorder.record("log", {"message": log.getMessage()}, t0_ns=time.perf_counter_ns(), hook="log")
+
+        handler = Handler()
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+        worker = threading.Thread(target=logger.info, args=("from the mqtt executor",))
+        worker.start()
+        worker.join()
+        stats = recorder.stats()
+        self.assertEqual((0, 1), (stats["hook_errors"], stats["off_thread"]))
+
+    def test_the_capture_thread_is_a_public_predicate(self):
+        self.assertFalse(recorder.on_capture_thread())
+        self.start()
+        answers = []
+        worker = threading.Thread(target=lambda: answers.append(recorder.on_capture_thread()))
+        worker.start()
+        worker.join()
+        self.assertEqual([False], answers)
+        self.assertTrue(recorder.on_capture_thread())
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        self.assertFalse(recorder.on_capture_thread())
