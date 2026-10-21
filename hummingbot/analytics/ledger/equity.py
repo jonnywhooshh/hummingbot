@@ -1,7 +1,7 @@
 """Incremental marked equity, independent of realized cost-basis allocation."""
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal, getcontext, setcontext
 from fractions import Fraction
 from functools import wraps
@@ -21,11 +21,19 @@ from hummingbot.analytics.ledger.model import (
 )
 
 
+def _amounts(*values):
+    for value in values:
+        if is_dataclass(value):
+            yield from (getattr(value, field.name) for field in fields(value))
+        else:
+            yield value
+
+
 def accounting_context(operation):
     """Run a ledger operation in the ledger's exact context, leaving the caller's untouched.
 
-    The outermost call swaps the context in. Nested calls reuse it. Keyword
-    amounts widen the working precision; positional arguments are never amounts.
+    The outermost call swaps the context in. Nested calls reuse it. Decimal
+    arguments and the Decimal fields of dataclass arguments widen the working precision.
     apply and value inline this swap, because the wrapper's argument tuple and
     dict are garbage-collector work on a path run once per event.
     """
@@ -37,8 +45,7 @@ def accounting_context(operation):
         setcontext(ledger._context)
         ledger._active = True
         try:
-            if kwargs:
-                ledger._observe(*kwargs.values())
+            ledger._observe(*_amounts(*args, *kwargs.values()))
             return operation(ledger, *args, **kwargs)
         finally:
             ledger._active = False

@@ -1,5 +1,5 @@
 import random
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from decimal import (
     ROUND_CEILING,
     ROUND_DOWN,
@@ -17,7 +17,7 @@ from test.hummingbot.analytics.ledger import Prices
 import pytest
 
 from hummingbot.analytics.ledger import Fill, FundingPayment, Ledger, Opening, Transfer
-from hummingbot.analytics.ledger.equity import _ratio_decimal
+from hummingbot.analytics.ledger.equity import _ratio_decimal, accounting_context
 
 
 def test_spot_criterion_10():
@@ -426,3 +426,19 @@ def test_wide_opening_position_cost_is_exact():
     ledger.apply(Fill(1, "sell", D("1234567890123456789012345.678"), D("99")))
     expected = Fraction(opening.pos_open) * (Fraction(99) - Fraction(opening.entry_price))
     assert ledger.value(1).realized_pnl == correctly_rounded(expected, ledger._context.prec)
+
+
+def test_dataclass_arguments_widen_the_ledger_precision():
+    @dataclass(frozen=True)
+    class Report:
+        amount: D
+
+    @accounting_context
+    def working_precision(ledger, report):
+        return ledger._context.prec
+
+    ledger = Ledger(Opening(D("1000"), 0, D("100")), Prices())
+    narrow = working_precision(ledger, Report(D("1.5")))
+    wide = working_precision(ledger, Report(D("0." + "1" * 60)))
+    assert wide >= 4 * 61
+    assert wide > narrow
