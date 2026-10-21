@@ -31,11 +31,12 @@ class Writer:
     """Own all run files. Hook bodies arrive only as immutable bytes, never as live bot objects."""
 
     def __init__(self, run_dir: Path, settings, queue: CaptureQueue, make_gap: GapFactory,
-                 emit_diagnostics: Callable[[], None]):
+                 emit_diagnostics: Callable[[], None], on_dead: Callable[[], None]):
         self.run_dir = run_dir
         self.queue = queue
         self.make_gap = make_gap
         self.emit_diagnostics = emit_diagnostics
+        self.on_dead = on_dead
         self.interval = settings.flush_interval_ms / 1000
         self.segment_max_bytes = settings.segment_max_bytes
         self.segment_max_seconds = settings.segment_max_seconds
@@ -115,6 +116,7 @@ class Writer:
         except Exception:
             self.errors += 1
             self.state = DiskState.FAILED
+            self._stop_capture()
             logger.exception("Analytics writer stopped writing %s.", self.run_dir)
         finally:
             self._give_up()
@@ -177,7 +179,14 @@ class Writer:
             gap_seq, line = self.make_gap(state.value, seq, None, None, state is DiskState.FULL)
             self._append(gap_seq, line, rotate=False)
             self._sync()
+            if state is DiskState.FULL:
+                self._stop_capture()
         return False
+
+    def _stop_capture(self) -> None:
+        """Nothing more can be written, so refuse and release records instead of serializing them for nothing."""
+        self.queue.close()
+        self.on_dead()
 
     def _append(self, seq: int, line: bytes, rotate: bool = True) -> None:
         segment = self._segment
