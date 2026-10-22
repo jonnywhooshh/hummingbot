@@ -80,10 +80,30 @@ async def execute(args):
         print(f"STATE_DIR {state_dir}", flush=True)
 
 
+async def interruptible_execute(args):
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def terminate():
+        if not task.cancelling():
+            task.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, terminate)
+    try:
+        await execute(args)
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, previous)
+
+
 def main():
     args = parser().parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s %(message)s")
-    asyncio.run(execute(args))
+    try:
+        asyncio.run(interruptible_execute(args))
+    except asyncio.CancelledError:
+        raise SystemExit(128 + signal.SIGTERM) from None
 
 
 if __name__ == "__main__":

@@ -39,6 +39,14 @@ service participates in a bot run.
 The guard checks socket destinations, DNS results, and each aiohttp request
 URL, including requests through a loopback proxy.
 
+All bot commands handle SIGTERM through the same cancellation cleanup paths as
+SIGINT. The reference venue watches its parent's process sentinel and exits if
+the parent dies, including on SIGKILL.
+Temporary bot roots include their owner's PID. Starting a bot sweeps same-user
+roots with dead owner PIDs from the system temporary directory, /dev/shm, and
+the selected temporary directory. Live owners, symlinks, and legacy roots
+without PID ownership are left untouched.
+
 All three bot commands accept --pre-start FILE and --post-stop FILE. Each file
 defines main(), which may be synchronous or asynchronous. Both callbacks run in
 the bot process. The first runs before connector or application startup. The

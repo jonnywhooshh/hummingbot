@@ -1,7 +1,9 @@
 import asyncio
 import inspect
 import ipaddress
+import os
 import runpy
+import shutil
 import socket
 import tempfile
 import time
@@ -232,6 +234,33 @@ async def close_http_clients():
         await ConnectionsFactory().close()
 
 
+@contextmanager
+def bot_root(prefix, directory=None):
+    directories = {Path(tempfile.gettempdir()), Path("/dev/shm")}
+    if directory is not None:
+        directories.add(Path(directory))
+    for parent in directories:
+        for owned_prefix in ("fake-backpack-", "fake-backpack-v2-"):
+            for root in parent.glob(f"{owned_prefix}[0-9]*-*"):
+                try:
+                    if root.is_symlink() or not root.is_dir() or root.stat().st_uid != os.getuid():
+                        continue
+                    try:
+                        pid = int(root.name[len(owned_prefix):].partition("-")[0])
+                    except ValueError:
+                        continue
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        shutil.rmtree(root)
+                    except (PermissionError, OverflowError):
+                        pass
+                except FileNotFoundError:
+                    pass
+    with tempfile.TemporaryDirectory(prefix=f"{prefix}{os.getpid()}-", dir=directory) as root:
+        yield root
+
+
 @asynccontextmanager
 async def connected_backpack(pair: str = "SOL-USDC", state_dir=None, pre_start=None, post_stop=None,
                              analytics_dir=None):
@@ -239,7 +268,7 @@ async def connected_backpack(pair: str = "SOL-USDC", state_dir=None, pre_start=N
     await venue.start()
     connector = None
     try:
-        with tempfile.TemporaryDirectory(prefix="fake-backpack-") as directory:
+        with bot_root("fake-backpack-") as directory:
             with bot_environment(venue, Path(directory), analytics_dir) as client:
                 try:
                     await run_callback(pre_start)
@@ -324,7 +353,7 @@ async def v2_headless(controller_yaml, state_dir=None, pre_start=None, post_stop
         venue = FakeBackpackVenue(state_dir=state_dir)
         await venue.start()
     try:
-        with tempfile.TemporaryDirectory(prefix="fake-backpack-v2-", dir=temp_dir) as directory:
+        with bot_root("fake-backpack-v2-", temp_dir) as directory:
             root = Path(directory)
             with bot_environment(venue, root, analytics_dir) as client:
                 (root / "conf/controllers/controller.yml").write_text(Path(controller_yaml).read_text())

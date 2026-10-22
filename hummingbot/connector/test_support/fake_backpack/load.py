@@ -64,6 +64,15 @@ async def produce_load(venue, seconds):
 
 async def venue_worker(connection, state_dir):
     venue = FakeBackpackVenue(state_dir=state_dir)
+    loop = asyncio.get_running_loop()
+    parent = multiprocessing.parent_process()
+    task = asyncio.current_task()
+
+    def parent_exited():
+        loop.remove_reader(parent.sentinel)
+        task.cancel()
+
+    loop.add_reader(parent.sentinel, parent_exited)
     try:
         await venue.start()
         connection.send({"port": venue.port})
@@ -78,6 +87,7 @@ async def venue_worker(connection, state_dir):
                     connection.send(result)
             await asyncio.sleep(0.01)
     finally:
+        loop.remove_reader(parent.sentinel)
         await venue.stop()
 
 
@@ -86,6 +96,8 @@ def process_main(connection, state_dir, cpus):
         if cpus:
             os.sched_setaffinity(0, cpus)
         asyncio.run(venue_worker(connection, state_dir))
+    except asyncio.CancelledError:
+        pass
     except BaseException as error:
         connection.send({"error": repr(error)})
         raise
