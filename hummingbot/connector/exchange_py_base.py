@@ -487,8 +487,11 @@ class ExchangePyBase(ExchangeBase, ABC):
             exception = ex
             raise
         finally:
-            if recorder.ACTIVE:
-                order_hooks.order_result(self, order_id, trading_pair, exchange_order_id, exception)
+            try:
+                if recorder.ACTIVE:
+                    order_hooks.order_result(self, order_id, trading_pair, exchange_order_id, exception)
+            finally:
+                exception = None
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
         exchange_order_id, update_timestamp = await self._place_order(
@@ -610,8 +613,11 @@ class ExchangePyBase(ExchangeBase, ABC):
             exception = ex
             raise
         finally:
-            if recorder.ACTIVE or capture is not None:
-                order_hooks.cancel_result(self, trading_pair, order_id, result, exception, capture)
+            try:
+                if recorder.ACTIVE or capture is not None:
+                    order_hooks.cancel_result(self, trading_pair, order_id, result, exception, capture)
+            finally:
+                exception = None
 
     # === Order Tracking ===
 

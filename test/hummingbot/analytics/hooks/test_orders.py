@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import tempfile
 import weakref
 from decimal import Decimal
@@ -162,6 +163,80 @@ class OrderHooksTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(("failed", "CancelledError", "stopped submission"),
                          (result["outcome"], result["error_type"], result["error"]))
         self.assertEqual([], self.events[MarketEvent.OrderFailure].event_log)
+
+    async def test_failed_call_frames_are_released_without_cyclic_gc(self):
+        class Payload:
+            pass
+
+        for capture in (False, True):
+            for operation in ("create", "cancel"):
+                for error_type in (OSError, asyncio.CancelledError, BaseException):
+                    with self.subTest(capture=capture, operation=operation, error_type=error_type):
+                        order_id = f"{capture}-{operation}-{error_type.__name__}"
+                        if operation == "cancel":
+                            await self.create(order_id)
+                        references = []
+
+                        async def fail_venue(*args, **kwargs):
+                            payload = Payload()
+                            references.append(weakref.ref(payload))
+                            raise error_type("venue failed")
+
+                        venue_method = "_place_order" if operation == "create" else "_place_cancel"
+                        gc_enabled = gc.isenabled()
+                        gc.disable()
+                        try:
+                            with patch.object(recorder, "ACTIVE", capture), \
+                                    patch.object(self.exchange, "logger"), \
+                                    patch.object(self.exchange, venue_method, new=fail_venue):
+                                propagated = False
+                                try:
+                                    if operation == "create":
+                                        await self.create(order_id)
+                                    else:
+                                        await self.exchange._execute_cancel("SOL-USDC", order_id)
+                                except BaseException as error:
+                                    propagated = True
+                                    self.assertIsInstance(error, error_type)
+                                self.assertEqual(error_type is not OSError, propagated)
+                                await asyncio.sleep(0)
+                            self.assertEqual(1, len(references))
+                            self.assertIsNone(references[0]())
+                        finally:
+                            if gc_enabled:
+                                gc.enable()
+
+    async def test_trading_exception_identity_and_traceback_survive_capture(self):
+        await self.create()
+        for operation in ("create", "cancel"):
+            for error_type in (asyncio.CancelledError, BaseException):
+                with self.subTest(operation=operation, error_type=error_type):
+                    failure = error_type("trading failed")
+                    tracebacks = []
+
+                    async def fail_venue(*args, **kwargs):
+                        try:
+                            raise failure
+                        except BaseException as error:
+                            tracebacks.append(error.__traceback__)
+                            raise
+
+                    venue_method = "_place_order" if operation == "create" else "_place_cancel"
+                    with patch.object(self.exchange, venue_method, new=fail_venue):
+                        propagated = False
+                        try:
+                            if operation == "create":
+                                await self.create("traceback")
+                            else:
+                                await self.exchange._execute_cancel("SOL-USDC", "order")
+                        except BaseException as error:
+                            propagated = True
+                            self.assertIs(failure, error)
+                            traceback = error.__traceback__
+                            while traceback.tb_next is not None:
+                                traceback = traceback.tb_next
+                            self.assertIs(tracebacks[0], traceback)
+                        self.assertTrue(propagated)
 
     async def test_cancel_success_missing_order_false_return_and_swallowed_errors(self):
         await self.create()
