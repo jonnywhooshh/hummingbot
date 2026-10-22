@@ -49,10 +49,10 @@ class Pending(NamedTuple):
 def snapshot(value: Any, exact: bool = True) -> Tuple[Any, int]:
     """Copy value into a tree the writer can encode later, and bound the length of that encoding from above.
 
-    Containers are copied and immutable values are kept. Whatever ujson would read lazily from a live object is read
-    now. Decimal becomes exact text and a non-finite float becomes text, before ujson could write a binary float or a
-    non-JSON constant. exact=False covers values that toDict and the fallback return, which ujson writes unconverted.
-    Text is bounded by ujson's worst case: 6 bytes per ASCII character and 12 per other code point, a surrogate pair.
+    The copy shares no container with value and keeps immutable values by reference. It reads now whatever ujson would
+    read lazily from a live object. Decimal and non-finite floats become text, before ujson could write a binary float
+    or a non-JSON constant. exact=False covers values that toDict and the fallback return, which ujson writes as is.
+    The bound assumes ujson's worst case of 6 bytes for an ASCII character and 12 for any other code point.
     """
     kind = type(value)
     if kind is str:
