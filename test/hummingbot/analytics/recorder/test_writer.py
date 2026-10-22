@@ -1,15 +1,19 @@
 import gzip
 import hashlib
+import io
 import json
 import os
 import threading
 import time
-from test.hummingbot.analytics.recorder.support import RunTestCase
+from test.hummingbot.analytics.recorder.support import Plain, RunTestCase
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from hummingbot.analytics import recorder
+from hummingbot.analytics.commands import dump
 from hummingbot.client.config.client_config_map import AnalyticsConfigMap
+
+UNENCODABLE = {b"\xff": "a bytes key that is not UTF-8 fails only when ujson writes it"}
 
 
 def manifest(run_dir):
@@ -128,6 +132,24 @@ class WriterFailureTest(RunTestCase):
         first.writer_dead()
         self.assertTrue(recorder.ACTIVE)
 
+    def test_a_record_the_writer_cannot_encode_becomes_an_exact_gap_and_a_hook_error(self):
+        run_dir = self.start(log_level="ERROR")
+        self.record("clock", {"n": 1})
+        self.record("clock", UNENCODABLE)
+        self.record("clock", {"n": 3})
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        records = self.records(run_dir)
+        self.assertEqual([1, 3], [row["body"]["n"] for row in records if row["kind"] == "clock"])
+        self.assertEqual([{"type": "queue_full", "first_seq": 2, "last_seq": 2, "count": 1, "priority_dropped": True}],
+                         [row["body"] for row in records if row["kind"] == "capture_gap"])
+        self.assertEqual(["Analytics hook clock failed, occurrence 1."],
+                         [row["body"]["message"] for row in records if row["kind"] == "log"])
+        self.assertEqual({"clock": 1}, recorder.stats()["hook_errors_by_hook"])
+        counters = records[-1]["body"]["counters"]
+        self.assertEqual((1, 1), (counters["dropped"], counters["hook_errors"]))
+        out = io.BytesIO()
+        self.assertEqual(0, dump.main(["--run", str(run_dir), "--verify"], out), out.getvalue())
+
 
 class DiskFloorTest(RunTestCase):
     def setUp(self):
@@ -165,13 +187,12 @@ class DiskFloorTest(RunTestCase):
                            "priority_dropped": True}], gaps)
         self.assertNotIn("run_end", json.loads((run_dir / "run.json").read_bytes()))
 
-    def test_a_framing_loss_is_reported_before_the_disk_full_gap(self):
+    def assert_loss_reported_before_disk_full(self, **lost_record):
         run_dir = self.start(min_free_bytes=5000, hard_min_free_bytes=2000)
         self.record("clock", {})
         self.wait_for(lambda: recorder.stats()["written"] == 1)
         recorder.pause()
-        with patch.object(recorder, "frame", side_effect=ValueError("framing failed")):
-            self.record("clock", {})
+        self.record("clock", **lost_record)
         self.record("clock", {})
         self.free = 1000
         recorder.resume()
@@ -180,6 +201,12 @@ class DiskFloorTest(RunTestCase):
         gaps = [row["body"] for row in self.records(run_dir) if row["kind"] == "capture_gap"]
         self.assertEqual(["queue_full", "disk_full"], [gap["type"] for gap in gaps])
         self.assertEqual((2, 2, 1), (gaps[0]["first_seq"], gaps[0]["last_seq"], gaps[0]["count"]))
+
+    def test_a_trading_thread_framing_loss_is_reported_before_the_disk_full_gap(self):
+        self.assert_loss_reported_before_disk_full(body={}, exchange_order_id=Plain.A)
+
+    def test_a_writer_encoding_loss_is_reported_before_the_disk_full_gap(self):
+        self.assert_loss_reported_before_disk_full(body=UNENCODABLE)
 
     def test_activate_refuses_below_min_free_bytes_without_creating_a_run(self):
         self.free = 100

@@ -7,14 +7,22 @@ import logging
 import threading
 import time
 from decimal import Decimal
-from test.hummingbot.analytics.recorder.support import RunTestCase
+from test.hummingbot.analytics.recorder.support import CORPUS, RunTestCase, inline_body_json
 from unittest.mock import patch
 from uuid import UUID
 
+import ujson
+
 from hummingbot.analytics import recorder
 from hummingbot.analytics.commands import dump
-from hummingbot.analytics.recorder import accounts, timing
+from hummingbot.analytics.recorder import accounts, segments, timing
+from hummingbot.analytics.recorder.envelope import frame, payload_size
 from hummingbot.client.config.client_config_map import AnalyticsConfigMap
+
+
+class Broken:
+    def __repr__(self):
+        raise ValueError("broken capture")
 
 
 class RecorderTest(RunTestCase):
@@ -74,12 +82,31 @@ class RecorderTest(RunTestCase):
                                                        "client_order_id", "exchange_order_id")))
         self.assertGreater(record["hook_ns"], 0)
 
+    def test_changing_or_reusing_a_body_after_record_never_changes_what_is_written(self):
+        run_dir = self.start()
+        recorder.pause()
+        body = {"text": "first", "levels": [[1, 2]], "meta": {"side": "buy"}, "pair": ("SOL", ["USDC"])}
+        self.record("clock", body)
+        body["text"] = "second"
+        body["levels"][0].append(3)
+        body["meta"]["side"] = "sell"
+        body["pair"][1][0] = "USDT"
+        body["added"] = True
+        self.record("clock", body)
+        body.clear()
+        recorder.resume()
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        first, second = [row["body"] for row in self.records(run_dir) if row["kind"] == "clock"]
+        self.assertEqual({"text": "first", "levels": [[1, 2]], "meta": {"side": "buy"}, "pair": ["SOL", ["USDC"]]},
+                         first)
+        self.assertEqual({"text": "second", "levels": [[1, 2, 3]], "meta": {"side": "sell"},
+                          "pair": ["SOL", ["USDT"]], "added": True}, second)
+
     def test_capture_faults_are_counted_and_logged_only_ten_times_per_hook(self):
         run_dir = self.start()
         with self.assertLogs("hummingbot.analytics.recorder", level="ERROR") as logs:
-            with patch("hummingbot.analytics.recorder.encode_body", side_effect=ValueError("broken capture")):
-                for _ in range(12):
-                    self.record("clock", {})
+            for _ in range(12):
+                self.record("clock", {"value": Broken()})
             self.record("clock", {"still": "works"})
             self.assertTrue(recorder.end_run({"path": "test"}))
             self.wait_for(lambda: len(logs.records) == 10)
@@ -162,9 +189,8 @@ class RecorderTest(RunTestCase):
 
     def test_run_start_or_end_encoding_failure_does_not_escape(self):
         run_dir = self.start()
-        with patch("hummingbot.analytics.recorder.encode_body", side_effect=ValueError("bad body")):
-            recorder.write_run_start({})
-            self.assertFalse(recorder.end_run({}))
+        recorder.write_run_start({"value": Broken()})
+        self.assertFalse(recorder.end_run({"value": Broken()}))
         self.assertNotIn("run_end", json.loads((run_dir / "run.json").read_bytes()))
 
     def test_an_activation_filesystem_error_leaves_capture_disabled(self):
@@ -260,8 +286,7 @@ class SequenceAccountingTest(RunTestCase):
     def test_failed_calls_are_counted_in_hook_timing(self):
         self.start()
         timing.drain()
-        with patch("hummingbot.analytics.recorder.encode_body", side_effect=ValueError("broken")):
-            self.record("clock", {})
+        self.record("clock", {"value": Broken()})
         row = timing.drain()["clock"]
         self.assertEqual(1, row["count"])
         self.assertGreater(row["total_ns"], 0)
@@ -349,3 +374,57 @@ class PayloadBytesTest(RunTestCase):
         self.assertEqual(len(text.encode("utf-8", "surrogatepass")), ws["payload_bytes"])
         self.assertEqual(0, recorder.stats()["hook_errors"])
         self.assertEqual([], [row for row in records if row["kind"] == "capture_gap"])
+
+
+class DeferredEncodingTest(RunTestCase):
+    def test_the_trading_thread_hands_records_to_the_writer_without_encoding_them(self):
+        self.start()
+        accounts.set("venue", "key")
+        threads = []
+        real_dumps = ujson.dumps
+
+        def spy(*args, **kwargs):
+            threads.append(threading.get_ident())
+            return real_dumps(*args, **kwargs)
+
+        with patch.object(ujson, "dumps", side_effect=spy):
+            self.record("ws_in", recorder.payload('{"stream":"depth.SOL_USDC_PERP"}' * 64), connector="venue")
+            self.record("order_request", {"price": Decimal("1.5"), "levels": [{"quantity": 1}]}, connector="venue",
+                        trading_pair="SOL-USDC", client_order_id="o", exchange_order_id="x")
+            self.wait_for(lambda: recorder.stats()["written"] == 2)
+        self.assertTrue(threads)
+        self.assertNotIn(threading.get_ident(), threads)
+
+    def test_each_line_matches_the_inline_encoding_and_fits_the_bytes_the_queue_charged(self):
+        run_dir = self.start()
+        accounts.set("venue", "key")
+        ids = dict(connector="venue", client_order_id='o"1\x7f', exchange_order_id=8886774)
+        recorder.pause()
+        charged = []
+        for body in CORPUS:
+            before = recorder.stats()["queue_bytes"]
+            self.record("rest", body, **ids)
+            charged.append(recorder.stats()["queue_bytes"] - before)
+        recorder.resume()
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        lines = [line + b"\n" for line in segments.iter_records(run_dir) if json.loads(line)["kind"] == "rest"]
+        self.assertEqual(len(CORPUS), len(lines))
+        for body, line, size in zip(CORPUS, lines, charged):
+            with self.subTest(body=body):
+                row = json.loads(line)
+                inline = {**body, "account_id": accounts.get("venue")}
+                body_json = inline_body_json(inline)
+                self.assertEqual(frame(row["seq"], row["run_id"], "rest", row["t_wall_ns"], row["t_mono_ns"],
+                                       row["hook_ns"], "venue", None, None, None, 'o"1\x7f', 8886774, body_json,
+                                       payload_size(inline, body_json)), line)
+                self.assertLessEqual(len(line), size)
+
+    def test_hook_ns_runs_from_hook_entry_to_enqueue(self):
+        run_dir = self.start()
+        t0_ns = time.perf_counter_ns()
+        recorder.record("clock", {"offset_ms": 1}, t0_ns=t0_ns, hook="clock")
+        elapsed = time.perf_counter_ns() - t0_ns
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        hook_ns = self.records(run_dir)[0]["hook_ns"]
+        self.assertGreater(hook_ns, 0)
+        self.assertLessEqual(hook_ns, elapsed)
