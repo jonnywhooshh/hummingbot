@@ -312,7 +312,10 @@ class RunTest(IsolatedAsyncioWrapperTestCase):
         app = SimpleNamespace(trading_core=core, logger=lambda: Mock(), notify=Mock())
         app.trading_core.strategy = None
         with patch.object(TradingCore, "stop_clock", AsyncMock()):
-            await StopCommand.stop_loop(app, skip_order_cancellation=True)
+            try:
+                raise ValueError("unrelated caller exception")
+            except ValueError:
+                await StopCommand.stop_loop(app, skip_order_cancellation=True)
         self.assertFalse(recorder.stats()["active"])
         end = json.loads((run_dir / "run.json").read_text())["run_end"]
         self.assertEqual((end["path"], end["reason"], end["exception"]), ("stop_command", "user", None))
@@ -325,10 +328,12 @@ class RunTest(IsolatedAsyncioWrapperTestCase):
         connector = FakeConnector()
         run.connector_created("stop", connector, {"api_key": "stop-key"})
         core.strategy = Mock(spec=StrategyV2Base)
-        core.strategy.on_stop = AsyncMock(side_effect=ValueError("stop-key"))
+        failure = ValueError("stop-key")
+        core.strategy.on_stop = AsyncMock(side_effect=failure)
         app = SimpleNamespace(trading_core=core, logger=lambda: Mock(), notify=Mock())
-        with self.assertRaisesRegex(ValueError, "stop-key"):
+        with self.assertRaisesRegex(ValueError, "stop-key") as raised:
             await StopCommand.stop_loop(app, skip_order_cancellation=True)
+        self.assertIs(raised.exception, failure)
         self.assertFalse(recorder.stats()["active"])
         self.assertEqual(connector.get_listeners(MarketEvent.OrderFilled), [])
         end = json.loads((run_dir / "run.json").read_text())["run_end"]
