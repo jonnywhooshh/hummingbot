@@ -309,6 +309,24 @@ class OrderHooksTest(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(await self.exchange._execute_cancel("SOL-USDC", "order"))
         self.assertIsNone(orders._cancel.get())
 
+    async def test_cancel_result_restores_nested_context_even_if_its_clock_fails(self):
+        for capture in (False, True):
+            for error_type in (RuntimeError, asyncio.CancelledError, KeyboardInterrupt, SystemExit, BaseException):
+                with self.subTest(capture=capture, error_type=error_type):
+                    saved = orders._cancel.set(None)
+                    try:
+                        parent_token = orders.cancel_request(self.exchange, "SOL-USDC", "parent")
+                        parent = orders._cancel.get()
+                        token = orders.cancel_request(self.exchange, "SOL-USDC", "child")
+                        with patch.object(recorder, "ACTIVE", capture), \
+                                patch.object(orders, "perf_counter_ns", side_effect=error_type("clock failed")):
+                            orders.cancel_result(self.exchange, "SOL-USDC", "child", None, None, token)
+                        self.assertIs(parent, orders._cancel.get())
+                        orders.cancel_result(self.exchange, "SOL-USDC", "parent", None, None, parent_token)
+                        self.assertIsNone(orders._cancel.get())
+                    finally:
+                        orders._cancel.reset(saved)
+
     async def test_clock_records_stored_sample_counter_and_connector_account(self):
         synchronizer = self.exchange._time_synchronizer
         for offset in (1234.5, 2345.75, 3456.0):
