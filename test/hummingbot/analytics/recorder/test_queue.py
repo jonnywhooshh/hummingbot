@@ -1,103 +1,116 @@
 import unittest
+from collections import deque
 from test.hummingbot.analytics.recorder.support import RunTestCase
-from unittest.mock import patch
 
 from hummingbot.analytics import recorder
+from hummingbot.analytics.recorder.envelope import Pending
 from hummingbot.analytics.recorder.queue import CaptureQueue
 
-LINE = b"x" * 100
+
+def pending(seq, priority=False, size=100):
+    return Pending(seq, priority, size, "clock", "clock", 0, 0, 0, (None,) * 6, {})
+
+
+def seqs(records):
+    return [record.seq for record in records]
 
 
 class CaptureQueueTest(unittest.TestCase):
     def test_bulk_bound_and_priority_reserve_are_independent_admission_limits(self):
         queue = CaptureQueue(250, 500)
-        self.assertEqual([True, True, False], [queue.offer(seq, False, LINE) for seq in (1, 2, 3)])
+        self.assertEqual([True, True, False], [queue.offer(pending(seq)) for seq in (1, 2, 3)])
         self.assertEqual(200, queue.depth_bytes)
-        self.assertEqual([True, True, True, False], [queue.offer(seq, True, LINE) for seq in (4, 5, 6, 7)])
+        self.assertEqual([True, True, True, False], [queue.offer(pending(seq, True)) for seq in (4, 5, 6, 7)])
         self.assertEqual((2, 1), (queue.dropped, queue.dropped_priority))
         self.assertEqual([(3, 3, False), (7, 7, True)], queue.take_drops())
-        self.assertEqual((1, False, LINE), queue.pop())
+        self.assertEqual(1, queue.pop().seq)
         self.assertEqual(400, queue.depth_bytes)
-        self.assertEqual((2, False, LINE), queue.pop())
-        self.assertEqual((4, True, LINE), queue.pop())
-        self.assertEqual((5, True, LINE), queue.pop())
-        self.assertEqual((6, True, LINE), queue.pop())
+        self.assertEqual([2, 4, 5, 6], [queue.pop().seq for _ in range(4)])
         self.assertIsNone(queue.pop())
         self.assertEqual(0, queue.depth_bytes)
 
     def test_ongoing_drop_snapshots_do_not_lose_or_repeat_any_sequence(self):
         queue = CaptureQueue(0, 0)
-        queue.offer(1, False, LINE)
-        queue.offer(2, True, LINE)
+        queue.offer(pending(1))
+        queue.offer(pending(2, True))
         self.assertEqual([(1, 2, True)], queue.take_drops())
-        queue.offer(3, False, LINE)
+        queue.offer(pending(3))
         self.assertEqual([(3, 3, False)], queue.take_drops())
-        queue.offer(5, False, LINE)
+        queue.offer(pending(5))
         self.assertEqual([(5, 5, False)], queue.take_drops())
         queue.seal_drops()
         self.assertEqual([], queue.take_drops())
 
-    def test_pop_batch_returns_the_oldest_items_in_order_and_releases_their_bytes(self):
+    def test_pop_batch_returns_the_oldest_records_in_order_and_releases_their_bytes(self):
         queue = CaptureQueue(10_000, 10_000)
         for seq in range(1, 6):
-            queue.offer(seq, seq % 2 == 0, LINE)
-        self.assertEqual([(1, False, LINE), (2, True, LINE), (3, False, LINE)], queue.pop_batch(3, 10_000))
+            queue.offer(pending(seq, seq % 2 == 0))
+        self.assertEqual([1, 2, 3], seqs(queue.pop_batch(3, 10_000)))
         self.assertEqual(200, queue.depth_bytes)
-        self.assertEqual([(4, True, LINE), (5, False, LINE)], queue.pop_batch(10, 10_000))
+        self.assertEqual([4, 5], seqs(queue.pop_batch(10, 10_000)))
         self.assertEqual([], queue.pop_batch(10, 10_000))
         self.assertEqual(0, queue.depth_bytes)
 
-    def test_pop_batch_sizes_the_batch_by_bytes_but_always_returns_one_item(self):
+    def test_pop_batch_sizes_the_batch_by_bytes_but_always_returns_one_record(self):
         queue = CaptureQueue(10_000, 10_000)
         for seq in range(1, 8):
-            queue.offer(seq, False, LINE)
-        self.assertEqual([1, 2, 3], [item[0] for item in queue.pop_batch(256, 300)])
-        self.assertEqual([4], [item[0] for item in queue.pop_batch(256, 10)])
+            queue.offer(pending(seq))
+        self.assertEqual([1, 2, 3], seqs(queue.pop_batch(256, 300)))
+        self.assertEqual([4], seqs(queue.pop_batch(256, 10)))
 
-    def test_pop_batch_uses_actual_bytes_when_middle_lines_are_larger(self):
+    def test_pop_batch_uses_each_charged_size_when_middle_records_are_larger(self):
         queue = CaptureQueue(10_000, 10_000)
         for seq, size in enumerate((1, 400, 400, 1), start=1):
-            queue.offer(seq, False, b"x" * size)
-        self.assertEqual([1, 2], [item[0] for item in queue.pop_batch(100, 500)])
+            queue.offer(pending(seq, size=size))
+        self.assertEqual([1, 2], seqs(queue.pop_batch(100, 500)))
         self.assertEqual(401, queue.depth_bytes)
 
-    def test_pop_batch_does_not_undershoot_because_of_a_large_last_line(self):
+    def test_pop_batch_does_not_undershoot_because_of_a_large_last_record(self):
         queue = CaptureQueue(10_000, 10_000)
         for seq, size in enumerate((100, 100, 100, 600), start=1):
-            queue.offer(seq, False, b"x" * size)
-        self.assertEqual([1, 2, 3], [item[0] for item in queue.pop_batch(100, 500)])
-        self.assertEqual([4], [item[0] for item in queue.pop_batch(100, 500)])
+            queue.offer(pending(seq, size=size))
+        self.assertEqual([1, 2, 3], seqs(queue.pop_batch(100, 500)))
+        self.assertEqual([4], seqs(queue.pop_batch(100, 500)))
         self.assertEqual(0, queue.depth_bytes)
 
-    def test_close_between_offer_and_push_rejects_and_counts_the_record(self):
+    def test_a_close_that_lands_just_before_the_append_rejects_and_counts_the_record(self):
         queue = CaptureQueue(1000, 1000)
-        push = queue.push
 
-        def close_then_push(seq, line, priority=True):
-            queue.close()
-            return push(seq, line, priority)
+        class ClosedFirst(deque):
+            def append(self, record):
+                queue.close()
+                super().append(record)
 
-        with patch.object(queue, "push", side_effect=close_then_push):
-            self.assertFalse(queue.offer(1, True, LINE))
+        queue.items = ClosedFirst()
+        self.assertFalse(queue.offer(pending(1, True)))
         self.assertEqual((0, 1, 1, 0, 0),
                          (queue.accepted, queue.dropped, queue.dropped_priority, len(queue), queue.depth_bytes))
+        self.assertEqual([(1, 1, True)], queue.take_drops())
 
-    def test_close_during_push_cannot_leave_a_record_pinned(self):
+    def test_a_close_that_drains_just_after_the_append_counts_the_record_once(self):
         queue = CaptureQueue(1000, 1000)
-        seal = queue.seal_drops
 
-        def seal_then_close():
-            seal()
-            queue.close()
+        class ClosedAfter(deque):
+            def append(self, record):
+                super().append(record)
+                queue.close()
 
-        with patch.object(queue, "seal_drops", side_effect=seal_then_close):
-            self.assertFalse(queue.offer(1, False, LINE))
-        self.assertEqual((0, 1, 0, 0), (queue.accepted, queue.dropped, len(queue), queue.depth_bytes))
+        queue.items = ClosedAfter()
+        self.assertTrue(queue.offer(pending(1)))
+        self.assertEqual((1, 1, 0, 0), (queue.accepted, queue.dropped, len(queue), queue.depth_bytes))
+        self.assertEqual([], queue.take_drops())
+
+    def test_a_closed_queue_refuses_lifecycle_records_and_counts_them(self):
+        queue = CaptureQueue(1000, 1000)
+        queue.close()
+        self.assertFalse(queue.push(pending(1, True)))
+        self.assertEqual((0, 1, 1, 0, 0),
+                         (queue.accepted, queue.dropped, queue.dropped_priority, len(queue), queue.depth_bytes))
 
     def test_close_counts_every_discarded_record_and_is_idempotent(self):
         queue = CaptureQueue(1000, 1000)
         for seq in range(1, 4):
-            queue.offer(seq, seq % 2 == 0, LINE)
+            queue.offer(pending(seq, seq % 2 == 0))
         queue.pop()
         queue.close()
         queue.close()

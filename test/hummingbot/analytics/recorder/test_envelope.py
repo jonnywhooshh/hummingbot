@@ -1,13 +1,50 @@
 import base64
 import hashlib
 import json
+import random
+import struct
 import unittest
 from decimal import Decimal
 from enum import IntEnum
+from test.hummingbot.analytics.recorder.support import CORPUS, inline_body_json
 
 import ujson
 
-from hummingbot.analytics.recorder.envelope import encode_body, frame, gap_line, payload, payload_size
+from hummingbot.analytics.recorder.envelope import encode_body, frame, gap_line, payload, payload_size, snapshot
+
+_CHARACTERS = [chr(code) for code in range(0x80)] + ["é", "雪", "\u2028", "\udcff", "\ud83d", "\U0001f600", "𝄞"]
+
+
+def _random_text(rng):
+    return "".join(rng.choice(_CHARACTERS) for _ in range(rng.randint(0, 40)))
+
+
+def _random_float(rng):
+    return rng.choice([struct.unpack("d", struct.pack("Q", rng.getrandbits(64)))[0], rng.uniform(-1e6, 1e6),
+                       float("nan"), float("inf"), -0.0, 5e-324, -1.7976931348623157e308])
+
+
+def _random_value(rng, depth=0):
+    choice = rng.randrange(10 if depth < 4 else 7)
+    if choice == 0:
+        return _random_text(rng)
+    if choice == 1:
+        return rng.choice([0, -1, rng.getrandbits(rng.randint(1, 200)) * rng.choice((1, -1))])
+    if choice == 2:
+        return _random_float(rng)
+    if choice == 3:
+        return Decimal(f"{rng.randint(-10 ** 30, 10 ** 30)}E{rng.randint(-40, 40)}")
+    if choice == 4:
+        return rng.choice([None, True, False])
+    if choice == 5:
+        return rng.choice([Decimal("NaN"), Decimal("-Infinity"), Decimal("sNaN")])
+    if choice == 6:
+        return _random_text(rng).encode("utf-8", "surrogatepass")
+    if choice == 7:
+        return {_random_text(rng): _random_value(rng, depth + 1) for _ in range(rng.randint(0, 5))}
+    if choice == 8:
+        return [_random_value(rng, depth + 1) for _ in range(rng.randint(0, 5))]
+    return tuple(_random_value(rng, depth + 1) for _ in range(rng.randint(0, 5)))
 
 
 class EnvelopeTest(unittest.TestCase):
@@ -93,3 +130,13 @@ class EnvelopeTest(unittest.TestCase):
         self.assertEqual({"type": "queue_full", "first_seq": 3, "last_seq": 8, "count": 6,
                           "priority_dropped": True}, record["body"])
         self.assertEqual((10, "capture_gap", None), (record["seq"], record["kind"], record["connector"]))
+
+    def test_a_snapshot_encodes_exactly_like_the_inline_encoder_within_its_bound(self):
+        rng = random.Random(20261022)
+        bodies = CORPUS + [{_random_text(rng): _random_value(rng) for _ in range(rng.randint(0, 6))}
+                           for _ in range(3000)]
+        for index, body in enumerate(bodies):
+            with self.subTest(index=index):
+                expected = inline_body_json(body)
+                self.assertEqual(expected, encode_body(body))
+                self.assertLessEqual(len(expected), snapshot(body)[1])
