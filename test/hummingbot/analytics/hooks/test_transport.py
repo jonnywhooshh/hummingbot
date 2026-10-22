@@ -1,21 +1,27 @@
 import asyncio
 import base64
 import hashlib
+import itertools
 import json
 import os
 import statistics
 import tempfile
 import time
 import unittest
+from collections import defaultdict
+from decimal import Decimal
 from pathlib import Path
 from test.hummingbot.analytics.recorder.support import RunTestCase
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import aiohttp
 from aiohttp import web
 from aioresponses import aioresponses
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
 from hummingbot.analytics import recorder, redaction
 from hummingbot.analytics.hooks import transport
@@ -340,6 +346,45 @@ class TransportTest(IsolatedAsyncioWrapperTestCase):
                 await connection.connect("wss://ws.backpack.exchange/")
         self.assertFalse(connection._capture.authenticated)
 
+    async def test_fixed_socket_url_does_not_need_repeated_url_redaction(self):
+        message = aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, '{"ok":true}', "")
+        connection, _ = await self.socket([message])
+        with patch.object(redaction, "clean_url", side_effect=AssertionError("URL already cleaned")), \
+                patch.object(redaction, "connector_of", side_effect=AssertionError("connector already known")):
+            await connection.send(WSJSONRequest({"method": "PING"}))
+            self.assertEqual({"ok": True}, (await connection.receive()).data)
+            await connection.disconnect()
+        recorder.end_run({})
+        rows = RunTestCase.records(self.run_dir)
+        kinds = [row["kind"] for row in rows if row["kind"] != "run_end"]
+        self.assertEqual(["ws_conn", "ws_out", "ws_in", "ws_conn"], kinds)
+        self.assertEqual(0, recorder.stats()["hook_errors"])
+
+    async def test_socket_url_cache_tracks_new_secure_values(self):
+        message = aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, '{"ok":true}', "")
+        connection, _ = await self.socket([message], url="wss://ws.backpack.exchange/late-secret?echo=late-secret")
+        secrets.add("late-secret")
+        await connection.receive()
+        self.assertEqual("wss://ws.backpack.exchange/<redacted>?echo=%3Credacted%3E",
+                         self.records("ws_in")[0]["body"]["url"])
+
+    async def test_socket_url_cache_tracks_reconnects_while_capture_is_disabled(self):
+        message = aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, '{"ok":true}', "")
+        connection, socket = await self.socket([message])
+        with patch.object(recorder, "ACTIVE", False):
+            await connection.disconnect()
+            with patch.object(self.session, "ws_connect", AsyncMock(return_value=socket)):
+                await connection.connect("ws://127.0.0.2:8123/private?key=never-record")
+        await connection.send(WSJSONRequest({"key": "never-record"}))
+        await connection.receive()
+        recorder.end_run({})
+        rows = RunTestCase.records(self.run_dir)
+        received = next(row for row in rows if row["kind"] == "ws_in")
+        sent = next(row for row in rows if row["kind"] == "ws_out")
+        self.assertEqual("/private", received["body"]["url"])
+        self.assertIsNone(received["connector"])
+        self.assertEqual("outbound_omitted", sent["body"]["outbound"])
+
     async def test_unknown_or_unparseable_ws_payload_is_omitted(self):
         connection, socket = await self.socket()
         await connection.send(WSBinaryRequest(b"\xffunregistered-key"))
@@ -501,3 +546,119 @@ class RedactionTest(unittest.TestCase):
         unchanged = {"key": [1, "plain"]}
         self.assertEqual((unchanged, False), redaction.scrub_tree(unchanged))
         self.assertEqual((["<redacted>"], True), redaction.scrub_tree(("configured-secret",)))
+
+
+class TransportEquivalenceTest(unittest.TestCase):
+    def test_records_match_pre_optimization_bytes_and_priority(self):
+        """Reference digests come from 117508c36c21 with the same frozen corpus."""
+        grouped = defaultdict(list)
+        for priority, line in self.corpus():
+            grouped[json.loads(line)["kind"]].append(bytes([priority]) + line)
+        actual = {kind: (len(lines), hashlib.sha256(b"".join(lines)).hexdigest()) for kind, lines in grouped.items()}
+        self.assertEqual({
+            "ws_conn": (16, "ab15c1e1d6582ea07e6ef611f8156979" "b1c2ae8badeea1f5b49dd2a6d7536a3f"),
+            "ws_in": (40, "95e56b6e012cea1189012fb8b4321889" "db9afd32b19c9a75e8be4343ee85c65e"),
+            "ws_out": (28, "a1e8a416ce1d8892306f75f033dc5484" "49577ef38e0a39007f177af6c00ba7ca"),
+            "rest": (85, "d0fc49a7e4f1561b4632490f0643cba1" "165a855c6695f98585a0422f279f301a"),
+            "rest_body": (81, "afc9f8d95bfcaf96ed45c2754fdb2eef" "727cd7bfcfde52fb9a3a52a83596655d"),
+        }, actual)
+
+    @staticmethod
+    def corpus():
+        """Freeze enqueue bytes and priority with the clocks and identities held constant."""
+        rows = []
+        with tempfile.TemporaryDirectory() as root:
+            config = AnalyticsConfigMap(enabled=True, dir=root, min_free_bytes=0, hard_min_free_bytes=0)
+            recorder.activate(config)
+            try:
+                with patch.object(recorder._run, "run_id", "00000000-0000-7000-8000-000000000000"), \
+                        patch.object(recorder._run, "counter", itertools.count(1)), \
+                        patch.object(recorder._run.queue, "offer",
+                                     side_effect=lambda seq, priority, line: rows.append((priority, line))), \
+                        patch.object(recorder, "time_ns", return_value=30000), \
+                        patch.object(recorder, "monotonic_ns", return_value=20000), \
+                        patch.object(recorder, "perf_counter_ns", return_value=11000), \
+                        patch.object(transport, "perf_counter_ns", return_value=10000), \
+                        patch.object(transport, "monotonic_ns", return_value=15000), \
+                        patch.object(transport, "_request_ids", itertools.count(1)), \
+                        patch.object(recorder.accounts, "get", return_value="backpack_perpetual:0123456789abcdef"), \
+                        patch.object(secrets, "_text", ()), patch.object(secrets, "_raw", ()):
+                    secrets.add("configured-secret")
+                    secrets.add("a+/ secret=value")
+                    urls = (None, "wss://ws.backpack.exchange/",
+                            "ws://user:password@127.0.0.1:8123/雪?echo=a%2B%2F+secret%3Dvalue#fragment",
+                            "ws://127.0.0.2/private?key=unregistered")
+                    messages = (
+                        (aiohttp.WSMsgType.TEXT, '{"p":0.1000000000000000055,"s":"雪\\n\\"\\\\/\\u007f"}', ""),
+                        (aiohttp.WSMsgType.TEXT, "configured-secret " + "x" * 17408, ""),
+                        (aiohttp.WSMsgType.BINARY, b"\x00\xff\x80configured-secret", ""),
+                        (aiohttp.WSMsgType.BINARY, "雪".encode(), ""),
+                        (aiohttp.WSMsgType.PING, b"\xff", ""),
+                        (aiohttp.WSMsgType.PONG, b"pong", ""),
+                        (aiohttp.WSMsgType.CLOSE, 1001, "going away"),
+                        (aiohttp.WSMsgType.CLOSED, None, ""),
+                        (aiohttp.WSMsgType.ERROR, ValueError("configured-secret"), "extra"),
+                    )
+                    requests = (
+                        WSJSONRequest({"method": "SUBSCRIBE", "signature": ["key", "signature", "123", "5000"]}),
+                        WSJSONRequest({"note": ["configured-secret", {"a+/ secret=value": True}]}),
+                        WSJSONRequest({"signature": ("key", "signature")}),
+                        WSPlainTextRequest(' { "signature": ["key","sig"], "p": 0.1000000000000000055 } '),
+                        WSPlainTextRequest(' { "p": 0.1000000000000000055, "s": "雪" } '),
+                        WSPlainTextRequest("not JSON configured-secret"),
+                        WSBinaryRequest(b"\xffconfigured-secret"),
+                    )
+                    for index, url in enumerate(urls):
+                        socket = transport.SocketCapture(index + 1, url)
+                        transport.ws_conn(socket, "connect")
+                        for kind, data, extra in messages:
+                            transport.ws_in(socket, aiohttp.WSMessage(kind, data, extra))
+                        for request in requests:
+                            original = repr(request.payload)
+                            transport.ws_out(socket, request)
+                            assert original == repr(request.payload)
+                        transport.ws_in(socket, aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, '{"fill":"private"}', ""))
+                        for event, error in (("timeout", asyncio.TimeoutError()), ("error", ValueError("configured-secret")),
+                                             ("disconnect", None)):
+                            transport.ws_conn(socket, event, error)
+                    urls = ("https://api.backpack.exchange/api/v1/order",
+                            "https://user:password@api.backpack.exchange/api/v1/order?echo=configured-secret#fragment",
+                            "http://127.0.0.2/api/v1/order?key=unregistered")
+                    bodies = (None, {"configured-secret": ["configured-secret", {"p": Decimal("0.1000000000000000055")}]},
+                              [1, {"p": Decimal("1.0000000000000000001"), "nan": float("nan")}],
+                              '{"auth":{"token":"unregistered"}}', "configured-secret",
+                              b"\xffconfigured-secret", bytearray(b"configured-secret"), memoryview(b"configured-secret"),
+                              object())
+                    for url in urls:
+                        for data in bodies:
+                            request = RESTRequest(RESTMethod.POST, url,
+                                                  params=MappingProxyType({"echo": "a+/ secret=value", "symbol": "SOL"}),
+                                                  headers=CIMultiDictProxy(CIMultiDict([
+                                                      ("X-API-Key", "key"), ("X-Signature", "sig"), ("X-Window", "5000")])),
+                                                  data=data)
+                            original = repr((request.params, request.headers, request.data))
+                            response = SimpleNamespace(request_info=SimpleNamespace(url=URL(url)), status=200,
+                                                       headers=CIMultiDictProxy(CIMultiDict([
+                                                           ("X-Echo", "configured-secret"), ("X-Repeat", "first"),
+                                                           ("X-Repeat", "second")])))
+                            sent = transport.rest_sent()
+                            capture = transport.rest(sent, request, response, None)
+                            assert capture is not None
+                            for body in (b'{"p":0.1000000000000000055}', b"\x00\xff\x80", "雪".encode()):
+                                transport.rest_body(capture, body)
+                            response.request_info.url = URL("https://api.backpack.exchange/final?echo=configured-secret")
+                            assert transport.rest(sent, request, response, None) is not None
+                            transport.rest(sent, request, None, ValueError("configured-secret"))
+                            assert original == repr((request.params, request.headers, request.data))
+                    rules = redaction.Rules(("X-API-Key",), ("token",), (("signature", 0),), (("auth", "token"),))
+                    with patch.dict(redaction.TABLE, {"backpack_perpetual": rules}):
+                        request = RESTRequest(RESTMethod.POST, "https://api.backpack.exchange/path?token=one&token=two",
+                                              params={"token": "three"}, headers={"X-API-Key": "key"},
+                                              data={"auth": {"token": "unregistered"}, "keep": ("configured-secret", 2)})
+                        for data in (request.data, '{"auth":{"token":"unregistered"}}', "not JSON", b"\xff"):
+                            request.data = data
+                            transport.rest(transport.rest_sent(), request, None, asyncio.CancelledError())
+                    assert recorder.stats()["hook_errors"] == 0, recorder.stats()
+            finally:
+                recorder.end_run({})
+        return rows
