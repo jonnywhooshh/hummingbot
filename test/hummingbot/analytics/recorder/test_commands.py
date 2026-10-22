@@ -67,6 +67,26 @@ class CommandsTest(RunTestCase):
             self.assertEqual(result, dump.main(["--run", str(run_dir), "--verify"], out))
             self.assertIn(text, out.getvalue())
 
+    def test_verify_reports_only_the_seqs_no_gap_explains(self):
+        def gap(first, last):
+            return dict(type="queue_full", first_seq=first, last_seq=last, count=last - first + 1,
+                        priority_dropped=False)
+
+        cases = [([{"seq": 1}, {"seq": 3}, {"seq": 6, "kind": "capture_gap", "body": gap(5, 5)}],
+                  [b"unexplained missing seq 2-2", b"unexplained missing seq 4-4"]),
+                 ([{"seq": 1}, {"seq": 61, "kind": "capture_gap", "body": gap(16, 60)}],
+                  [b"unexplained missing seq 2-15"]),
+                 ([{"seq": 1}, {"seq": 20, "kind": "capture_gap", "body": gap(5, 7)},
+                   {"seq": 21, "kind": "capture_gap", "body": gap(10, 12)}],
+                  [b"unexplained missing seq 2-4", b"unexplained missing seq 8-9", b"unexplained missing seq 13-19"])]
+        for records, expected in cases:
+            out = io.BytesIO()
+            self.assertEqual(1, dump.main(["--run", str(self.fixture_run(records)), "--verify"], out))
+            reported = out.getvalue().split(b"\n")[0]
+            self.assertEqual(len(expected), reported.count(b"unexplained missing seq"), reported)
+            for text in expected:
+                self.assertIn(text, reported)
+
     def test_dump_accepts_open_ended_disk_gaps_and_rejects_missing_files_or_corruption(self):
         run_dir = self.fixture_run([{"seq": 1}, {"seq": 4, "kind": "capture_gap",
                                                  "body": dict(type="disk_low", first_seq=2, last_seq=None)}])

@@ -105,8 +105,15 @@ def _verify(chosen: List[segments.Source], manifest_partial: int) -> Tuple[bool,
     for first, last in missing:
         cursor = first
         for start, end in explained:
-            if start <= cursor <= end:
-                cursor = end + 1
+            if end < cursor:
+                continue
+            if start > last:
+                break
+            if start > cursor:
+                problems.append(f"unexplained missing seq {cursor}-{start - 1}")
+            cursor = max(cursor, end + 1)
+            if cursor > last:
+                break
         if cursor <= last:
             problems.append(f"unexplained missing seq {cursor}-{last}")
     closed = sum(source.entry is not None for source in chosen)
