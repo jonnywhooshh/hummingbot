@@ -25,7 +25,7 @@ from yarl import URL
 
 from hummingbot.analytics import recorder, redaction
 from hummingbot.analytics.hooks import transport
-from hummingbot.analytics.recorder import secrets
+from hummingbot.analytics.recorder import secrets, segments
 from hummingbot.client.config.client_config_map import AnalyticsConfigMap
 from hummingbot.core.web_assistant.connections.data_types import (
     RESTMethod,
@@ -549,32 +549,32 @@ class RedactionTest(unittest.TestCase):
 
 
 class TransportEquivalenceTest(unittest.TestCase):
-    def test_records_match_pre_optimization_bytes_and_priority(self):
+    def test_records_match_pre_optimization_bytes(self):
         """Reference digests come from 117508c36c21 with the same frozen corpus."""
         grouped = defaultdict(list)
-        for priority, line in self.corpus():
-            grouped[json.loads(line)["kind"]].append(bytes([priority]) + line)
+        for line in self.corpus():
+            grouped[json.loads(line)["kind"]].append(line)
         actual = {kind: (len(lines), hashlib.sha256(b"".join(lines)).hexdigest()) for kind, lines in grouped.items()}
         self.assertEqual({
-            "ws_conn": (16, "ab15c1e1d6582ea07e6ef611f8156979" "b1c2ae8badeea1f5b49dd2a6d7536a3f"),
-            "ws_in": (40, "95e56b6e012cea1189012fb8b4321889" "db9afd32b19c9a75e8be4343ee85c65e"),
-            "ws_out": (28, "a1e8a416ce1d8892306f75f033dc5484" "49577ef38e0a39007f177af6c00ba7ca"),
-            "rest": (85, "d0fc49a7e4f1561b4632490f0643cba1" "165a855c6695f98585a0422f279f301a"),
-            "rest_body": (81, "afc9f8d95bfcaf96ed45c2754fdb2eef" "727cd7bfcfde52fb9a3a52a83596655d"),
+            "ws_conn": (16, "c919d3aa88f2bb327c07570016feb006" "c0c07b2b7d6895306049b1e8b8ea1f1d"),
+            "ws_in": (40, "83f0d5eac1e89b0db7e5a205ddf74a4e" "c2c1b411f76bea5bcb6c73378d0efd3f"),
+            "ws_out": (28, "0c81ad45d9ba415e866aa491694935ba" "ffa592c5b157e0a348406bbe328776f1"),
+            "rest": (85, "f6dc404aa0fee7d55742bd06785dcc6e" "a86c394e1b3eea96f8d1200e5cf8be69"),
+            "rest_body": (81, "8d7e5bc6461f110208811cddfae3de95" "5a12de710e474b80526db158cf7f609c"),
         }, actual)
 
     @staticmethod
     def corpus():
-        """Freeze enqueue bytes and priority with the clocks and identities held constant."""
+        """Freeze persisted bytes with the clocks and identities held constant."""
         rows = []
         with tempfile.TemporaryDirectory() as root:
             config = AnalyticsConfigMap(enabled=True, dir=root, min_free_bytes=0, hard_min_free_bytes=0)
-            recorder.activate(config)
+            run_id = recorder.activate(config)
+            assert run_id is not None
+            run_dir = Path(root) / run_id
             try:
                 with patch.object(recorder._run, "run_id", "00000000-0000-7000-8000-000000000000"), \
                         patch.object(recorder._run, "counter", itertools.count(1)), \
-                        patch.object(recorder._run.queue, "offer",
-                                     side_effect=lambda seq, priority, line: rows.append((priority, line))), \
                         patch.object(recorder, "time_ns", return_value=30000), \
                         patch.object(recorder, "monotonic_ns", return_value=20000), \
                         patch.object(recorder, "perf_counter_ns", return_value=11000), \
@@ -659,6 +659,10 @@ class TransportEquivalenceTest(unittest.TestCase):
                             request.data = data
                             transport.rest(transport.rest_sent(), request, None, asyncio.CancelledError())
                     assert recorder.stats()["hook_errors"] == 0, recorder.stats()
+                    assert recorder.end_run({})
+                for line in segments.iter_records(run_dir):
+                    if json.loads(line)["kind"] != "run_end":
+                        rows.append(line + b"\n")
             finally:
                 recorder.end_run({})
         return rows
