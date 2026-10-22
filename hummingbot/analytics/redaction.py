@@ -3,6 +3,7 @@
 Host attribution cannot distinguish Backpack spot from perpetual accounts because they share endpoints.
 The production hosts and the fake venue's IPv4 loopback host use backpack_perpetual.
 Unknown hosts retain only outbound method, URL path, and timing. Inbound payloads stay verbatim.
+Tree redaction handles dict, list, and tuple containers without changing caller-owned values.
 """
 from functools import lru_cache
 from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
@@ -93,15 +94,17 @@ def clean_url(connector: Optional[str], url: str) -> Tuple[str, Tuple[str, ...]]
 
 def redact_items(items: Optional[Mapping[Any, Any]],
                  names: Tuple[str, ...]) -> Tuple[Optional[Dict[Any, Any]], List[str]]:
-    """Copy a header or parameter mapping to a plain dict with the named values replaced, matching names case-blind."""
+    """Redact named values case-blind, copying only when replacing a value or converting a non-dict mapping."""
     if items is None:
         return None, []
     folded = _folded(names)
-    result = dict(items)
+    result = items if isinstance(items, dict) else dict(items)
     removed: List[str] = []
     for key in result:
         name = folded.get(str(key).casefold())
         if name is not None:
+            if result is items:
+                result = dict(items)
             result[key] = REDACTED
             removed.append(name)
     return result, removed
@@ -119,7 +122,7 @@ def redact_paths(data: Any, paths: Sequence[JsonPath]) -> Tuple[Any, List[str]]:
 
 
 def _replace(node: Any, path: JsonPath) -> Any:
-    if not isinstance(node, (Mapping, list, tuple)):
+    if not isinstance(node, (dict, list, tuple)):
         return node
     key, rest = path[0], path[1:]
     try:
@@ -129,7 +132,7 @@ def _replace(node: Any, path: JsonPath) -> Any:
     replacement = _replace(child, rest) if rest else REDACTED
     if replacement is child:
         return node
-    copy: Any = dict(node) if isinstance(node, Mapping) else list(node)
+    copy: Any = dict(node) if isinstance(node, dict) else list(node)
     copy[key] = replacement
     return copy
 
@@ -142,7 +145,7 @@ def scrub_tree(node: Any) -> Tuple[Any, bool]:
     if isinstance(node, (str, bytes, bytearray, memoryview)):
         scrubbed = secrets.scrub(node)
         return scrubbed, scrubbed != node
-    if isinstance(node, Mapping):
+    if isinstance(node, dict):
         changed = False
         result = {}
         for key, value in node.items():
