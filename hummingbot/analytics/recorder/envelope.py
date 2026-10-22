@@ -88,7 +88,7 @@ def gap_line(seq: int, run_id: str, gap_type: str, first_seq: int, last_seq: Opt
 def payload_size(body: Dict[str, Any], body_json: str) -> int:
     if "text" in body:
         text = body["text"]
-        return len(text) if text.isascii() else len(text.encode("utf-8"))
+        return len(text) if text.isascii() else len(text.encode("utf-8", "surrogatepass"))
     if "b64" in body:
         return len(body["b64"]) * 3 // 4 - len(body["b64"]) + len(body["b64"].rstrip("="))
     return len(body_json)

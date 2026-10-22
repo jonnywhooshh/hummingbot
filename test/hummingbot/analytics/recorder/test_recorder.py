@@ -336,3 +336,16 @@ class PayloadBytesTest(RunTestCase):
         self.assertTrue(recorder.end_run({}))
         sizes = {row["kind"]: row["payload_bytes"] for row in self.records(run_dir)}
         self.assertEqual((0, 6), (sizes["clock"], sizes["ws_in"]))
+
+    def test_a_lone_surrogate_in_a_payload_text_does_not_lose_the_record(self):
+        text = "frame \udcff end"
+        run_dir = self.start()
+        self.record("ws_in", {"text": text})
+        self.record("clock", {})
+        self.assertTrue(recorder.end_run({}))
+        records = self.records(run_dir)
+        ws = next(row for row in records if row["kind"] == "ws_in")
+        self.assertEqual(text, ws["body"]["text"])
+        self.assertEqual(len(text.encode("utf-8", "surrogatepass")), ws["payload_bytes"])
+        self.assertEqual(0, recorder.stats()["hook_errors"])
+        self.assertEqual([], [row for row in records if row["kind"] == "capture_gap"])
