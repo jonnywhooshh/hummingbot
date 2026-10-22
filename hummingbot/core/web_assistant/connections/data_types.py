@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 import aiohttp
 import ujson
 
+from hummingbot.analytics import recorder
+from hummingbot.analytics.hooks import transport
+
 if TYPE_CHECKING:
     from hummingbot.core.web_assistant.connections.ws_connection import WSConnection
 
@@ -90,6 +93,7 @@ class RESTResponse:
 
     def __init__(self, aiohttp_response: aiohttp.ClientResponse):
         self._aiohttp_response = aiohttp_response
+        self.capture: Optional[transport.Capture] = None
 
     @property
     def url(self) -> str:
@@ -111,12 +115,18 @@ class RESTResponse:
         headers_ = self._aiohttp_response.headers
         return headers_
 
+    def _record_body(self, body: bytes) -> None:
+        capture, self.capture = self.capture, None
+        if capture is not None and recorder.ACTIVE:
+            transport.rest_body(capture, body)
+
     async def json(self) -> Any:
+        byte_string = await self._aiohttp_response.read()
+        self._record_body(byte_string)
         if self._aiohttp_response.content_type == "text/plain" or self._aiohttp_response.content_type == "text/html":
             # aiohttp does not support decoding of text/plain or text/html content types
             # so we need to read the response as bytes and decode it manually
             # https://docs.aiohttp.org/en/stable/client_reference.html#aiohttp.ClientResponse.json
-            byte_string = await self._aiohttp_response.read()
             if isinstance(byte_string, bytes):
                 decoded_string = byte_string.decode('utf-8')
                 try:
@@ -130,6 +140,8 @@ class RESTResponse:
         return json_
 
     async def text(self) -> str:
+        byte_string = await self._aiohttp_response.read()
+        self._record_body(byte_string)
         text_ = await self._aiohttp_response.text()
         return text_
 
