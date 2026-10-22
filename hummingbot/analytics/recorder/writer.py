@@ -127,6 +127,10 @@ class Writer:
     def _step(self) -> bool:
         self._check_disk()
         self._write_run_json(self.run_json)
+        if self.state is not DiskState.FAILED and DiskState.FULL not in self._gaps_written:
+            for first, last, priority in self.queue.take_drops():
+                seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
+                self._append(seq, line, rotate=self.state is not DiskState.FULL)
         batch = self.queue.pop_batch(BATCH_ITEMS, BATCH_BYTES)
         if batch:
             self._check_deadline()
@@ -134,10 +138,6 @@ class Writer:
                 for seq, priority, line in batch:
                     if self._admit(seq, priority):
                         self._append(seq, line)
-        if self.state not in (DiskState.FULL, DiskState.FAILED):
-            for first, last, priority in self.queue.take_drops():
-                seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
-                self._append(seq, line)
         if self._segment is not None:
             self._segment.flush()
         if time.monotonic() - self._last_sync >= self.interval:
