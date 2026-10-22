@@ -1,6 +1,9 @@
-"""Synchronous transport capture. Callers check recorder.ACTIVE before entering a hook."""
+"""Synchronous transport capture. Callers check recorder.ACTIVE before entering a hook.
+
+Socket URL metadata is cached until the URL or the immutable secure-value registry changes.
+"""
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import monotonic_ns, perf_counter_ns
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
@@ -13,11 +16,18 @@ from hummingbot.analytics.recorder import secrets
 _request_ids = itertools.count(1)
 
 
+class _SocketURL(NamedTuple):
+    source: Optional[str]
+    secure_values: Tuple[str, ...]
+    value: Tuple[Optional[str], Optional[str]]
+
+
 @dataclass(slots=True)
 class SocketCapture:
     connection_id: int
     url: Optional[str] = None
     authenticated: bool = False
+    _url_metadata: Optional[_SocketURL] = field(default=None, init=False, repr=False)
 
 
 class Sent(NamedTuple):
@@ -36,7 +46,7 @@ class Capture(NamedTuple):
 def ws_in(socket: SocketCapture, msg: aiohttp.WSMessage) -> None:
     try:
         t0_ns = perf_counter_ns()
-        connector, clean = _ws_url(socket.url)
+        connector, clean = _ws_url(socket)
         body: Dict[str, Any] = {"connection_id": socket.connection_id, "url": clean, "msg_type": msg.type.name}
         kind = msg.type
         if kind in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY, aiohttp.WSMsgType.PING, aiohttp.WSMsgType.PONG):
@@ -54,7 +64,7 @@ def ws_in(socket: SocketCapture, msg: aiohttp.WSMessage) -> None:
 def ws_out(socket: SocketCapture, request: Any) -> None:
     try:
         t0_ns = perf_counter_ns()
-        connector = redaction.connector_of(socket.url)
+        connector, _ = _ws_url(socket)
         rules = redaction.rules_for(connector)
         body: Dict[str, Any] = {"connection_id": socket.connection_id}
         removed: List[str] = []
@@ -77,7 +87,7 @@ def ws_out(socket: SocketCapture, request: Any) -> None:
 def ws_conn(socket: SocketCapture, event: str, error: Optional[BaseException] = None) -> None:
     try:
         t0_ns = perf_counter_ns()
-        connector, clean = _ws_url(socket.url)
+        connector, clean = _ws_url(socket)
         body = {"connection_id": socket.connection_id, "url": clean, "event": event,
                 "error": None if error is None else secrets.scrub(f"{type(error).__name__}: {error}")}
         recorder.record("ws_conn", body, t0_ns=t0_ns, hook="ws_conn", connector=connector)
@@ -114,9 +124,13 @@ def rest(sent: Sent, request: Any, aiohttp_resp: Optional[aiohttp.ClientResponse
             removed += by_name
             body["data"] = _rest_data(request.data, rules, removed)
         if aiohttp_resp is not None:
-            final_url, by_name = redaction.clean_url(connector, str(aiohttp_resp.request_info.url))
-            removed += by_name
-            body["final_url"] = final_url
+            raw_final_url = str(aiohttp_resp.request_info.url)
+            if raw_final_url == request.url:
+                body["final_url"] = url
+            else:
+                final_url, by_name = redaction.clean_url(connector, raw_final_url)
+                removed += by_name
+                body["final_url"] = final_url
         if error is not None:
             body["error"] = f"{type(error).__name__}: {error}" if rules is not None else type(error).__name__
         body, hit = redaction.scrub_tree(body)
@@ -146,12 +160,19 @@ def rest_body(capture: Capture, data: bytes) -> None:
         recorder.hook_error("rest_body", error)
 
 
-def _ws_url(url: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-    if url is None:
-        return None, None
-    connector = redaction.connector_of(url)
-    clean, _ = redaction.clean_url(connector, url)
-    return connector, secrets.scrub(clean)
+def _ws_url(socket: SocketCapture) -> Tuple[Optional[str], Optional[str]]:
+    cached = socket._url_metadata
+    secure_values = secrets._text
+    if cached is not None and cached.source == socket.url and cached.secure_values is secure_values:
+        return cached.value
+    if socket.url is None:
+        value = None, None
+    else:
+        connector = redaction.connector_of(socket.url)
+        clean, _ = redaction.clean_url(connector, socket.url)
+        value = connector, secrets.scrub(clean)
+    socket._url_metadata = _SocketURL(socket.url, secure_values, value)
+    return value
 
 
 def _ws_text(data: Any, rules: redaction.Rules, removed: List[str]) -> Optional[str]:
