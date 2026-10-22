@@ -50,14 +50,19 @@ def encode_body(body: Dict[str, Any]) -> str:
     return ujson.dumps(exact(body), ensure_ascii=True, escape_forward_slashes=False, default=_fallback)
 
 
-def _quote(value: Optional[str]) -> str:
-    return "null" if value is None else _ascii(value)
+def _quote(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, str) and "\x7f" not in value:
+        return _ascii(value)
+    return ujson.dumps(value, ensure_ascii=True, escape_forward_slashes=False)
 
 
 def frame(seq: int, run_id: str, kind: str, t_wall_ns: int, t_mono_ns: int, hook_ns: int,
           connector: Optional[str], trading_pair: Optional[str], controller_id: Optional[str],
           executor_id: Optional[str], client_order_id: Optional[str], exchange_order_id: Optional[str],
           body_json: str, payload_bytes: int = 0) -> bytes:
+    """Keep the legacy ujson header representation, including numeric identifiers and literal DEL bytes."""
     # run_id is a generated UUID and kind a KINDS key, so only the caller-supplied identifiers need escaping.
     return (f'{{"seq":{seq},"run_id":"{run_id}","kind":"{kind}","t_wall_ns":{t_wall_ns},"t_mono_ns":{t_mono_ns},'
             f'"hook_ns":{hook_ns},"payload_bytes":{payload_bytes},"connector":{_quote(connector)},'
