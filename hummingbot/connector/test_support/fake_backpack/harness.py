@@ -138,13 +138,26 @@ def loopback_network():
         yield
 
 
+_LIVE_EVENT_LOGS: ContextVar[Optional[list["EventLog"]]] = ContextVar("fake_backpack_event_logs", default=None)
+
+
 class EventLog:
     def __init__(self, connector):
         self.items = []
         self._changed = asyncio.Event()
+        self._connector = connector
         self._forwarder = SourceInfoEventForwarder(self._on)
         for tag in MarketEvent:
             connector.add_listener(tag, self._forwarder)
+        live = _LIVE_EVENT_LOGS.get()
+        if live is not None:
+            live.append(self)
+
+    def close(self):
+        connector, self._connector = self._connector, None
+        if connector is not None:
+            for tag in MarketEvent:
+                connector.remove_listener(tag, self._forwarder)
 
     def _on(self, tag, source, event):
         self.items.append((time.monotonic(), MarketEvent(tag), event))
@@ -159,6 +172,18 @@ class EventLog:
                 self._changed.clear()
                 await self._changed.wait()
         return await asyncio.wait_for(wait(), timeout)
+
+
+@contextmanager
+def event_log_lifetime():
+    live = []
+    token = _LIVE_EVENT_LOGS.set(live)
+    try:
+        yield
+    finally:
+        _LIVE_EVENT_LOGS.reset(token)
+        for log in live:
+            log.close()
 
 
 async def run_callback(path):
@@ -181,6 +206,7 @@ def bot_environment(venue, root: Path, analytics_dir=None):
     (conf / "conf_fee_overrides.yml").write_text("{}\n")
     (root / "data").mkdir(exist_ok=True)
     with ExitStack() as stack:
+        stack.enter_context(event_log_lifetime())
         stack.enter_context(loopback_network())
         stack.enter_context(patch.object(RateOracle, "_shared_instance", RateOracle(source=FixedRateSource())))
         for name in ("_instance", "_shared_client", "_ws_independent_session"):

@@ -31,6 +31,13 @@ The context exposes the application, strategy, connectors, ticks, and executors.
 Only ungated controller iterations count toward --ticks. Shutdown uses stop_loop.
 After the requested ticks, run-v2 waits for its drive script to finish. There is
 no implicit post-tick timeout. Cancellation still stops the script and strategy.
+The harness owns every EventLog created while a bot runs, including logs that a
+venue script builds in drive. It keeps each one referenced and registered on its
+connector until the bot has stopped, then calls close, which removes its
+listeners. The connector's pubsub holds listeners by weak reference and
+dereferences them without a check during dispatch, so a log that went out of
+scope while registered could be collected mid-dispatch and crash the bot.
+Outside the harness, call EventLog.close before dropping the last reference.
 Strategy discovery uses the checkout's scripts directory, not the caller's
 working directory. The harness isolates inherited HTTP factories and gateway
 sessions. It closes its own clients before restoring the original singletons.
