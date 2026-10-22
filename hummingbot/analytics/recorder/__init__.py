@@ -2,7 +2,8 @@
 
 Hooks check the module attribute ACTIVE before building a body, then call record with their perf_counter_ns start
 and hook name. Local evidence is always priority. Authenticated transport hooks pass priority=True after redaction.
-Only end_run waits for the writer, for at most two seconds after the strategy has stopped.
+Only end_run waits for the writer, for at most two seconds after the strategy has stopped. Activation leaves the
+process allocator unchanged.
 """
 import itertools
 import logging
@@ -15,7 +16,7 @@ from time import monotonic, monotonic_ns, perf_counter_ns, time_ns
 from typing import Any, Deque, Dict, NamedTuple, Optional, Tuple, Union
 from uuid import UUID
 
-from hummingbot.analytics.recorder import accounts, heap, secrets, timing
+from hummingbot.analytics.recorder import accounts, secrets, timing
 from hummingbot.analytics.recorder.envelope import encode_body, frame, gap_line, payload, payload_size
 from hummingbot.analytics.recorder.kinds import KINDS
 from hummingbot.analytics.recorder.queue import CaptureQueue
@@ -96,7 +97,6 @@ def activate(config: Any, root: Union[str, Path, None] = None) -> Optional[str]:
         run_id = str(_uuid7())
         run_dir = Path(settings.dir) / run_id
         run_dir.mkdir(parents=True, mode=0o700)
-        heap.keep_freed_memory()
         run = _Run(run_id, run_dir, settings)
         run.writer.start()
         timing.drain()

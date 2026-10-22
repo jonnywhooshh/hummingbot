@@ -28,6 +28,11 @@ class RecorderTest(RunTestCase):
         recorder.pause()
         recorder.resume()
 
+    def test_activation_does_not_change_the_process_allocator(self):
+        with patch("ctypes.CDLL") as libc:
+            self.start()
+        libc.assert_not_called()
+
     def test_run_start_end_ordering_and_run_metadata_are_saved_once(self):
         run_dir = self.start()
         self.assertEqual(7, UUID(run_dir.name).version)
