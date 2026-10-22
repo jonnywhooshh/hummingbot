@@ -5,7 +5,7 @@ import time
 from enum import Enum
 from operator import itemgetter
 from pathlib import Path
-from typing import Callable, List, NamedTuple, Optional, Tuple
+from typing import Callable, Iterator, List, NamedTuple, Optional, Tuple
 
 from hummingbot.analytics.recorder.queue import CaptureQueue, Item
 from hummingbot.analytics.recorder.segments import Abandoned, ActiveSegment, write_run_json
@@ -32,11 +32,13 @@ class Writer:
     """Own all run files. Hook bodies arrive only as immutable bytes, never as live bot objects."""
 
     def __init__(self, run_dir: Path, settings, queue: CaptureQueue, make_gap: GapFactory,
-                 emit_diagnostics: Callable[[], None], on_dead: Callable[[], None]):
+                 capture_diagnostics: Callable[[], Iterator[Tuple[int, bytes]]], on_dead: Callable[[], None],
+                 defer_diagnostics: Callable[[], None]):
         self.run_dir = run_dir
         self.queue = queue
         self.make_gap = make_gap
-        self.emit_diagnostics = emit_diagnostics
+        self.capture_diagnostics = capture_diagnostics
+        self.defer_diagnostics = defer_diagnostics
         self.on_dead = on_dead
         self.interval = settings.flush_interval_ms / 1000
         self.segment_max_bytes = settings.segment_max_bytes
@@ -114,7 +116,6 @@ class Writer:
                             return
                 if not self._paused and len(self.queue):
                     continue
-                self.emit_diagnostics()
                 self._wake.wait(self.interval)
                 self._wake.clear()
         except Abandoned:
@@ -127,7 +128,7 @@ class Writer:
         finally:
             self._give_up()
             self._drained.set()
-            self.emit_diagnostics()
+            self.defer_diagnostics()
 
     def _step(self) -> bool:
         self._check_disk()
@@ -143,6 +144,10 @@ class Writer:
                 for seq, priority, line in batch:
                     if self._admit(seq, priority):
                         self._append(seq, line, priority=priority)
+        if self.state not in (DiskState.FULL, DiskState.FAILED):
+            for seq, line in self.capture_diagnostics():
+                self._check_deadline()
+                self._append(seq, line)
         if self._segment is not None:
             self._segment.flush()
         if time.monotonic() - self._last_sync >= self.interval:
