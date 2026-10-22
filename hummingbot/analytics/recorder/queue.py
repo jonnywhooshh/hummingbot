@@ -57,8 +57,8 @@ class CaptureQueue:
         return len(self.items)
 
     def offer(self, record: Pending) -> bool:
-        if self.closed or self.depth_bytes + record.size > (self.priority_bound if record.priority else
-                                                             self.bulk_bound):
+        bound = self.priority_bound if record.priority else self.bulk_bound
+        if self.closed or self.depth_bytes + record.size > bound:
             self.lose(record.seq, record.priority)
             return False
         return self.push(record)

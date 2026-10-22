@@ -140,3 +140,19 @@ class EnvelopeTest(unittest.TestCase):
                 expected = inline_body_json(body)
                 self.assertEqual(expected, encode_body(body))
                 self.assertLessEqual(len(expected), snapshot(body)[1])
+
+    def test_a_snapshot_rejects_what_the_inline_encoder_rejects_before_anything_is_queued(self):
+        class ListToDict:
+            def toDict(self):
+                return [1]
+
+        class NumberJson:
+            def __json__(self):
+                return 5
+
+        for body in ({"value": ListToDict()}, {"value": NumberJson()}):
+            with self.subTest(body=body):
+                with self.assertRaises(TypeError):
+                    inline_body_json(body)
+                with self.assertRaises(TypeError):
+                    snapshot(body)
