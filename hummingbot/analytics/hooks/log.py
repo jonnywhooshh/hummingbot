@@ -16,10 +16,13 @@ class CaptureHandler(logging.Handler):
         return False
 
     def emit(self, record: logging.LogRecord) -> None:
-        if not recorder.ACTIVE or not recorder.on_capture_thread():
+        if not recorder.ACTIVE:
             return
-        t0_ns = perf_counter_ns()
         try:
+            if not recorder.on_capture_thread():
+                recorder.record("log", {}, t0_ns=0, hook="log")
+                return
+            t0_ns = perf_counter_ns()
             exception = logging.Formatter().formatException(record.exc_info) if record.exc_info else None
             recorder.record("log", {
                 "logger": record.name,

@@ -498,6 +498,7 @@ class TradingCore:
 
         except Exception as e:
             self.logger().error(f"Failed to start strategy {strategy_name}: {e}")
+            run.finish("start_strategy", "start_failed", e)
             return False
 
     async def _initialize_v2_strategy(self):
