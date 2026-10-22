@@ -1,6 +1,7 @@
 from collections import deque
 from itertools import repeat, starmap
 from operator import itemgetter
+from threading import RLock
 from typing import Deque, List, Optional, Tuple
 
 Item = Tuple[int, bool, bytes]
@@ -17,10 +18,10 @@ class DropRange:
 
 
 class CaptureQueue:
-    """Single hook producer and single writer consumer, with no producer lock.
+    """Single hook producer and single writer consumer. Admission never waits for queue retirement.
 
-    The producer owns bytes_in, admission counters, and drop snapshots. The consumer owns bytes_out and reported
-    positions. Publishing immutable snapshots lets the writer report drops even when no later hook runs.
+    The producer owns admission counters and drop snapshots. The consumer owns discarded counts and bytes_out.
+    A nonblocking admission lock prevents close from draining between the closed check and append.
     """
 
     def __init__(self, bulk_bound: int, priority_bound: int):
@@ -31,14 +32,25 @@ class CaptureQueue:
         self.bytes_in = 0
         self.bytes_out = 0
         self.accepted = 0
-        self.dropped = 0
-        self.dropped_priority = 0
+        self._dropped = 0
+        self._dropped_priority = 0
+        self._discarded = 0
+        self._discarded_priority = 0
+        self._admission = RLock()
         self._ranges: Deque[DropRange] = deque()
         self._open: Optional[DropRange] = None
 
     @property
     def depth_bytes(self) -> int:
         return self.bytes_in - self.bytes_out
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped + self._discarded
+
+    @property
+    def dropped_priority(self) -> int:
+        return self._dropped_priority + self._discarded_priority
 
     def __len__(self) -> int:
         return len(self.items)
@@ -47,14 +59,15 @@ class CaptureQueue:
         if self.closed or self.depth_bytes + len(line) > (self.priority_bound if priority else self.bulk_bound):
             self.lose(seq, priority)
             return False
-        self.push(seq, line, priority)
+        if not self.push(seq, line, priority):
+            return False
         self.accepted += 1
         return True
 
     def lose(self, seq: int, priority: bool) -> None:
         """Count a seq that will never reach the writer, so its capture_gap range stays exact."""
-        self.dropped += 1
-        self.dropped_priority += priority
+        self._dropped += 1
+        self._dropped_priority += priority
         current = self._open
         if current is None or seq != current.snapshot[0] + 1:
             self.seal_drops()
@@ -65,22 +78,32 @@ class CaptureQueue:
 
     def close(self) -> None:
         """Refuse every later record and release the queued ones. Called by the writer once it can write no more."""
-        self.closed = True
-        while self.pop() is not None:
-            pass
+        with self._admission:
+            self.closed = True
+            while (item := self.pop()) is not None:
+                self._discarded += 1
+                self._discarded_priority += item[1]
 
     def seal_drops(self) -> None:
         if self._open is not None:
             self._open.sealed = True
             self._open = None
 
-    def push(self, seq: int, line: bytes, priority: bool = True) -> None:
-        """Lifecycle records bypass capacity, so stopping does not lose run_end to a bulk flood."""
-        if self.closed:
-            return
-        self.seal_drops()
-        self.bytes_in += len(line)
-        self.items.append((seq, priority, line))
+    def push(self, seq: int, line: bytes, priority: bool = True) -> bool:
+        """Bypass capacity for lifecycle records, but never wait for or append after close."""
+        if not self._admission.acquire(blocking=False):
+            self.lose(seq, priority)
+            return False
+        try:
+            self.seal_drops()
+            if self.closed:
+                self.lose(seq, priority)
+                return False
+            self.bytes_in += len(line)
+            self.items.append((seq, priority, line))
+            return True
+        finally:
+            self._admission.release()
 
     def take_drops(self) -> List[Tuple[int, int, bool]]:
         ranges = []
