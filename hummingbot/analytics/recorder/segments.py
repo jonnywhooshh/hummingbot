@@ -124,7 +124,7 @@ class ActiveSegment:
             self.dirty = False
 
     def close(self, check: Callable[[], None]) -> None:
-        """Publish gzip, then the durable manifest, then remove the recoverable original."""
+        """Publish gzip before the manifest. Only incomplete compression output may be removed on failure."""
         check()
         self.sync()
         os.close(self.fd)
@@ -139,17 +139,17 @@ class ActiveSegment:
                 check()
                 raw.flush()
                 os.fsync(raw.fileno())
-            check()
-            fsync_dir(self.run_dir)
-            with open(gz_path, "rb") as packed_file:
-                sha256 = hashlib.file_digest(packed_file, "sha256").hexdigest()
-            check()
-            entry = (f'{{"file":"{gz_path.name}","first_seq":{self.first_seq},"last_seq":{self.last_seq},'
-                     f'"records":{self.records},"bytes":{gz_path.stat().st_size},"sha256":"{sha256}"}}\n')
-            append_line(self.run_dir / MANIFEST, entry.encode("ascii"))
         except BaseException:
             gz_path.unlink(missing_ok=True)
             raise
+        check()
+        fsync_dir(self.run_dir)
+        with open(gz_path, "rb") as packed_file:
+            sha256 = hashlib.file_digest(packed_file, "sha256").hexdigest()
+        check()
+        entry = (f'{{"file":"{gz_path.name}","first_seq":{self.first_seq},"last_seq":{self.last_seq},'
+                 f'"records":{self.records},"bytes":{gz_path.stat().st_size},"sha256":"{sha256}"}}\n')
+        append_line(self.run_dir / MANIFEST, entry.encode("ascii"))
         check()
         self.path.unlink()
         fsync_dir(self.run_dir)
