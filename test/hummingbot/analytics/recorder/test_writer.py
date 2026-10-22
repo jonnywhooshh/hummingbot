@@ -137,6 +137,22 @@ class DiskFloorTest(RunTestCase):
                            "priority_dropped": True}], gaps)
         self.assertNotIn("run_end", json.loads((run_dir / "run.json").read_bytes()))
 
+    def test_a_framing_loss_is_reported_before_the_disk_full_gap(self):
+        run_dir = self.start(min_free_bytes=5000, hard_min_free_bytes=2000)
+        self.record("clock", {})
+        self.wait_for(lambda: recorder.stats()["written"] == 1)
+        recorder.pause()
+        with patch.object(recorder, "frame", side_effect=ValueError("framing failed")):
+            self.record("clock", {})
+        self.record("clock", {})
+        self.free = 1000
+        recorder.resume()
+        self.wait_for(lambda: not recorder.ACTIVE)
+        self.assertFalse(recorder.end_run({}))
+        gaps = [row["body"] for row in self.records(run_dir) if row["kind"] == "capture_gap"]
+        self.assertEqual(["queue_full", "disk_full"], [gap["type"] for gap in gaps])
+        self.assertEqual((2, 2, 1), (gaps[0]["first_seq"], gaps[0]["last_seq"], gaps[0]["count"]))
+
     def test_activate_refuses_below_min_free_bytes_without_creating_a_run(self):
         self.free = 100
         config = AnalyticsConfigMap(enabled=True, dir="runs", min_free_bytes=5000, hard_min_free_bytes=0)
