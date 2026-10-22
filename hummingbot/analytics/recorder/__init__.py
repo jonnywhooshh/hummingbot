@@ -3,7 +3,8 @@
 Hooks check the module attribute ACTIVE before building a body, then call record with their perf_counter_ns start
 and hook name. Local evidence is always priority. Authenticated transport hooks pass priority=True after redaction.
 Only end_run waits for the writer, for at most two seconds after the strategy has stopped. Activation leaves the
-process allocator unchanged.
+process allocator unchanged. Recorder-owned log evidence has body.origin="recorder" and the application-log body
+fields logger, level, message, and exception. It respects log_level. External error handlers run after file work ends.
 """
 import itertools
 import logging
@@ -13,7 +14,7 @@ from collections import deque
 from pathlib import Path
 from threading import get_ident
 from time import monotonic, monotonic_ns, perf_counter_ns, time_ns
-from typing import Any, Deque, Dict, NamedTuple, Optional, Tuple, Union
+from typing import Any, Deque, Dict, Iterator, NamedTuple, Optional, Tuple, Union
 from uuid import UUID
 
 from hummingbot.analytics.recorder import accounts, secrets, timing
@@ -54,7 +55,10 @@ class _Run:
         self.queue = CaptureQueue(settings.queue_max_bytes, settings.queue_max_bytes + settings.priority_reserve_bytes)
         self.off_thread = 0
         self.off_thread_lock = threading.Lock()
-        self.writer = Writer(run_dir, settings, self.queue, self.writer_gap, _emit_diagnostics, self.writer_dead)
+        self.diagnostics: Deque[Tuple[str, int, BaseException]] = deque()
+        self.deferred_logs: Deque[Tuple[str, int, BaseException]] = deque()
+        self.writer = Writer(run_dir, settings, self.queue, self.writer_gap, self.capture_diagnostics,
+                             self.writer_dead, self.defer_diagnostics)
         self.writer.run_json = _run_json(run_id, None, None)
         self.run_start_json: Optional[str] = None
 
@@ -68,6 +72,32 @@ class _Run:
                    priority: bool) -> Tuple[int, bytes]:
         seq = next(self.counter)
         return seq, gap_line(seq, self.run_id, gap_type, first, last, count, priority)
+
+    def capture_diagnostics(self) -> Iterator[Tuple[int, bytes]]:
+        while self.diagnostics:
+            diagnostic = self.diagnostics.popleft()
+            self.deferred_logs.append(diagnostic)
+            if logging.ERROR < logging.getLevelNamesMapping()[self.settings.log_level]:
+                continue
+            hook, count, error = diagnostic
+            try:
+                t0_ns = perf_counter_ns()
+                exception = logging.Formatter().formatException((type(error), error, error.__traceback__))
+                body_json = encode_body({
+                    "logger": logger.name, "level": "ERROR", "origin": "recorder",
+                    "message": secrets.scrub(f"Analytics hook {hook} failed, occurrence {count}."),
+                    "exception": secrets.scrub(exception),
+                })
+                seq = next(self.counter)
+                yield seq, _framed(self, seq, True, "log", time_ns(), monotonic_ns(), t0_ns,
+                                   None, None, None, None, None, None, body_json, len(body_json))
+            except Exception:
+                pass
+
+    def defer_diagnostics(self) -> None:
+        self.deferred_logs.extend(self.diagnostics)
+        self.diagnostics.clear()
+        _defer_diagnostics(self.deferred_logs)
 
 
 _run: Optional[_Run] = None
@@ -106,7 +136,7 @@ def activate(config: Any, root: Union[str, Path, None] = None) -> Optional[str]:
         return run_id
     except Exception as error:
         hook_error("activate", error)
-        _emit_diagnostics()
+        _defer_diagnostics(_diagnostics)
         return None
 
 
@@ -205,10 +235,12 @@ def end_run(body: Dict[str, Any]) -> bool:
     except Exception as error:
         hook_error("run_end", error)
         return False
+    finally:
+        _defer_diagnostics(_diagnostics)
 
 
 def hook_error(hook: str, error: BaseException) -> None:
-    """Count the error now and queue the first ten per hook for the writer thread to log.
+    """Count the error now and queue the first ten per hook as recorder-owned log evidence.
 
     The call never touches a logging handler, so a slow or locked handler cannot stall the trading thread.
     Hook adapters call this from their except branch.
@@ -216,7 +248,8 @@ def hook_error(hook: str, error: BaseException) -> None:
     count = _errors.get(hook, 0) + 1
     _errors[hook] = count
     if count <= LOGGED_ERRORS_PER_HOOK:
-        _diagnostics.append((hook, count, error))
+        pending = _run.diagnostics if _run is not None else _diagnostics
+        pending.append((hook, count, error))
 
 
 def on_capture_thread() -> bool:
@@ -225,10 +258,18 @@ def on_capture_thread() -> bool:
     return run is not None and get_ident() == run.thread_id
 
 
-def _emit_diagnostics() -> None:
+def _defer_diagnostics(pending: Deque[Tuple[str, int, BaseException]]) -> None:
+    if not pending:
+        return
+    diagnostics = deque(pending)
+    pending.clear()
+    threading.Thread(target=_log_diagnostics, args=(diagnostics,), name="analytics-diagnostics", daemon=True).start()
+
+
+def _log_diagnostics(diagnostics: Deque[Tuple[str, int, BaseException]]) -> None:
     while True:
         try:
-            hook, count, error = _diagnostics.popleft()
+            hook, count, error = diagnostics.popleft()
         except IndexError:
             return
         try:
