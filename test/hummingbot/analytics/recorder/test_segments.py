@@ -158,3 +158,21 @@ class AbandonedCloseTest(RunTestCase):
             segment.close(check)
         self.assertEqual(["seg-000001.jsonl"], sorted(path.name for path in self.root.iterdir()))
         self.assertEqual(b'{"seq":1}\n', (self.root / "seg-000001.jsonl").read_bytes())
+
+    def test_manifest_fsync_failure_keeps_the_finished_gzip_readable(self):
+        segment = segments.ActiveSegment(self.root, 1)
+        segment.add(1, b'{"seq":1,"kind":"clock","body":{}}\n')
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            if os.readlink(f"/proc/self/fd/{fd}").endswith("manifest.jsonl"):
+                raise OSError("manifest fsync failed")
+            return real_fsync(fd)
+
+        with patch.object(segments.os, "fsync", side_effect=fsync), self.assertRaises(OSError):
+            segment.close(lambda: None)
+        entries, partial = segments.read_manifest(self.root)
+        self.assertEqual((1, 0), (len(entries), partial))
+        source = segments.sources(self.root, entries)[0]
+        self.assertIsNone(segments.verify(source))
+        self.assertEqual([b'{"seq":1,"kind":"clock","body":{}}'], list(segments.iter_records(self.root)))
