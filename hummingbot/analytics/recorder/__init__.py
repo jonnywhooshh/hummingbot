@@ -141,7 +141,7 @@ def record(kind: str, body: Dict[str, Any], *, t0_ns: int, hook: str, priority: 
         size = payload_size(body, body_json) if spec.per_kib_us else 0
         priority = priority or spec.priority
         seq = next(run.counter)
-        line = _framed(run, seq, priority, kind, t_wall_ns, t_mono_ns, perf_counter_ns() - t0_ns, connector,
+        line = _framed(run, seq, priority, kind, t_wall_ns, t_mono_ns, t0_ns, connector,
                        trading_pair, controller_id, executor_id, client_order_id, exchange_order_id, body_json, size)
         run.queue.offer(seq, priority, line)
     except Exception as error:
@@ -283,18 +283,20 @@ def _counters(run: _Run) -> Dict[str, Any]:
             "hook_errors": sum(_errors.values()), "off_thread": run.off_thread}
 
 
-def _framed(run: _Run, seq: int, priority: bool, *fields: Any) -> bytes:
+def _framed(run: _Run, seq: int, priority: bool, kind: str, t_wall_ns: int, t_mono_ns: int,
+            t0_ns: int, *fields: Any) -> bytes:
     """Frame a record whose seq is already taken. A failure registers that seq as dropped, so no hole is left."""
     try:
-        return frame(seq, run.run_id, *fields)
+        return frame(seq, run.run_id, kind, t_wall_ns, t_mono_ns, perf_counter_ns() - t0_ns, *fields)
     except Exception:
         run.queue.lose(seq, priority)
         raise
 
 
 def _push(run: _Run, kind: str, body_json: str, t0_ns: int) -> None:
+    t_wall_ns, t_mono_ns = time_ns(), monotonic_ns()
     seq = next(run.counter)
-    run.queue.push(seq, _framed(run, seq, True, kind, time_ns(), monotonic_ns(), perf_counter_ns() - t0_ns,
+    run.queue.push(seq, _framed(run, seq, True, kind, t_wall_ns, t_mono_ns, t0_ns,
                                 None, None, None, None, None, None, body_json))
 
 
