@@ -1,4 +1,7 @@
+from bisect import bisect_right
 from collections import deque
+from itertools import accumulate, islice, repeat, starmap
+from operator import itemgetter
 from threading import RLock
 from typing import Deque, List, Optional, Tuple
 
@@ -127,14 +130,16 @@ class CaptureQueue:
         return item
 
     def pop_batch(self, max_items: int, max_bytes: int) -> List[Item]:
-        """Pop an actual byte-bounded prefix, allowing one oversized item so the queue always makes progress."""
-        batch = []
-        size = 0
-        while self.items and len(batch) < max_items:
-            next_size = len(self.items[0][2])
-            if batch and size + next_size > max_bytes:
-                break
-            batch.append(self.items.popleft())
-            size += next_size
-        self.bytes_out += size
+        """Pop a byte-bounded prefix, allowing one oversized item so the queue always makes progress.
+
+        Sizes come from one pass of C-level calls, so the writer holds the GIL for microseconds and the caller never
+        waits on a Python-level per-item loop.
+        """
+        items = self.items
+        ends = list(accumulate(map(len, map(itemgetter(2), islice(items, max_items)))))
+        if not ends:
+            return []
+        count = max(1, bisect_right(ends, max_bytes))
+        batch = list(starmap(items.popleft, repeat((), count)))
+        self.bytes_out += ends[count - 1]
         return batch
