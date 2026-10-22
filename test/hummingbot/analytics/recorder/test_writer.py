@@ -92,6 +92,34 @@ class WriterFailureTest(RunTestCase):
         self.assertEqual((0, 0), (stats["queue_bytes"], stats["queue_records"]))
         self.assertFalse(recorder.end_run({"path": "test"}))
 
+    def test_failed_writes_count_only_complete_disk_lines_and_every_discarded_record(self):
+        run_dir = self.start(queue_max_bytes=4 << 20)
+        self.wait_for(lambda: (run_dir / "run.json").exists())
+        recorder.pause()
+        run = recorder._run
+        for index in range(1000):
+            self.record("order_request", {"index": index, "data": "x" * 2000})
+        real_writev = os.writev
+        first = True
+
+        def writev(fd, lines):
+            nonlocal first
+            if first:
+                first = False
+                return real_writev(fd, [lines[0], lines[1][:5]])
+            raise OSError(5, "EIO")
+
+        with patch("hummingbot.analytics.recorder.segments.os.writev", side_effect=writev):
+            recorder.resume()
+            run.writer._thread.join(5)
+        self.assertFalse(run.writer._thread.is_alive())
+        stats = recorder.stats()
+        self.assertEqual(1, len(self.records(run_dir)))
+        self.assertEqual(1, stats["written"])
+        self.assertEqual(1000, stats["written"] + stats["dropped"] + stats["disk_dropped"])
+        self.assertEqual(999, run.queue.dropped_priority + run.writer.disk_dropped_priority)
+        self.assertEqual((0, 0), (stats["queue_records"], stats["queue_bytes"]))
+
     def test_a_finished_run_that_died_late_cannot_turn_off_the_next_run(self):
         self.start()
         first = recorder._run

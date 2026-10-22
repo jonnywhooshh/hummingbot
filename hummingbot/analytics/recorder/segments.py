@@ -77,11 +77,17 @@ class ActiveSegment:
         self.last_seq: Optional[int] = None
         self.dirty = False
         self._pending: List[bytes] = []
+        self._pending_priority: List[bool] = []
+        self.written_records = 0
+        self.priority_records = 0
+        self.written_priority = 0
 
-    def add(self, seq: int, line: bytes) -> None:
+    def add(self, seq: int, line: bytes, priority: bool = True) -> None:
         if self.opened is None:
             self.opened = time.monotonic()
         self._pending.append(line)
+        self._pending_priority.append(priority)
+        self.priority_records += priority
         self.size += len(line)
         self.records += 1
         self.first_seq = seq if self.first_seq is None else min(self.first_seq, seq)
@@ -89,10 +95,12 @@ class ActiveSegment:
 
     def add_batch(self, batch: List[Tuple[int, bool, bytes]]) -> None:
         """Add queue items in one pass of C-level calls. The caller has checked that the batch fits."""
-        seqs, _, lines = zip(*batch)
+        seqs, priorities, lines = zip(*batch)
         if self.opened is None:
             self.opened = time.monotonic()
         self._pending.extend(lines)
+        self._pending_priority.extend(priorities)
+        self.priority_records += sum(priorities)
         self.size += sum(map(len, lines))
         self.records += len(lines)
         low, high = min(seqs), max(seqs)
@@ -108,12 +116,18 @@ class ActiveSegment:
                 raise OSError("Analytics write made no progress")
             self.dirty = True
             if written == sum(map(len, chunk)):
+                self.written_records += len(chunk)
+                self.written_priority += sum(self._pending_priority[:len(chunk)])
+                del self._pending_priority[:len(chunk)]
                 del self._pending[:len(chunk)]
                 continue
             done = 0
             while written >= len(chunk[done]):
                 written -= len(chunk[done])
                 done += 1
+            self.written_records += done
+            self.written_priority += sum(self._pending_priority[:done])
+            del self._pending_priority[:done]
             del self._pending[:done]
             self._pending[0] = self._pending[0][written:]
 
