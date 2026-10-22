@@ -200,6 +200,18 @@ class SequenceAccountingTest(RunTestCase):
         status, text = self.verify(run_dir)
         self.assertEqual(0, status, text)
 
+    def test_elapsed_clock_failure_after_sequence_allocation_is_reported_as_a_gap(self):
+        run_dir = self.start()
+        self.record("clock", {})
+        recorder.record("clock", {}, t0_ns=None, hook="clock")
+        self.record("clock", {})
+        self.assertTrue(recorder.end_run({}))
+        records = self.records(run_dir)
+        gap = next(row["body"] for row in records if row["kind"] == "capture_gap")
+        self.assertEqual((2, 2, 1), (gap["first_seq"], gap["last_seq"], gap["count"]))
+        status, text = self.verify(run_dir)
+        self.assertEqual(0, status, text)
+
     def test_failed_calls_are_counted_in_hook_timing(self):
         self.start()
         timing.drain()
