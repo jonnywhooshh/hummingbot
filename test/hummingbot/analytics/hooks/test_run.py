@@ -9,6 +9,8 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import yaml
+
 from hummingbot.analytics import recorder
 from hummingbot.analytics.hooks import run
 from hummingbot.analytics.hooks.log import CaptureHandler
@@ -18,6 +20,7 @@ from hummingbot.client.config.config_helpers import ClientConfigAdapter
 from hummingbot.core.event.events import MarketEvent
 from hummingbot.core.pubsub import PubSub
 from hummingbot.core.trading_core import StrategyType, TradingCore
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 
 CLIENT_YML = """instance_id: abc
 mqtt_bridge:
@@ -77,16 +80,59 @@ class RunTest(IsolatedAsyncioWrapperTestCase):
         core = TradingCore(self.adapter, self.root / "scripts")
         return core
 
-    def test_redaction_keeps_the_rest_of_the_file(self):
-        redacted = run.redact_yaml_text(CLIENT_YML + "other:\n  - api_key: 'x'\n  token: keep\n")
+    def test_redaction_preserves_config_values_without_credentials(self):
+        redacted = run.redact_yaml_text(CLIENT_YML + "other:\n  - api_key: 'x'\n  - token: keep\n")
         self.assertNotIn("mqtt-secret-value", redacted)
         self.assertNotIn("db-secret-value", redacted)
-        self.assertIn('mqtt_password: "<redacted>"', redacted)
-        self.assertIn('- api_key: "<redacted>"', redacted)
-        self.assertIn("mqtt_username: bot", redacted)
-        self.assertIn("token: keep", redacted)
-        self.assertEqual(run.redact_yaml_text("a:\n  secret: |\n    text\n", frozenset()), "a:\n  secret: |\n    text\n")
-        self.assertEqual(run.redact_yaml_text("plain: value", frozenset({"plain"})), 'plain: "<redacted>"')
+        config = yaml.safe_load(redacted)
+        self.assertEqual(config["mqtt_bridge"]["mqtt_password"], "<redacted>")
+        self.assertEqual(config["db_mode"]["db_password"], "<redacted>")
+        self.assertEqual(config["mqtt_bridge"]["mqtt_username"], "bot")
+        self.assertEqual(config["other"], [{"api_key": "<redacted>"}, {"token": "keep"}])
+        self.assertEqual(yaml.safe_load(run.redact_yaml_text("plain: value", frozenset({"plain"}))),
+                         {"plain": "<redacted>"})
+
+    def test_redaction_covers_yaml_key_and_scalar_spellings(self):
+        cases = [
+            '"db_password": hunter2\n',
+            "'mqtt_password': hunter2\n",
+            "mqtt_bridge: {mqtt_password: hunter2, mqtt_host: h}\n",
+            "db_password:\n  hunter2\n",
+            "mqtt_password: |\n  hunter2\n",
+            "mqtt_password: >\n  hunter2\n",
+            "# mqtt_password: hunter2\n",
+            "a: 1\n---\nsecret_key: hunter2\n",
+            "db_password:\thunter2\n",
+            "mqtt_password: hunter2\n",
+            '"mqtt_\\u0070assword": hunter2\n',
+            "copy: &credential hunter2\nmqtt_password: *credential\n",
+            "mqtt_password: &credential hunter2\ncopy: *credential\n",
+            "a: &credentials {db_password: hunter2}\nb: {<<: *credentials}\n",
+            "db_password: [hunter2, other]\n",
+            "db_password: {value: hunter2}\n",
+            "db_password: hunter2\ndb_password: replacement\n",
+            "db_password: {value: &credential hunter2}\ncopy: *credential\n",
+            "db_password: [&credential hunter2]\ncopy: *credential\n",
+        ]
+        recorder.secrets.add("second-pass-value")
+        for text in cases:
+            with self.subTest(text=text):
+                redacted = run.redact_yaml_text(text + "\n# second-pass-value\n")
+                self.assertNotIn("hunter2", redacted)
+                self.assertNotIn("second-pass-value", redacted)
+                list(yaml.safe_load_all(redacted))
+        redacted = run.redact_yaml_text("decimal: 0.1000000000000000055\nplain: second-pass-value\n")
+        self.assertIn("0.1000000000000000055", redacted)
+        self.assertEqual(yaml.safe_load(redacted)["plain"], "<redacted>")
+
+    def test_redaction_uses_secure_config_paths_and_handles_recursive_aliases(self):
+        text = "private: {token: hunter2}\npublic: {token: visible}\nrecursive: &loop {self: *loop}\n"
+        redacted = run.redact_yaml_text(text, frozenset({"private.token"}))
+        self.assertNotIn("hunter2", redacted)
+        data = yaml.safe_load(redacted)
+        self.assertEqual(data["private"]["token"], "<redacted>")
+        self.assertEqual(data["public"]["token"], "visible")
+        self.assertIs(data["recursive"]["self"], data["recursive"])
 
     async def test_start_strategy_activates_only_on_a_real_start(self):
         core = self.core()
@@ -104,16 +150,102 @@ class RunTest(IsolatedAsyncioWrapperTestCase):
         self.adapter.analytics.enabled = True
         with patch.object(TradingCore, "detect_strategy_type", side_effect=ValueError("stop here")):
             self.assertFalse(await core.start_strategy("v2"))
-        self.assertTrue(recorder.stats()["active"])
-        run_id = recorder.stats()["run_id"]
-        handlers = [h for h in logging.getLogger("hummingbot").handlers if isinstance(h, CaptureHandler)]
-        with patch.object(TradingCore, "detect_strategy_type", side_effect=ValueError("again")):
-            await core.start_strategy("v2")
-        self.assertEqual(recorder.stats()["run_id"], run_id)
-        self.assertEqual([h for h in logging.getLogger("hummingbot").handlers if isinstance(h, CaptureHandler)], handlers)
-        self.assertEqual(handlers[0].level, logging.WARNING)
+        self.assertFalse(recorder.stats()["active"])
+        first_run = next((self.root / "runs").iterdir())
+        end = json.loads((first_run / "run.json").read_text())["run_end"]
+        self.assertEqual((end["path"], end["reason"]), ("start_strategy", "start_failed"))
+        self.assertIn("ValueError: stop here", end["exception"])
+        for name in ("hummingbot", "hummingbot.connector", "hummingbot.client", "hummingbot.strategy"):
+            self.assertFalse(any(isinstance(handler, CaptureHandler) for handler in logging.getLogger(name).handlers))
+
+    @patch("hummingbot.core.trading_core.RateOracle")
+    async def test_failed_start_detaches_listeners_and_retry_starts_a_new_run(self, _):
+        core = self.core()
+        first_connector, second_connector = FakeConnector(), FakeConnector()
+        attempts = []
+        tasks_before = asyncio.all_tasks()
+
+        async def initialize():
+            connector = second_connector if attempts else first_connector
+            core.connector_manager.connectors["retry"] = connector
+            run.connector_created("retry", connector, {"retry_api_key": "retry-key"})
+            attempts.append(self.run_dir())
+            if len(attempts) == 1:
+                raise ValueError("failed initialization")
+            core.strategy = SimpleNamespace(controllers={}, config=None)
+
+        with patch.object(TradingCore, "detect_strategy_type", return_value=StrategyType.V2), \
+                patch.object(core, "_initialize_v2_strategy", initialize), \
+                patch.object(TradingCore, "_start_strategy_execution", AsyncMock()):
+            self.assertFalse(await core.start_strategy("v2"))
+            await asyncio.sleep(0)
+            self.assertFalse(recorder.stats()["active"])
+            self.assertEqual(asyncio.all_tasks(), tasks_before)
+            self.assertEqual(first_connector.get_listeners(MarketEvent.OrderFilled), [])
+            failed_end = json.loads((attempts[0] / "run.json").read_text())["run_end"]
+            self.assertEqual(failed_end["reason"], "start_failed")
+            self.assertEqual([row["kind"] for row in self.records(attempts[0])].count("run_end"), 1)
+            self.assertTrue(await core.start_strategy("v2"))
+        self.assertNotEqual(attempts[0], attempts[1])
+        self.assertEqual(first_connector.get_listeners(MarketEvent.OrderFilled), [])
+        self.assertEqual(len(second_connector.get_listeners(MarketEvent.OrderFilled)), 1)
+        first_connector.trigger_event(MarketEvent.OrderFilled, SimpleNamespace(timestamp=1))
+        second_connector.trigger_event(MarketEvent.OrderFilled, SimpleNamespace(timestamp=2))
         run.finish("shutdown")
-        self.assertEqual([h for h in logging.getLogger("hummingbot").handlers if isinstance(h, CaptureHandler)], [])
+        events = [row for row in self.records(attempts[1]) if row["kind"] == "connector_event"]
+        self.assertEqual([row["body"]["fields"]["timestamp"] for row in events], [2])
+        self.assertEqual(second_connector.get_listeners(MarketEvent.OrderFilled), [])
+
+    async def test_failed_execution_finishes_after_run_start(self):
+        core = self.core()
+        core.strategy = SimpleNamespace(controllers={}, config=None)
+        with patch.object(TradingCore, "detect_strategy_type", return_value=StrategyType.V2), \
+                patch.object(TradingCore, "_initialize_v2_strategy", AsyncMock()), \
+                patch.object(TradingCore, "_start_strategy_execution", AsyncMock(side_effect=ValueError("execution"))):
+            self.assertFalse(await core.start_strategy("v2"))
+        run_dir = next((self.root / "runs").iterdir())
+        document = json.loads((run_dir / "run.json").read_text())
+        self.assertIsNotNone(document["run_start"])
+        self.assertEqual(document["run_end"]["reason"], "start_failed")
+        self.assertFalse(recorder.stats()["active"])
+
+    async def test_capture_attaches_to_non_propagating_hummingbot_loggers_and_detaches(self):
+        template = Path(run.__file__).parents[2] / "templates" / "hummingbot_logs_TEMPLATE.yml"
+        logger_settings = yaml.safe_load(template.read_text())["loggers"]
+        names = ["hummingbot.connector.exchange.x", "hummingbot.client.command.x",
+                 "hummingbot.strategy.x", "hummingbot.core.x", "hummingbot.strategy_v2.x"]
+        for name, settings in logger_settings.items():
+            if not name.startswith("hummingbot."):
+                continue
+            logger = logging.getLogger(name)
+            self.addCleanup(setattr, logger, "propagate", logger.propagate)
+            logger.propagate = settings["propagate"]
+        for name in names:
+            logger = logging.getLogger(name)
+            self.addCleanup(logger.setLevel, logger.level)
+            logger.setLevel(logging.WARNING)
+        run.begin(self.adapter)
+        run_dir = self.run_dir()
+        for name in names:
+            logging.getLogger(name).warning("construction %s", name)
+        run.finish("shutdown")
+        logs = [row["body"]["logger"] for row in self.records(run_dir) if row["kind"] == "log"]
+        self.assertCountEqual(logs, names)
+        for name in ("hummingbot", *logger_settings):
+            self.assertFalse(any(isinstance(handler, CaptureHandler) for handler in logging.getLogger(name).handlers))
+
+    async def test_default_logger_propagation_captures_each_log_once(self):
+        logger = logging.getLogger("hummingbot.connector")
+        self.addCleanup(setattr, logger, "propagate", logger.propagate)
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.propagate = True
+        logger.setLevel(logging.WARNING)
+        run.begin(self.adapter)
+        run_dir = self.run_dir()
+        logger.warning("one record")
+        run.finish("shutdown")
+        messages = [row["body"]["message"] for row in self.records(run_dir) if row["kind"] == "log"]
+        self.assertEqual(messages, ["one record"])
 
     @patch("hummingbot.core.trading_core.RateOracle")
     async def test_run_start_and_both_stop_paths_write_run_json_once(self, _):
@@ -156,7 +288,8 @@ class RunTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(start["controller_configs"][0]["text"], "id: c1\nconnector_name: backpack_perpetual\n")
         self.assertEqual(start["controller_sources"][0]["sha256"],
                          hashlib.sha256(Path(support.__file__).read_bytes()).hexdigest())
-        self.assertEqual(start["script_configs"][0]["text"], 'script_file_name: v2.py\napi_key: "<redacted>"\n')
+        self.assertEqual(yaml.safe_load(start["script_configs"][0]["text"]),
+                         {"script_file_name": "v2.py", "api_key": "<redacted>"})
         self.assertEqual(start["analytics"]["log_level"], "WARNING")
         text = (run_dir / "run.json").read_text()
         for value in ("mqtt-secret-value", "db-secret-value", "script-key-value"):
@@ -183,6 +316,38 @@ class RunTest(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(recorder.stats()["active"])
         end = json.loads((run_dir / "run.json").read_text())["run_end"]
         self.assertEqual((end["path"], end["reason"], end["exception"]), ("stop_command", "user", None))
+        self.assertEqual([row["kind"] for row in self.records(run_dir)].count("run_end"), 1)
+
+    async def test_stop_command_failure_still_finishes_once_and_preserves_exception(self):
+        core = self.core()
+        run.begin(self.adapter)
+        run_dir = self.run_dir()
+        connector = FakeConnector()
+        run.connector_created("stop", connector, {"api_key": "stop-key"})
+        core.strategy = Mock(spec=StrategyV2Base)
+        core.strategy.on_stop = AsyncMock(side_effect=ValueError("stop-key"))
+        app = SimpleNamespace(trading_core=core, logger=lambda: Mock(), notify=Mock())
+        with self.assertRaisesRegex(ValueError, "stop-key"):
+            await StopCommand.stop_loop(app, skip_order_cancellation=True)
+        self.assertFalse(recorder.stats()["active"])
+        self.assertEqual(connector.get_listeners(MarketEvent.OrderFilled), [])
+        end = json.loads((run_dir / "run.json").read_text())["run_end"]
+        self.assertEqual((end["path"], end["reason"], end["exception"]),
+                         ("stop_command", "exception", "ValueError: <redacted>"))
+        self.assertEqual([row["kind"] for row in self.records(run_dir)].count("run_end"), 1)
+        core.strategy = None
+        await core.shutdown(skip_order_cancellation=True)
+        self.assertEqual([row["kind"] for row in self.records(run_dir)].count("run_end"), 1)
+
+    async def test_cancelled_stop_command_still_finishes_once(self):
+        core = self.core()
+        run.begin(self.adapter)
+        run_dir = self.run_dir()
+        app = SimpleNamespace(trading_core=core, logger=lambda: Mock(), notify=Mock())
+        with patch.object(TradingCore, "cancel_outstanding_orders", AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await StopCommand.stop_loop(app)
+        self.assertFalse(recorder.stats()["active"])
         self.assertEqual([row["kind"] for row in self.records(run_dir)].count("run_end"), 1)
 
     async def test_shutdown_exception_and_kill_switch_reason(self):
@@ -226,6 +391,35 @@ class RunTest(IsolatedAsyncioWrapperTestCase):
         run.finish("test")
         self.assertEqual(connector.get_listeners(MarketEvent.OrderFilled), [])
         self.assertTrue((run_dir / "run.json").exists())
+
+    async def test_connector_identity_does_not_hash_non_key_secrets(self):
+        run.begin(self.adapter)
+        for name, keys in (
+            ("secret_only", {"private_secret": "not-a-key"}),
+            ("key_secret_only", {"api_key_secret": "also-not-a-key"}),
+            ("passphrase_only", {"passphrase": "not-an-api-key"}),
+        ):
+            with self.subTest(name=name):
+                connector = FakeConnector()
+                run.connector_created(name, connector, keys)
+                self.assertIsNone(recorder.accounts.get(name))
+                self.assertEqual(recorder.secrets.scrub(next(iter(keys.values()))), "<redacted>")
+                self.assertEqual(len(connector.get_listeners(MarketEvent.OrderFilled)), 1)
+
+    async def test_replaced_connector_detaches_the_previous_listener(self):
+        run.begin(self.adapter)
+        run_dir = self.run_dir()
+        first, second = FakeConnector(), FakeConnector()
+        run.connector_created("replacement", first, {"api_key": "same-key"})
+        run.connector_created("replacement", second, {"api_key": "same-key"})
+        self.assertEqual(first.get_listeners(MarketEvent.OrderFilled), [])
+        self.assertEqual(len(second.get_listeners(MarketEvent.OrderFilled)), 1)
+        first.trigger_event(MarketEvent.OrderFilled, SimpleNamespace(timestamp=1))
+        second.trigger_event(MarketEvent.OrderFilled, SimpleNamespace(timestamp=2))
+        run.finish("shutdown")
+        events = [row for row in self.records(run_dir) if row["kind"] == "connector_event"]
+        self.assertEqual([row["body"]["fields"]["timestamp"] for row in events], [2])
+        self.assertEqual(second.get_listeners(MarketEvent.OrderFilled), [])
 
     async def test_begin_failure_leaves_capture_off_and_trading_path_unchanged(self):
         with patch("hummingbot.analytics.hooks.run.HostSampler", side_effect=ValueError("sampler")):

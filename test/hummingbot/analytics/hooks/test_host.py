@@ -24,10 +24,17 @@ class HostTest(RunTestCase, IsolatedAsyncioWrapperTestCase):
         process.num_fds.return_value = 9
         recorder.timing.observe("order_request", 1200)
         module = "hummingbot.analytics.hooks.host"
+        real_open = os.open
+
+        def open_without_procfs(path, flags, *args, **kwargs):
+            if path == "/proc/self/statm":
+                raise OSError("no procfs")
+            return real_open(path, flags, *args, **kwargs)
+
         with patch(f"{module}.psutil.Process", return_value=process) as create, \
                 patch(f"{module}.process_time", side_effect=[1.0, 1.25, 1.25]), \
                 patch(f"{module}.monotonic", side_effect=[100.0, 101.0, 101.5]), \
-                patch(f"{module}.os.open", side_effect=OSError("no procfs")):
+                patch(f"{module}.os.open", side_effect=open_without_procfs):
             sampler = HostSampler(str(run_dir))
             with patch(f"{module}.os.statvfs", return_value=SimpleNamespace(f_bavail=100, f_frsize=4096)):
                 sampler.sample(2.5)
