@@ -269,25 +269,31 @@ class OrderHooksTest(IsolatedAsyncioWrapperTestCase):
 
     async def test_each_hook_failure_preserves_order_cancel_fill_and_clock_behavior(self):
         original = recorder.record
-        cases = ("order_request", "order_dispatch", "order_result", "cancel_request", "cancel_result",
-                 "order_update", "trade_update", "clock")
-        for target in cases:
-            with self.subTest(hook=target):
+        cases = [(hook, error_type)
+                 for error_type in (RuntimeError, asyncio.CancelledError, KeyboardInterrupt, SystemExit, BaseException)
+                 for hook in ("order_request", "order_dispatch", "order_result", "cancel_request", "cancel_result",
+                              "order_update", "trade_update", "clock")]
+        for target, error_type in cases:
+            with self.subTest(hook=target, error_type=error_type):
                 failures = []
+                order_id = f"{error_type.__name__}-{target}"
 
                 def fail_one(kind, body, **kwargs):
                     hook = body.get("update_type", "") + "_update" if kind == "tracker_update" else kind
                     if hook == target:
                         failures.append(hook)
-                        raise RuntimeError("capture broke")
+                        raise error_type("capture broke")
                     return original(kind, body, **kwargs)
 
-                with patch.object(recorder, "record", side_effect=fail_one):
-                    self.assertIsNone(await self.create(target))
-                    self.exchange._order_tracker.process_trade_update(self.trade(target))
-                    self.exchange._time_synchronizer.add_time_offset_ms_sample(12.5)
-                    self.assertEqual(target, await self.exchange._execute_cancel("SOL-USDC", target))
-                    await asyncio.sleep(0)
+                try:
+                    with patch.object(recorder, "record", side_effect=fail_one):
+                        self.assertIsNone(await self.create(order_id))
+                        self.exchange._order_tracker.process_trade_update(self.trade(order_id))
+                        self.exchange._time_synchronizer.add_time_offset_ms_sample(12.5)
+                        self.assertEqual(order_id, await self.exchange._execute_cancel("SOL-USDC", order_id))
+                        await asyncio.sleep(0)
+                except BaseException as error:
+                    self.fail(f"Capture raised {type(error).__name__} into trading")
                 self.assertGreaterEqual(len(failures), 1)
         self.assertEqual(len(cases), len(self.events[MarketEvent.BuyOrderCreated].event_log))
         self.assertEqual(len(cases), len(self.events[MarketEvent.OrderFilled].event_log))
@@ -295,6 +301,47 @@ class OrderHooksTest(IsolatedAsyncioWrapperTestCase):
         self.assertEqual([], self.events[MarketEvent.OrderFailure].event_log)
         self.assertEqual([12.5] * 5, list(self.exchange._time_synchronizer._time_offset_ms))
         self.assertGreaterEqual(recorder.stats()["hook_errors"], len(cases))
+
+    async def test_capture_error_reporting_cannot_interrupt_trading(self):
+        for error_type in (RuntimeError, asyncio.CancelledError, KeyboardInterrupt, SystemExit, BaseException):
+            with self.subTest(error_type=error_type):
+                try:
+                    with patch.object(orders, "perf_counter_ns", side_effect=RuntimeError("capture clock failed")), \
+                            patch.object(recorder, "hook_error", side_effect=error_type("reporting failed")):
+                        self.exchange._time_synchronizer.add_time_offset_ms_sample(12.5)
+                except BaseException as error:
+                    self.fail(f"Capture reporting raised {type(error).__name__} into trading")
+        self.assertEqual([12.5] * 5, list(self.exchange._time_synchronizer._time_offset_ms))
+
+    async def test_real_task_cancellation_survives_capture_cancellation(self):
+        await self.create()
+        for operation in ("create", "cancel"):
+            with self.subTest(operation=operation):
+                entered = asyncio.Event()
+                release = asyncio.Event()
+
+                async def wait_for_cancel(*args, **kwargs):
+                    entered.set()
+                    await release.wait()
+
+                venue_method = "_place_order" if operation == "create" else "_place_cancel"
+                with patch.object(self.exchange, venue_method, side_effect=wait_for_cancel), \
+                        patch.object(recorder, "record", side_effect=asyncio.CancelledError("capture failed")):
+                    coroutine = (self.create("cancelled") if operation == "create"
+                                 else self.exchange._execute_cancel("SOL-USDC", "order"))
+                    task = asyncio.create_task(coroutine)
+                    try:
+                        await asyncio.wait_for(entered.wait(), timeout=1)
+                        self.assertTrue(task.cancel("trading stopped"))
+                        with self.assertRaises(asyncio.CancelledError) as caught:
+                            await task
+                        self.assertEqual(("trading stopped",), caught.exception.args)
+                        self.assertTrue(task.cancelled())
+                        self.assertEqual(1, task.cancelling())
+                    finally:
+                        release.set()
+                        await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual([], self.events[MarketEvent.OrderFailure].event_log)
 
     async def test_serializer_failure_and_adapter_failure_do_not_change_a_cancel_failure(self):
         await self.create()

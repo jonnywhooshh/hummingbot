@@ -1,5 +1,6 @@
 """Priority local order observations, with account identity added by the recorder.
 
+Capture catches BaseException only in synchronous adapters, so cancellation at trading awaits still propagates.
 Cancel errors stay in the current task until its result, never in an order-ID registry shared by connectors.
 """
 from contextvars import ContextVar, Token
@@ -24,6 +25,13 @@ def _plain(value: Any) -> Any:
     return value.name if isinstance(value, Enum) else value
 
 
+def _hook_error(hook: str, error: BaseException) -> None:
+    try:
+        recorder.hook_error(hook, error)
+    except BaseException:
+        pass
+
+
 def order_request(connector: Any, trade_type: Any, order_id: str, trading_pair: str, amount: Any, order_type: Any,
                   price: Any, kwargs: Dict[str, Any]) -> None:
     try:
@@ -35,8 +43,8 @@ def order_request(connector: Any, trade_type: Any, order_id: str, trading_pair: 
              "kwargs": {key: _plain(value) for key, value in kwargs.items()}},
             t0_ns=t0, hook="order_request", connector=connector.name, trading_pair=trading_pair,
             client_order_id=order_id)
-    except Exception as error:
-        recorder.hook_error("order_request", error)
+    except BaseException as error:
+        _hook_error("order_request", error)
 
 
 def order_dispatch(connector: Any, order_id: str, trading_pair: str, amount: Any, price: Any) -> None:
@@ -46,8 +54,8 @@ def order_dispatch(connector: Any, order_id: str, trading_pair: str, amount: Any
             "order_dispatch", {"client_order_id": order_id, "amount": amount, "price": price},
             t0_ns=t0, hook="order_dispatch", connector=connector.name, trading_pair=trading_pair,
             client_order_id=order_id)
-    except Exception as error:
-        recorder.hook_error("order_dispatch", error)
+    except BaseException as error:
+        _hook_error("order_dispatch", error)
 
 
 def order_result(connector: Any, order_id: str, trading_pair: str, exchange_order_id: Any,
@@ -63,8 +71,8 @@ def order_result(connector: Any, order_id: str, trading_pair: str, exchange_orde
              "error": None if exception is None else str(exception)},
             t0_ns=t0, hook="order_result", connector=connector.name, trading_pair=trading_pair,
             client_order_id=order_id, exchange_order_id=exchange_order_id)
-    except Exception as error:
-        recorder.hook_error("order_result", error)
+    except BaseException as error:
+        _hook_error("order_result", error)
 
 
 def cancel_request(connector: Any, trading_pair: str, order_id: str) -> Optional[Token]:
@@ -78,8 +86,8 @@ def cancel_request(connector: Any, trading_pair: str, order_id: str) -> Optional
             "cancel_request", {"client_order_id": order_id, "exchange_order_id": exchange_order_id},
             t0_ns=t0, hook="cancel_request", connector=connector.name, trading_pair=trading_pair,
             client_order_id=order_id, exchange_order_id=exchange_order_id)
-    except Exception as error:
-        recorder.hook_error("cancel_request", error)
+    except BaseException as error:
+        _hook_error("cancel_request", error)
     return token
 
 
@@ -88,8 +96,8 @@ def cancel_error(exception: BaseException) -> None:
         pending = _cancel.get()
         if pending is not None:
             pending.exception = exception
-    except Exception as error:
-        recorder.hook_error("cancel_result", error)
+    except BaseException as error:
+        _hook_error("cancel_result", error)
 
 
 def cancel_result(connector: Any, trading_pair: str, order_id: str, result: Optional[str],
@@ -112,8 +120,8 @@ def cancel_result(connector: Any, trading_pair: str, order_id: str, result: Opti
              "error": None if exception is None else str(exception)},
             t0_ns=t0, hook="cancel_result", connector=connector.name, trading_pair=trading_pair,
             client_order_id=order_id, exchange_order_id=exchange_order_id)
-    except Exception as error:
-        recorder.hook_error("cancel_result", error)
+    except BaseException as error:
+        _hook_error("cancel_result", error)
 
 
 def order_update(connector: Any, update: Any) -> None:
@@ -125,8 +133,8 @@ def order_update(connector: Any, update: Any) -> None:
             "tracker_update", body,
             t0_ns=t0, hook="tracker_update", connector=connector.name, trading_pair=update.trading_pair,
             client_order_id=update.client_order_id, exchange_order_id=update.exchange_order_id)
-    except Exception as error:
-        recorder.hook_error("tracker_update", error)
+    except BaseException as error:
+        _hook_error("tracker_update", error)
 
 
 def trade_update(connector: Any, update: Any) -> None:
@@ -138,8 +146,8 @@ def trade_update(connector: Any, update: Any) -> None:
             "tracker_update", body,
             t0_ns=t0, hook="tracker_update", connector=connector.name, trading_pair=update.trading_pair,
             client_order_id=update.client_order_id, exchange_order_id=update.exchange_order_id)
-    except Exception as error:
-        recorder.hook_error("tracker_update", error)
+    except BaseException as error:
+        _hook_error("tracker_update", error)
 
 
 def clock(synchronizer: Any, offset_ms: float) -> None:
@@ -149,5 +157,5 @@ def clock(synchronizer: Any, offset_ms: float) -> None:
         recorder.record(
             "clock", {"offset_ms": offset_ms, "perf_counter_ns": t0},
             t0_ns=t0, hook="clock", connector=None if owner is None else owner.name)
-    except Exception as error:
-        recorder.hook_error("clock", error)
+    except BaseException as error:
+        _hook_error("clock", error)
