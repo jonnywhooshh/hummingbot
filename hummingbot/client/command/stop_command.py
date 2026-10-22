@@ -1,5 +1,4 @@
 import platform
-import sys
 import threading
 from typing import TYPE_CHECKING
 
@@ -21,6 +20,7 @@ class StopCommand:
 
     async def stop_loop(self,  # type: HummingbotApplication
                         skip_order_cancellation: bool = False):
+        failure = None
         try:
             self.logger().info("stop command initiated.")
             self.notify("\nWinding down...")
@@ -60,6 +60,8 @@ class StopCommand:
             self.trading_core._config_data = None
 
             self.notify("Hummingbot stopped.")
+        except BaseException as error:
+            failure = error
+            raise
         finally:
-            error = sys.exc_info()[1]
-            run.finish("stop_command", "user" if error is None else None, error)
+            run.finish("stop_command", "user" if failure is None else None, failure)
