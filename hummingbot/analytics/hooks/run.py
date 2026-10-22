@@ -1,3 +1,11 @@
+"""Capture a strategy attempt and detach its resources after either success or failure.
+
+Log capture attaches to hummingbot and its non-propagating descendants present at activation. Config snapshots
+serialize parsed YAML after redaction. Numeric scalar text survives, but comments and formatting do not.
+
+TradingCore's two connector creation paths are instrumented. ConnectorManager.add_trading_pairs has no production
+callers and bypasses those paths, so direct manager recreation is not captured.
+"""
 import asyncio
 import hashlib
 import inspect
@@ -7,7 +15,9 @@ import platform
 import re
 import socket
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import yaml
 
 from hummingbot.analytics import recorder
 from hummingbot.analytics.hooks.connector_events import ConnectorEvents
@@ -16,7 +26,6 @@ from hummingbot.analytics.hooks.log import CaptureHandler
 
 REDACTED = recorder.secrets.REDACTED
 SENSITIVE_KEY = re.compile(r"password|secret|passphrase|_key$", re.IGNORECASE)
-YAML_LINE = re.compile(r"^(?P<head>\s*(?:-\s+)?(?P<key>[^\s:#'\"][^:#]*?)\s*:)(?P<space>[ \t]+)(?P<value>[^\s#|>].*)$")
 
 
 class _Run:
@@ -24,6 +33,10 @@ class _Run:
         self.handler = handler
         self.sampler = sampler
         self.task = task
+        self.loggers = [logging.getLogger("hummingbot")]
+        self.loggers.extend(logger for name, logger in list(logging.root.manager.loggerDict.items())
+                            if name.startswith("hummingbot.") and isinstance(logger, logging.Logger)
+                            and not logger.propagate)
         self.connectors: Dict[str, ConnectorEvents] = {}
 
 
@@ -31,7 +44,7 @@ _run: Optional[_Run] = None
 
 
 def begin(client_config_map: Any) -> None:
-    """Activate capture for a real strategy start. Repeated starts keep the first run's handler and host task."""
+    """Activate capture once per strategy attempt."""
     global _run
     if _run is not None:
         return
@@ -42,7 +55,8 @@ def begin(client_config_map: Any) -> None:
         handler = CaptureHandler(logging.getLevelName(str(config.log_level).upper()))
         sampler = HostSampler(recorder.settings().dir)
         _run = _Run(handler, sampler, asyncio.ensure_future(sampler.run()))
-        logging.getLogger("hummingbot").addHandler(handler)
+        for logger in _run.loggers:
+            logger.addHandler(handler)
     except Exception as error:
         recorder.hook_error("run", error)
         if _run is None and recorder.ACTIVE:
@@ -62,12 +76,15 @@ def connector_created(name: str, connector: Any, api_keys: Optional[Dict[str, An
                 if isinstance(value, str) and value}
         for value in keys.values():
             recorder.secrets.add(value)
-        api_key = next((value for key, value in keys.items() if "api_key" in key), next(iter(keys.values()), None))
+        api_key = next((value for key, value in keys.items()
+                        if key.lower() == "api_key" or key.lower().endswith("_api_key")), None)
         if api_key is not None:
             recorder.accounts.set(name, api_key)
+        if existing is not None:
+            existing.close()
         capture = ConnectorEvents(connector, name)
-        capture.attach()
         run.connectors[name] = capture
+        capture.attach()
     except Exception as error:
         recorder.hook_error("run", error)
 
@@ -94,28 +111,59 @@ def finish(path: str, reason: Optional[str] = None, exception: Optional[BaseExce
         run.sampler.close()
         for capture in run.connectors.values():
             capture.close()
-        logging.getLogger("hummingbot").removeHandler(run.handler)
+        for logger in run.loggers:
+            logger.removeHandler(run.handler)
         text = None
         if exception is not None:
             text = recorder.secrets.scrub(f"{type(exception).__name__}: {exception}")
-        recorder.end_run({"path": path, "reason": "exception" if exception is not None else reason,
+        recorder.end_run({"path": path, "reason": reason or ("exception" if exception is not None else None),
                           "exception": text})
     except Exception as error:
         recorder.hook_error("run", error)
 
 
 def redact_yaml_text(text: str, secure_keys: frozenset = frozenset()) -> str:
-    """Replace the value of every credential-named key on its line, keeping the rest of the file verbatim."""
-    lines = []
-    for line in text.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        match = YAML_LINE.match(body)
-        if match is not None:
-            key = match.group("key").strip().strip("'\"")
-            if key in secure_keys or SENSITIVE_KEY.search(key):
-                line = f'{match.group("head")}{match.group("space")}"{REDACTED}"{line[len(body):]}'
-        lines.append(line)
-    return recorder.secrets.scrub("".join(lines))
+    """Redact credential values in the YAML graph, including aliases, then scrub registered secrets."""
+    documents = list(yaml.compose_all(text, Loader=yaml.CSafeLoader))
+    replacements: Dict[yaml.Node, yaml.Node] = {}
+    ancestors: Set[yaml.Node] = set()
+
+    def collect(node: yaml.Node, path: Tuple[str, ...], protected: bool = False) -> None:
+        if protected:
+            replacements[node] = yaml.ScalarNode("tag:yaml.org,2002:str", REDACTED)
+        if node in ancestors:
+            return
+        ancestors.add(node)
+        if isinstance(node, yaml.MappingNode):
+            for key, value in node.value:
+                key_path = (*path, key.value) if isinstance(key, yaml.ScalarNode) else path
+                sensitive = isinstance(key, yaml.ScalarNode) and (
+                    key.value in secure_keys or ".".join(key_path) in secure_keys or SENSITIVE_KEY.search(key.value)
+                )
+                collect(key, path, protected)
+                collect(value, key_path, protected or bool(sensitive))
+        elif isinstance(node, yaml.SequenceNode):
+            for index, value in enumerate(node.value):
+                collect(value, (*path, str(index)), protected)
+        ancestors.remove(node)
+
+    visited: Set[yaml.Node] = set()
+
+    def replace(node: yaml.Node) -> yaml.Node:
+        if node in replacements:
+            return replacements[node]
+        if node not in visited:
+            visited.add(node)
+            if isinstance(node, yaml.MappingNode):
+                node.value = [(replace(key), replace(value)) for key, value in node.value]
+            elif isinstance(node, yaml.SequenceNode):
+                node.value = [replace(value) for value in node.value]
+        return node
+
+    for document in documents:
+        collect(document, ())
+    return recorder.secrets.scrub(yaml.serialize_all([replace(document) for document in documents],
+                                                     Dumper=yaml.SafeDumper))
 
 
 def shutdown_reason(kill_switch: Any) -> Optional[str]:
@@ -131,7 +179,7 @@ def _run_start_body(core: Any) -> Dict[str, Any]:
     import hummingbot
     from hummingbot.client import settings
     version_file = Path(hummingbot.__file__).parent / "VERSION"
-    secure_keys = frozenset(item.attr for item in core.client_config_map.traverse()
+    secure_keys = frozenset(item.config_path for item in core.client_config_map.traverse()
                             if item.client_field_data is not None and item.client_field_data.is_secure)
     strategy = core.strategy
     controllers = getattr(strategy, "controllers", None) or {}
@@ -171,7 +219,7 @@ def _read_redacted(path: Any, secure_keys: frozenset) -> Dict[str, Any]:
     path = Path(path)
     try:
         return {"path": str(path), "text": redact_yaml_text(path.read_text(), secure_keys)}
-    except OSError as error:
+    except (OSError, yaml.YAMLError) as error:
         return {"path": str(path), "text": None, "error": type(error).__name__}
 
 
