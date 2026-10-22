@@ -1,5 +1,6 @@
 import unittest
 from test.hummingbot.analytics.recorder.support import RunTestCase
+from unittest.mock import patch
 
 from hummingbot.analytics import recorder
 from hummingbot.analytics.recorder.queue import CaptureQueue
@@ -52,6 +53,41 @@ class CaptureQueueTest(unittest.TestCase):
             queue.offer(seq, False, LINE)
         self.assertEqual([1, 2, 3], [item[0] for item in queue.pop_batch(256, 300)])
         self.assertEqual([4], [item[0] for item in queue.pop_batch(256, 10)])
+
+    def test_close_between_offer_and_push_rejects_and_counts_the_record(self):
+        queue = CaptureQueue(1000, 1000)
+        push = queue.push
+
+        def close_then_push(seq, line, priority=True):
+            queue.close()
+            return push(seq, line, priority)
+
+        with patch.object(queue, "push", side_effect=close_then_push):
+            self.assertFalse(queue.offer(1, True, LINE))
+        self.assertEqual((0, 1, 1, 0, 0),
+                         (queue.accepted, queue.dropped, queue.dropped_priority, len(queue), queue.depth_bytes))
+
+    def test_close_during_push_cannot_leave_a_record_pinned(self):
+        queue = CaptureQueue(1000, 1000)
+        seal = queue.seal_drops
+
+        def seal_then_close():
+            seal()
+            queue.close()
+
+        with patch.object(queue, "seal_drops", side_effect=seal_then_close):
+            self.assertFalse(queue.offer(1, False, LINE))
+        self.assertEqual((0, 1, 0, 0), (queue.accepted, queue.dropped, len(queue), queue.depth_bytes))
+
+    def test_close_counts_every_discarded_record_and_is_idempotent(self):
+        queue = CaptureQueue(1000, 1000)
+        for seq in range(1, 4):
+            queue.offer(seq, seq % 2 == 0, LINE)
+        queue.pop()
+        queue.close()
+        queue.close()
+        self.assertEqual((3, 2, 1, 0, 0),
+                         (queue.accepted, queue.dropped, queue.dropped_priority, len(queue), queue.depth_bytes))
 
 
 class QueueFullGapTest(RunTestCase):

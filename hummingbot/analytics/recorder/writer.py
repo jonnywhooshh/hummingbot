@@ -45,7 +45,7 @@ class Writer:
         self.hard_min_free_bytes = settings.hard_min_free_bytes
         self.state = DiskState.OK
         self.free_bytes: Optional[int] = None
-        self.written = 0
+        self._written = 0
         self.disk_dropped = 0
         self.disk_dropped_priority = 0
         self.segments_closed = 0
@@ -65,6 +65,11 @@ class Writer:
         self._drain_complete = False
         self._drained = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="analytics-writer", daemon=True)
+
+    @property
+    def written(self) -> int:
+        """Count complete lines delivered to the active file, not buffered segment records."""
+        return self._written + (self._segment.written_records if self._segment is not None else 0)
 
     def start(self) -> None:
         self._thread.start()
@@ -131,13 +136,13 @@ class Writer:
             for first, last, priority in self.queue.take_drops():
                 seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
                 self._append(seq, line, rotate=self.state is not DiskState.FULL)
+        self._check_deadline()
         batch = self.queue.pop_batch(BATCH_ITEMS, BATCH_BYTES)
         if batch:
-            self._check_deadline()
             if not self._append_batch(batch):
                 for seq, priority, line in batch:
                     if self._admit(seq, priority):
-                        self._append(seq, line)
+                        self._append(seq, line, priority=priority)
         if self._segment is not None:
             self._segment.flush()
         if time.monotonic() - self._last_sync >= self.interval:
@@ -172,7 +177,6 @@ class Writer:
         if segment.size + sum(map(len, map(itemgetter(2), batch))) > self.segment_max_bytes:
             return False
         segment.add_batch(batch)
-        self.written += len(batch)
         return True
 
     def _admit(self, seq: int, priority: bool) -> bool:
@@ -195,7 +199,7 @@ class Writer:
         self.queue.close()
         self.on_dead()
 
-    def _append(self, seq: int, line: bytes, rotate: bool = True) -> None:
+    def _append(self, seq: int, line: bytes, rotate: bool = True, priority: bool = True) -> None:
         segment = self._segment
         if rotate and segment is not None and segment.records and segment.size + len(line) > self.segment_max_bytes:
             self._close_segment()
@@ -203,11 +207,11 @@ class Writer:
         if segment is None:
             segment = self._segment = ActiveSegment(self.run_dir, self._next_number)
             self._next_number += 1
-        segment.add(seq, line)
-        self.written += 1
+        segment.add(seq, line, priority)
 
     def _close_segment(self) -> None:
         self._segment.close(self._check_deadline)
+        self._written += self._segment.written_records
         self._segment = None
         self.segments_closed += 1
         self._last_sync = time.monotonic()
@@ -236,9 +240,15 @@ class Writer:
             self._run_json_written = data
 
     def _give_up(self) -> None:
-        segment, self._segment = self._segment, None
+        segment = self._segment
         if segment is not None:
             try:
                 segment.abandon()
             except OSError:
                 self.errors += 1
+            finally:
+                self._written += segment.written_records
+                self.disk_dropped += segment.records - segment.written_records
+                self.disk_dropped_priority += segment.priority_records - segment.written_priority
+                self._segment = None
+        self.queue.close()
