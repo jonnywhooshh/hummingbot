@@ -103,23 +103,25 @@ def cancel_error(exception: BaseException) -> None:
 def cancel_result(connector: Any, trading_pair: str, order_id: str, result: Optional[str],
                   exception: Optional[BaseException], token: Optional[Token]) -> None:
     try:
-        t0 = perf_counter_ns()
-        pending = None if token is None else _cancel.get()
-        if token is not None:
-            _cancel.reset(token)
-        if not recorder.ACTIVE:
-            return
-        exchange_order_id = None if pending is None else pending.exchange_order_id
-        if exception is None and pending is not None:
-            exception = pending.exception
-        recorder.record(
-            "cancel_result",
-            {"client_order_id": order_id, "exchange_order_id": exchange_order_id,
-             "outcome": "success" if result is not None and exception is None else "failed",
-             "error_type": None if exception is None else type(exception).__name__,
-             "error": None if exception is None else str(exception)},
-            t0_ns=t0, hook="cancel_result", connector=connector.name, trading_pair=trading_pair,
-            client_order_id=order_id, exchange_order_id=exchange_order_id)
+        try:
+            t0 = perf_counter_ns()
+            pending = None if token is None else _cancel.get()
+            if not recorder.ACTIVE:
+                return
+            exchange_order_id = None if pending is None else pending.exchange_order_id
+            if exception is None and pending is not None:
+                exception = pending.exception
+            recorder.record(
+                "cancel_result",
+                {"client_order_id": order_id, "exchange_order_id": exchange_order_id,
+                 "outcome": "success" if result is not None and exception is None else "failed",
+                 "error_type": None if exception is None else type(exception).__name__,
+                 "error": None if exception is None else str(exception)},
+                t0_ns=t0, hook="cancel_result", connector=connector.name, trading_pair=trading_pair,
+                client_order_id=order_id, exchange_order_id=exchange_order_id)
+        finally:
+            if token is not None:
+                _cancel.reset(token)
     except BaseException as error:
         _hook_error("cancel_result", error)
 
