@@ -3,6 +3,9 @@ import hashlib
 import json
 import unittest
 from decimal import Decimal
+from enum import IntEnum
+
+import ujson
 
 from hummingbot.analytics.recorder.envelope import encode_body, frame, gap_line, payload, payload_size
 
@@ -60,6 +63,23 @@ class EnvelopeTest(unittest.TestCase):
         self.assertEqual(["seq", "run_id", "kind", "t_wall_ns", "t_mono_ns", "hook_ns", "payload_bytes", "connector",
                           "trading_pair", "controller_id", "executor_id", "client_order_id", "exchange_order_id",
                           "body"], list(record))
+
+    def test_identifier_header_bytes_match_ujson_for_strings_and_connector_identifiers(self):
+        class Level(IntEnum):
+            ONE = 1
+
+        values = [None, 8886774, 1.5, True, Decimal("12.5"), Level.ONE, "\x7f", "\\u007f\x7f", "雪"]
+        fields = ("connector", "trading_pair", "controller_id", "executor_id", "client_order_id", "exchange_order_id")
+        for value in values:
+            for index, field in enumerate(fields):
+                with self.subTest(value=value, field=field):
+                    identifiers = [None] * len(fields)
+                    identifiers[index] = value
+                    header = dict(seq=1, run_id="run", kind="clock", t_wall_ns=2, t_mono_ns=3,
+                                  hook_ns=4, payload_bytes=0, **dict(zip(fields, identifiers)))
+                    expected = ujson.dumps(header, ensure_ascii=True, escape_forward_slashes=False)[:-1] + ',"body":{}}\n'
+                    self.assertEqual(expected.encode("ascii"),
+                                     frame(1, "run", "clock", 2, 3, 4, *identifiers, "{}"))
 
     def test_payload_size_counts_the_utf8_bytes_of_text_and_the_decoded_bytes_of_base64(self):
         for text in ("plain ascii", "雪 and é", ""):
