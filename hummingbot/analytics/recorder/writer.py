@@ -7,13 +7,16 @@ from operator import itemgetter
 from pathlib import Path
 from typing import Callable, Iterator, List, NamedTuple, Optional, Tuple
 
-from hummingbot.analytics.recorder.queue import CaptureQueue, Item
+from hummingbot.analytics.recorder.envelope import Pending, encode
+from hummingbot.analytics.recorder.queue import CaptureQueue
 from hummingbot.analytics.recorder.segments import Abandoned, ActiveSegment, write_run_json
 
-BATCH_BYTES = 1024 * 1024
-BATCH_ITEMS = 1024
+# The writer encodes a whole batch while holding the GIL, so small batches bound how long the trading thread waits.
+BATCH_BYTES = 256 * 1024
+BATCH_ITEMS = 128
 logger = logging.getLogger(__name__)
 GapFactory = Callable[[str, int, Optional[int], Optional[int], bool], Tuple[int, bytes]]
+Line = Tuple[int, bool, bytes]
 
 
 class DiskState(Enum):
@@ -29,17 +32,19 @@ class Finish(NamedTuple):
 
 
 class Writer:
-    """Own all run files. Hook bodies arrive only as immutable bytes, never as live bot objects."""
+    """Own all run files and turn queued records into lines. Records hold copies, never live bot objects."""
 
-    def __init__(self, run_dir: Path, settings, queue: CaptureQueue, make_gap: GapFactory,
-                 capture_diagnostics: Callable[[], Iterator[Tuple[int, bytes]]], on_dead: Callable[[], None],
-                 defer_diagnostics: Callable[[], None]):
+    def __init__(self, run_dir: Path, run_id: str, settings, queue: CaptureQueue, make_gap: GapFactory,
+                 capture_diagnostics: Callable[[], Iterator[Pending]], on_dead: Callable[[], None],
+                 defer_diagnostics: Callable[[], None], on_encode_error: Callable[[str, BaseException], None]):
         self.run_dir = run_dir
+        self.run_id = run_id
         self.queue = queue
         self.make_gap = make_gap
         self.capture_diagnostics = capture_diagnostics
         self.defer_diagnostics = defer_diagnostics
         self.on_dead = on_dead
+        self.on_encode_error = on_encode_error
         self.interval = settings.flush_interval_ms / 1000
         self.segment_max_bytes = settings.segment_max_bytes
         self.segment_max_seconds = settings.segment_max_seconds
@@ -133,19 +138,16 @@ class Writer:
     def _step(self) -> bool:
         self._check_disk()
         self._write_run_json(self.run_json)
-        if self.state is not DiskState.FAILED and DiskState.FULL not in self._gaps_written:
-            for first, last, priority in self.queue.take_drops():
-                seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
-                self._append(seq, line, rotate=self.state is not DiskState.FULL)
+        self._report_losses(self.queue.take_drops(), rotate=True)
         self._check_deadline()
-        batch = self.queue.pop_batch(BATCH_ITEMS, BATCH_BYTES)
+        batch = self._encode(self.queue.pop_batch(BATCH_ITEMS, BATCH_BYTES))
         if batch:
             if not self._append_batch(batch):
                 for seq, priority, line in batch:
                     if self._admit(seq, priority):
                         self._append(seq, line, priority=priority)
         if self.state not in (DiskState.FULL, DiskState.FAILED):
-            for seq, line in self.capture_diagnostics():
+            for seq, _, line in self._encode(list(self.capture_diagnostics())):
                 self._check_deadline()
                 self._append(seq, line)
         if self._segment is not None:
@@ -174,7 +176,27 @@ class Writer:
         self.clean = True
         return True
 
-    def _append_batch(self, batch: List[Item]) -> bool:
+    def _encode(self, records: List[Pending]) -> List[Line]:
+        """Encode in queue order. A record that fails becomes a dropped seq with its gap written before the batch."""
+        lines = []
+        for record in records:
+            try:
+                lines.append((record.seq, record.priority, encode(self.run_id, record)))
+            except Exception as error:
+                self.queue.discard(record.priority)
+                self._report_losses([(record.seq, record.seq, record.priority)], rotate=False)
+                self.on_encode_error(record.hook, error)
+        return lines
+
+    def _report_losses(self, ranges: List[Tuple[int, int, bool]], rotate: bool) -> None:
+        """Write queue_full gaps for dropped seqs. After a disk_full gap, that gap already covers every later seq."""
+        if self.state is DiskState.FAILED or DiskState.FULL in self._gaps_written:
+            return
+        for first, last, priority in ranges:
+            seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
+            self._append(seq, line, rotate=rotate and self.state is not DiskState.FULL)
+
+    def _append_batch(self, batch: List[Line]) -> bool:
         """Append a whole batch when nothing needs a per-record decision, so the GIL is held for microseconds."""
         segment = self._segment
         if self.state is not DiskState.OK or segment is None:
@@ -200,7 +222,7 @@ class Writer:
         return False
 
     def _stop_capture(self) -> None:
-        """Nothing more can be written, so refuse and release records instead of serializing them for nothing."""
+        """Nothing more can be written, so refuse and release records instead of encoding them for nothing."""
         self.queue.close()
         self.on_dead()
 
