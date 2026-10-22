@@ -221,6 +221,7 @@ class ConnectorBehaviorTests(IsolatedAsyncioWrapperTestCase):
             sequence = [(row["method"], row["path"]) for row in rows]
             self.assertEqual(("POST", "/api/v1/order"), sequence[-1])
             self.assertEqual(1, sequence.count(("GET", "/api/v1/ticker")))
+            self.assertEqual(1, sequence.count(("GET", "/wapi/v1/history/funding")))
             sequences.append(sequence)
         self.assertEqual([sequences[0]] * 3, sequences)
 

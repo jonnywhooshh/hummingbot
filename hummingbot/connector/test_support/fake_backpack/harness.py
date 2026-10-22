@@ -263,7 +263,7 @@ def bot_root(prefix, directory=None):
 
 @asynccontextmanager
 async def connected_backpack(pair: str = "SOL-USDC", state_dir=None, pre_start=None, post_stop=None,
-                             analytics_dir=None):
+                             analytics_dir=None, funding_poll_once=False):
     venue = FakeBackpackVenue(state_dir=state_dir, symbol=pair.replace("-", "_") + "_PERP")
     await venue.start()
     connector = None
@@ -276,6 +276,10 @@ async def connected_backpack(pair: str = "SOL-USDC", state_dir=None, pre_start=N
                     connector = ConnectorManager(client).create_connector(
                         "backpack_perpetual", [pair], True,
                         api_keys={"backpack_api_key": api_key, "backpack_api_secret": secret})
+                    if funding_poll_once:
+                        async def initial_funding_payments():
+                            await connector._update_all_funding_payments(fire_event_on_new=False)
+                        connector._funding_payment_polling_loop = initial_funding_payments
                     events = EventLog(connector)
                     clock = Clock(ClockMode.REALTIME, tick_size=1.0)
                     clock.add_iterator(connector)
@@ -431,7 +435,8 @@ async def v2_headless(controller_yaml, state_dir=None, pre_start=None, post_stop
 
 async def one_fill(state_dir=None, pre_start=None, post_stop=None, analytics_dir=None):
     async with connected_backpack(state_dir=state_dir, pre_start=pre_start, post_stop=post_stop,
-                                  analytics_dir=analytics_dir) as (venue, connector, events):
+                                  analytics_dir=analytics_dir, funding_poll_once=True) as (venue, connector, events):
+        await connector._funding_fee_polling_task
         book = connector.get_order_book("SOL-USDC")
         async with asyncio.timeout(5):
             while book.last_trade_price_rest_updated < 0:

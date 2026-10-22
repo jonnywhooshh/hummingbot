@@ -22,9 +22,9 @@ hummingbot.connector.test_support.fake_backpack``.
 
 ``serve --port 0 --state-dir DIR`` binds an ephemeral port and prints exactly
 ``FAKE_VENUE_READY port=PORT``. SIGINT or SIGTERM closes the venue.
-``one-fill --state-dir DIR`` waits for the initial REST ticker update before
-placing its order. It prints an OrderFilled event for trade 9001 and the signed
-order POST.
+``one-fill --state-dir DIR`` waits for the initial REST ticker update and funding
+payment snapshot before placing its order. It does not run periodic funding
+polls. It prints an OrderFilled event for trade 9001 and the signed order POST.
 ``run-v2 --controller-yaml FILE --ticks 30 --venue-script FILE`` runs
 V2WithControllers. Its venue script defines ``async def drive(venue, ctx)``.
 The context exposes the application, strategy, connectors, ticks, and executors.
