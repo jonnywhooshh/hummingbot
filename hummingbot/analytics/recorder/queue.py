@@ -1,6 +1,4 @@
 from collections import deque
-from itertools import repeat, starmap
-from operator import itemgetter
 from threading import RLock
 from typing import Deque, List, Optional, Tuple
 
@@ -129,18 +127,14 @@ class CaptureQueue:
         return item
 
     def pop_batch(self, max_items: int, max_bytes: int) -> List[Item]:
-        """Pop the oldest items with no Python-level per-item work, so the writer never holds the GIL for long.
-
-        The count is sized from the larger of the oldest and newest line, and at least one item is returned.
-        """
-        items = self.items
-        if not items:
-            return []
-        try:
-            line = max(len(items[0][2]), len(items[-1][2]), 1)
-        except IndexError:
-            return []
-        count = min(max_items, len(items), max(1, max_bytes // line))
-        batch = list(starmap(items.popleft, repeat((), count)))
-        self.bytes_out += sum(map(len, map(itemgetter(2), batch)))
+        """Pop an actual byte-bounded prefix, allowing one oversized item so the queue always makes progress."""
+        batch = []
+        size = 0
+        while self.items and len(batch) < max_items:
+            next_size = len(self.items[0][2])
+            if batch and size + next_size > max_bytes:
+                break
+            batch.append(self.items.popleft())
+            size += next_size
+        self.bytes_out += size
         return batch
