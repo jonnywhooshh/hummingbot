@@ -82,6 +82,7 @@ class RecorderTest(RunTestCase):
                     self.record("clock", {})
             self.record("clock", {"still": "works"})
             self.assertTrue(recorder.end_run({"path": "test"}))
+            self.wait_for(lambda: len(logs.records) == 10)
         self.assertEqual(10, len(logs.records))
         self.assertEqual(12, recorder.stats()["hook_errors"])
         self.assertEqual("works", self.records(run_dir)[0]["body"]["still"])
@@ -93,6 +94,7 @@ class RecorderTest(RunTestCase):
                 threading.get_ident())):
             recorder.hook_error("clock", ValueError("capture"))
             self.assertEqual([], logged)
+            self.assertTrue(recorder.end_run({}))
             self.wait_for(lambda: logged)
         self.assertNotEqual(threading.get_ident(), logged[0])
 
@@ -104,6 +106,49 @@ class RecorderTest(RunTestCase):
             self.assertTrue(recorder.end_run({"path": "test"}))
         self.assertEqual(1, recorder.stats()["hook_errors"])
         self.assertEqual("handler", self.records(run_dir)[0]["body"]["after"])
+
+    def test_diagnostics_become_log_evidence_with_an_explicit_recorder_origin(self):
+        run_dir = self.start(log_level="ERROR")
+        recorder.hook_error("clock", ValueError("diagnostic witness"))
+        self.assertTrue(recorder.end_run({}))
+        logs = [row["body"] for row in self.records(run_dir) if row["kind"] == "log"]
+        self.assertEqual(1, len(logs))
+        self.assertEqual({"logger", "level", "message", "exception", "origin"}, set(logs[0]))
+        self.assertEqual(("hummingbot.analytics.recorder", "ERROR", "recorder"),
+                         (logs[0]["logger"], logs[0]["level"], logs[0]["origin"]))
+        self.assertIn("Analytics hook clock failed, occurrence 1.", logs[0]["message"])
+        self.assertIn("ValueError: diagnostic witness", logs[0]["exception"])
+        self.assertEqual(0, recorder.stats()["hook_errors_by_hook"].get("log", 0))
+
+    def test_diagnostic_log_evidence_respects_the_configured_log_threshold(self):
+        run_dir = self.start(log_level="CRITICAL")
+        recorder.hook_error("clock", ValueError("below threshold"))
+        self.assertTrue(recorder.end_run({}))
+        self.assertEqual([], [row for row in self.records(run_dir) if row["kind"] == "log"])
+
+    def test_external_diagnostic_handlers_run_only_after_durable_run_end_and_do_not_delay_it(self):
+        run_dir = self.start()
+        recorder.pause()
+        release = threading.Event()
+        entered = threading.Event()
+        observed = []
+
+        def slow_handler(*args, **kwargs):
+            observed.append("run_end" in json.loads((run_dir / "run.json").read_bytes()))
+            entered.set()
+            release.wait(5)
+
+        with patch.object(recorder.logger, "error", side_effect=slow_handler):
+            try:
+                for _ in range(10):
+                    recorder.hook_error("clock", ValueError("capture"))
+                recorder.resume()
+                self.assertTrue(recorder.end_run({}))
+                self.assertTrue(entered.wait(1))
+                self.assertTrue(all(observed))
+                self.assertEqual(10, sum(row["kind"] == "log" for row in self.records(run_dir)))
+            finally:
+                release.set()
 
     def test_hook_name_owns_the_timing_bucket_and_foreign_threads_are_counted_not_recorded(self):
         self.start()
