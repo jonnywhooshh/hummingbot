@@ -54,6 +54,21 @@ class CaptureQueueTest(unittest.TestCase):
         self.assertEqual([1, 2, 3], [item[0] for item in queue.pop_batch(256, 300)])
         self.assertEqual([4], [item[0] for item in queue.pop_batch(256, 10)])
 
+    def test_pop_batch_uses_actual_bytes_when_middle_lines_are_larger(self):
+        queue = CaptureQueue(10_000, 10_000)
+        for seq, size in enumerate((1, 400, 400, 1), start=1):
+            queue.offer(seq, False, b"x" * size)
+        self.assertEqual([1, 2], [item[0] for item in queue.pop_batch(100, 500)])
+        self.assertEqual(401, queue.depth_bytes)
+
+    def test_pop_batch_does_not_undershoot_because_of_a_large_last_line(self):
+        queue = CaptureQueue(10_000, 10_000)
+        for seq, size in enumerate((100, 100, 100, 600), start=1):
+            queue.offer(seq, False, b"x" * size)
+        self.assertEqual([1, 2, 3], [item[0] for item in queue.pop_batch(100, 500)])
+        self.assertEqual([4], [item[0] for item in queue.pop_batch(100, 500)])
+        self.assertEqual(0, queue.depth_bytes)
+
     def test_close_between_offer_and_push_rejects_and_counts_the_record(self):
         queue = CaptureQueue(1000, 1000)
         push = queue.push
