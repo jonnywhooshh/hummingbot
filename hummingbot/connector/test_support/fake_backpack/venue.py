@@ -179,6 +179,8 @@ class FakeBackpackVenue:
 
     async def stop(self):
         self._stopping.set()
+        for accepted in self._accepted.values():
+            accepted.set()
         for ws in list(self.subscriptions):
             await ws.close()
         for task in list(self._tasks):
@@ -350,6 +352,8 @@ class FakeBackpackVenue:
                    public_trade_id: Optional[int] = None) -> dict:
         order = self.orders[str(order_id)]
         await self._accepted[str(order_id)].wait()
+        if self._stopping.is_set():
+            raise RuntimeError("Venue stopped before the fill")
         quantity = Decimal(qty)
         remaining = Decimal(order["quantity"]) - Decimal(order["executedQuantity"])
         if order["status"] not in ("New", "PartiallyFilled") or not 0 < quantity <= remaining:
@@ -378,6 +382,8 @@ class FakeBackpackVenue:
         available = Decimal(quantity) if quantity is not None else None
         for order in list(self.orders.values()):
             await self._accepted[order["id"]].wait()
+            if self._stopping.is_set():
+                return
             if order["status"] not in ("New", "PartiallyFilled") or order["orderType"] != "Limit":
                 continue
             side = self.book["asks" if order["side"] == "Bid" else "bids"]
@@ -519,9 +525,11 @@ class FakeBackpackVenue:
         return web.json_response(order)
 
     async def _after_accept(self, order):
-        await asyncio.sleep(self.ack_delay)
-        await self.push("account.orderUpdate", self._order_frame("orderAccepted", order))
-        self._accepted[order["id"]].set()
+        try:
+            await asyncio.sleep(self.ack_delay)
+            await self.push("account.orderUpdate", self._order_frame("orderAccepted", order))
+        finally:
+            self._accepted[order["id"]].set()
         if order["orderType"] == "Market":
             side = self.book["asks" if order["side"] == "Bid" else "bids"]
             if side:

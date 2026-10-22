@@ -1,11 +1,45 @@
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from test.hummingbot.connector.test_support.fake_backpack import test_fake_backpack as behavior
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+from hummingbot.connector.derivative.backpack_perpetual.backpack_perpetual_api_order_book_data_source import (
+    BackpackPerpetualAPIOrderBookDataSource,
+)
+from hummingbot.connector.test_support.fake_backpack import harness
+
+
+class OneFillStartupTests(IsolatedAsyncioWrapperTestCase):
+    async def test_one_fill_waits_for_the_initial_rest_price(self):
+        allowed = asyncio.Event()
+        finished = asyncio.Event()
+        get_prices = BackpackPerpetualAPIOrderBookDataSource.get_last_traded_prices
+        connected = harness.connected_backpack
+
+        async def delayed_prices(source, *args, **kwargs):
+            await allowed.wait()
+            prices = await get_prices(source, *args, **kwargs)
+            finished.set()
+            return prices
+
+        @asynccontextmanager
+        async def release_after_ready(**kwargs):
+            async with connected(**kwargs) as result:
+                timer = asyncio.get_running_loop().call_later(0.05, allowed.set)
+                try:
+                    yield result
+                finally:
+                    timer.cancel()
+
+        with patch.object(BackpackPerpetualAPIOrderBookDataSource, "get_last_traded_prices", delayed_prices), \
+                patch.object(harness, "connected_backpack", release_after_ready):
+            await harness.one_fill()
+        self.assertTrue(finished.is_set(), "one-fill cancelled the initial REST price request")
 
 
 class V2AcceptanceRegressionTests(IsolatedAsyncioWrapperTestCase):

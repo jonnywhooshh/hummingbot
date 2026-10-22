@@ -405,7 +405,7 @@ async def one_fill(state_dir=None, pre_start=None, post_stop=None, analytics_dir
                                   analytics_dir=analytics_dir) as (venue, connector, events):
         book = connector.get_order_book("SOL-USDC")
         async with asyncio.timeout(5):
-            while book.last_trade_price_rest_updated == 0:
+            while book.last_trade_price_rest_updated < 0:
                 await asyncio.sleep(0.001)
         poll = connector.order_book_tracker._update_last_trade_prices_task
         poll.cancel()

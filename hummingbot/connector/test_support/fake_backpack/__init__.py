@@ -9,8 +9,11 @@ Fault queues are independent for each method and path. A held request receives
 no response and does not execute. A dropped request executes before disconnect.
 The default LIMIT fill policy is manual. MARKET orders fill at the touch or
 expire when the opposite book is empty.
-Private fills wait for orderAccepted. A CROSSING trade appears once on the public
-tape and shares its trade ID with any resulting private fill.
+Private fills wait for the orderAccepted delivery attempt. A failed delivery
+still releases fills because the venue has accepted the order. Stopping the
+venue releases waiters without executing further fills.
+A CROSSING trade appears once on the public tape and shares its trade ID with
+any resulting private fill.
 Crossing post-only limits return INVALID_ORDER. The connector reports an order
 failure through its existing LIMIT_MAKER rejection path.
 
@@ -19,8 +22,9 @@ hummingbot.connector.test_support.fake_backpack``.
 
 ``serve --port 0 --state-dir DIR`` binds an ephemeral port and prints exactly
 ``FAKE_VENUE_READY port=PORT``. SIGINT or SIGTERM closes the venue.
-``one-fill --state-dir DIR`` prints an OrderFilled event for trade 9001 and
-the signed order POST.
+``one-fill --state-dir DIR`` waits for the initial REST ticker update before
+placing its order. It prints an OrderFilled event for trade 9001 and the signed
+order POST.
 ``run-v2 --controller-yaml FILE --ticks 30 --venue-script FILE`` runs
 V2WithControllers. Its venue script defines ``async def drive(venue, ctx)``.
 The context exposes the application, strategy, connectors, ticks, and executors.

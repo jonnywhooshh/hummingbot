@@ -222,8 +222,7 @@ class ConnectorBehaviorTests(IsolatedAsyncioWrapperTestCase):
             self.assertEqual(("POST", "/api/v1/order"), sequence[-1])
             self.assertEqual(1, sequence.count(("GET", "/api/v1/ticker")))
             sequences.append(sequence)
-        self.assertEqual([sorted(sequences[0])] * 3, [sorted(sequence) for sequence in sequences])
-        self.assertEqual([sequences[0][-2:]] * 3, [sequence[-2:] for sequence in sequences])
+        self.assertEqual([sequences[0]] * 3, sequences)
 
     async def test_400_then_accepted_retry(self):
         async with connected_backpack() as (venue, connector, events):
