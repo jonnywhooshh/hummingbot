@@ -8,7 +8,7 @@ import statistics
 import tempfile
 import time
 import unittest
-from collections import defaultdict
+from collections import OrderedDict, UserDict, UserList, defaultdict
 from decimal import Decimal
 from pathlib import Path
 from test.hummingbot.analytics.recorder.support import RunTestCase
@@ -21,7 +21,7 @@ from uuid import UUID
 import aiohttp
 from aiohttp import web
 from aioresponses import aioresponses
-from multidict import CIMultiDict, CIMultiDictProxy
+from multidict import CIMultiDict, CIMultiDictProxy, MultiDict
 from yarl import URL
 
 from hummingbot.analytics import recorder, redaction
@@ -37,6 +37,10 @@ from hummingbot.core.web_assistant.connections.data_types import (
 )
 from hummingbot.core.web_assistant.connections.rest_connection import RESTConnection
 from hummingbot.core.web_assistant.connections.ws_connection import WSConnection
+
+MAPPING_FACTORIES = (dict, MultiDict, lambda items: CIMultiDictProxy(CIMultiDict(items)),
+                     MappingProxyType, OrderedDict, UserDict)
+SEQUENCE_FACTORIES = (list, tuple, UserList)
 
 
 class TransportTest(IsolatedAsyncioWrapperTestCase):
@@ -494,6 +498,31 @@ class TransportTest(IsolatedAsyncioWrapperTestCase):
         rows = [row for row in RunTestCase.records(self.run_dir) if row["kind"] == "ws_in"]
         self.assertEqual(inbound.data.encode(), self.raw(rows[0]))
 
+    async def test_nested_mapping_credentials_do_not_reach_disk(self):
+        secrets.add("registered-secret")
+        rules = redaction.Rules((), (), (), (("auth", "token"),))
+        originals = []
+        with patch.dict(redaction.TABLE, {"backpack_perpetual": rules}):
+            for factory in MAPPING_FACTORIES:
+                for sequence in SEQUENCE_FACTORIES:
+                    data = {"auth": factory({"token": "structural-secret"}),
+                            "wrapped": sequence([factory({"registered-secret": "registered-secret"})])}
+                    originals.append((data, repr(data)))
+                    request = RESTRequest(RESTMethod.POST, "https://api.backpack.exchange/path", data=data)
+                    self.assertIsNotNone(transport.rest(transport.rest_sent(), request, None, None))
+        captured = self.records("rest")
+        self.assertEqual(len(MAPPING_FACTORIES) * len(SEQUENCE_FACTORIES), len(captured))
+        for record in captured:
+            self.assertEqual({"auth": {"token": "<redacted>"},
+                              "wrapped": [{"<redacted>": "<redacted>"}]}, record["body"]["data"])
+            self.assertEqual(["auth.token", "secure_config_value"], record["body"]["redacted"])
+        for line in segments.iter_records(self.run_dir):
+            self.assertNotIn(b"registered-secret", line)
+            self.assertNotIn(b"structural-secret", line)
+        for original, before in originals:
+            self.assertEqual(before, repr(original))
+        self.assertEqual(0, recorder.stats()["hook_errors"])
+
 
 class RedactionTest(unittest.TestCase):
     def setUp(self):
@@ -549,6 +578,46 @@ class RedactionTest(unittest.TestCase):
         unchanged = {"key": [1, "plain"]}
         self.assertEqual((unchanged, False), redaction.scrub_tree(unchanged))
         self.assertEqual((["<redacted>"], True), redaction.scrub_tree(("configured-secret",)))
+
+    def test_structural_paths_do_not_index_text_or_binary_values(self):
+        for value in ("token", b"token", bytearray(b"token"), memoryview(b"token")):
+            with self.subTest(value=value):
+                original = {"auth": value}
+                clean, removed = redaction.redact_paths(original, (("auth", 0),))
+                self.assertIs(original, clean)
+                self.assertEqual([], removed)
+
+    def test_structural_paths_cover_mapping_and_sequence_containers(self):
+        for factory in MAPPING_FACTORIES:
+            for sequence in SEQUENCE_FACTORIES:
+                with self.subTest(mapping=factory, sequence=sequence):
+                    original = {"auth": factory({"token": "structural-secret"}),
+                                "rows": sequence([factory({"token": "row-secret"})])}
+                    before = repr(original)
+                    clean, removed = redaction.redact_paths(original, (("auth", "token"), ("rows", 0, "token")))
+                    self.assertEqual({"auth": {"token": "<redacted>"},
+                                      "rows": [{"token": "<redacted>"}]}, clean)
+                    self.assertEqual(["auth.token", "rows[0].token"], removed)
+                    self.assertEqual(before, repr(original))
+                    unchanged, removed = redaction.redact_paths(original, (("missing",),))
+                    self.assertIs(original, unchanged)
+                    self.assertEqual([], removed)
+
+    def test_registered_secrets_cover_mapping_and_sequence_containers(self):
+        secrets.add("registered-secret")
+        for factory in MAPPING_FACTORIES:
+            for sequence in SEQUENCE_FACTORIES:
+                with self.subTest(mapping=factory, sequence=sequence):
+                    original = {"wrapped": sequence([factory({"registered-secret": "registered-secret"})])}
+                    before = repr(original)
+                    clean, changed = redaction.scrub_tree(original)
+                    self.assertTrue(changed)
+                    self.assertEqual({"wrapped": [{"<redacted>": "<redacted>"}]}, clean)
+                    self.assertEqual(before, repr(original))
+                    unchanged = {"wrapped": sequence([factory({"keep": "plain"})])}
+                    clean, changed = redaction.scrub_tree(unchanged)
+                    self.assertIs(unchanged, clean)
+                    self.assertFalse(changed)
 
 
 class TransportEquivalenceTest(unittest.TestCase):
