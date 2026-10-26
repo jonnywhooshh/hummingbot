@@ -77,16 +77,22 @@ class ActiveSegment:
         self.last_seq: Optional[int] = None
         self.dirty = False
         self._pending: List[bytes] = []
+        self._pending_seqs: List[int] = []
         self._pending_priority: List[bool] = []
+        self._covers: Dict[int, Tuple[int, int, bool]] = {}
         self.written_records = 0
         self.priority_records = 0
         self.written_priority = 0
 
-    def add(self, seq: int, line: bytes, priority: bool = True) -> None:
+    def add(self, seq: int, line: bytes, priority: bool = True, covers: Optional[Tuple[int, int, bool]] = None) -> None:
+        """Add one line. covers is the seq range a capture_gap line explains, which is lost again if the line is."""
         if self.opened is None:
             self.opened = time.monotonic()
         self._pending.append(line)
+        self._pending_seqs.append(seq)
         self._pending_priority.append(priority)
+        if covers is not None:
+            self._covers[seq] = covers
         self.priority_records += priority
         self.size += len(line)
         self.records += 1
@@ -99,6 +105,7 @@ class ActiveSegment:
         if self.opened is None:
             self.opened = time.monotonic()
         self._pending.extend(lines)
+        self._pending_seqs.extend(seqs)
         self._pending_priority.extend(priorities)
         self.priority_records += sum(priorities)
         self.size += sum(map(len, lines))
@@ -119,6 +126,7 @@ class ActiveSegment:
                 self.written_records += len(chunk)
                 self.written_priority += sum(self._pending_priority[:len(chunk)])
                 del self._pending_priority[:len(chunk)]
+                del self._pending_seqs[:len(chunk)]
                 del self._pending[:len(chunk)]
                 continue
             done = 0
@@ -128,8 +136,16 @@ class ActiveSegment:
             self.written_records += done
             self.written_priority += sum(self._pending_priority[:done])
             del self._pending_priority[:done]
+            del self._pending_seqs[:done]
             del self._pending[:done]
             self._pending[0] = self._pending[0][written:]
+        self._covers.clear()
+
+    def unwritten(self) -> List[Tuple[int, int, bool]]:
+        """Seq ranges of the lines not yet written whole, plus the ranges their capture_gap lines explain."""
+        lost = [(seq, seq, priority) for seq, priority in zip(self._pending_seqs, self._pending_priority)]
+        lost.extend(self._covers[seq] for seq in self._pending_seqs if seq in self._covers)
+        return lost
 
     def sync(self) -> None:
         self.flush()

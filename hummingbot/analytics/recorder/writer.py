@@ -2,10 +2,11 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from enum import Enum
 from operator import itemgetter
 from pathlib import Path
-from typing import Callable, Iterator, List, NamedTuple, Optional, Tuple
+from typing import Callable, Deque, Iterator, List, NamedTuple, Optional, Tuple
 
 from hummingbot.analytics.recorder.queue import CaptureQueue, Item
 from hummingbot.analytics.recorder.segments import Abandoned, ActiveSegment, write_run_json
@@ -14,6 +15,7 @@ BATCH_BYTES = 1024 * 1024
 BATCH_ITEMS = 1024
 logger = logging.getLogger(__name__)
 GapFactory = Callable[[str, int, Optional[int], Optional[int], bool], Tuple[int, bytes]]
+SeqRange = Tuple[int, int, bool]
 
 
 class DiskState(Enum):
@@ -66,6 +68,9 @@ class Writer:
         self._drain_requested = False
         self._drain_complete = False
         self._drained = threading.Event()
+        self._unreported: Deque[SeqRange] = deque()
+        self._unsent: Deque[Item] = deque()
+        self._holding: Optional[SeqRange] = None
         self._thread = threading.Thread(target=self._loop, name="analytics-writer", daemon=True)
 
     @property
@@ -99,9 +104,12 @@ class Writer:
         self._thread.join(max(0.0, deadline - time.monotonic()))
         return self.clean and not self._thread.is_alive()
 
-    def _check_deadline(self) -> None:
+    def _past_deadline(self) -> bool:
         finish = self._finish
-        if finish is not None and time.monotonic() >= finish.deadline:
+        return finish is not None and time.monotonic() >= finish.deadline
+
+    def _check_deadline(self) -> None:
+        if self._past_deadline():
             raise Abandoned()
 
     def _loop(self) -> None:
@@ -121,10 +129,7 @@ class Writer:
         except Abandoned:
             pass
         except Exception:
-            self.errors += 1
-            self.state = DiskState.FAILED
-            self._stop_capture()
-            logger.exception("Analytics writer stopped writing %s.", self.run_dir)
+            self._fail()
         finally:
             self._give_up()
             self._drained.set()
@@ -134,16 +139,23 @@ class Writer:
         self._check_disk()
         self._write_run_json(self.run_json)
         if self.state is not DiskState.FAILED and DiskState.FULL not in self._gaps_written:
-            for first, last, priority in self.queue.take_drops():
+            unreported = self._unreported
+            unreported.extend(self.queue.take_drops())
+            while unreported:
+                first, last, priority = unreported[0]
                 seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
-                self._append(seq, line, rotate=self.state is not DiskState.FULL)
+                self._append(seq, line, rotate=self.state is not DiskState.FULL, covers=unreported[0])
+                unreported.popleft()
         self._check_deadline()
         batch = self.queue.pop_batch(BATCH_ITEMS, BATCH_BYTES)
-        if batch:
-            if not self._append_batch(batch):
-                for seq, priority, line in batch:
-                    if self._admit(seq, priority):
-                        self._append(seq, line, priority=priority)
+        if batch and not self._append_batch(batch):
+            unsent = self._unsent
+            unsent.extend(batch)
+            while unsent:
+                seq, priority, line = unsent[0]
+                if self._admit(seq, priority):
+                    self._append(seq, line, priority=priority)
+                unsent.popleft()
         if self.state not in (DiskState.FULL, DiskState.FAILED):
             for seq, line in self.capture_diagnostics():
                 self._check_deadline()
@@ -188,15 +200,15 @@ class Writer:
         state = self.state
         if state is DiskState.OK or (state is DiskState.LOW and priority):
             return True
-        self.disk_dropped += 1
-        self.disk_dropped_priority += priority
         if state is not DiskState.FAILED and state not in self._gaps_written:
-            self._gaps_written.add(state)
             gap_seq, line = self.make_gap(state.value, seq, None, None, state is DiskState.FULL)
-            self._append(gap_seq, line, rotate=False)
+            self._append(gap_seq, line, rotate=False, covers=(seq, seq, priority))
             self._sync()
+            self._gaps_written.add(state)
             if state is DiskState.FULL:
                 self._stop_capture()
+        self.disk_dropped += 1
+        self.disk_dropped_priority += priority
         return False
 
     def _stop_capture(self) -> None:
@@ -204,7 +216,9 @@ class Writer:
         self.queue.close()
         self.on_dead()
 
-    def _append(self, seq: int, line: bytes, rotate: bool = True, priority: bool = True) -> None:
+    def _append(self, seq: int, line: bytes, rotate: bool = True, priority: bool = True,
+                covers: Optional[SeqRange] = None) -> None:
+        self._holding = (seq, seq, priority)
         segment = self._segment
         if rotate and segment is not None and segment.records and segment.size + len(line) > self.segment_max_bytes:
             self._close_segment()
@@ -212,7 +226,8 @@ class Writer:
         if segment is None:
             segment = self._segment = ActiveSegment(self.run_dir, self._next_number)
             self._next_number += 1
-        segment.add(seq, line, priority)
+        segment.add(seq, line, priority, covers)
+        self._holding = None
 
     def _close_segment(self) -> None:
         self._segment.close(self._check_deadline)
@@ -245,15 +260,91 @@ class Writer:
             self._run_json_written = data
 
     def _give_up(self) -> None:
-        segment = self._segment
-        if segment is not None:
-            try:
-                segment.abandon()
-            except OSError:
-                self.errors += 1
-            finally:
-                self._written += segment.written_records
-                self.disk_dropped += segment.records - segment.written_records
-                self.disk_dropped_priority += segment.priority_records - segment.written_priority
-                self._segment = None
+        self._abandon_segment()
         self.queue.close()
+
+    def _abandon_segment(self) -> List[SeqRange]:
+        """Write what the active segment can still take, then count and return the seqs it could not."""
+        segment = self._segment
+        if segment is None:
+            return []
+        try:
+            segment.abandon()
+        except OSError:
+            self.errors += 1
+        finally:
+            self._written += segment.written_records
+            self.disk_dropped += segment.records - segment.written_records
+            self.disk_dropped_priority += segment.priority_records - segment.written_priority
+            self._segment = None
+        return segment.unwritten()
+
+    def _fail(self) -> None:
+        """Stop capture after an error and write a queue_full gap for every seq the run lost, now and at end_run.
+
+        The writer waits for end_run because only then has the trading thread stopped taking seqs, so its last report
+        also covers records refused after the first. Each report goes to a fresh segment, because the failed one may
+        end inside a line.
+        """
+        self._drained.set()
+        lost = self._in_flight() + self.queue.close()
+        self.on_dead()
+        logger.exception("Analytics writer stopped writing %s.", self.run_dir)
+        lost = self._report(lost + self._abandon_segment() + self.queue.take_drops())
+        self.errors += 1
+        self.state = DiskState.FAILED
+        while self._finish is None:
+            self._wake.wait()
+            self._wake.clear()
+        self._report(lost + self.queue.take_drops())
+
+    def _in_flight(self) -> List[SeqRange]:
+        """Seq ranges the writer took but never handed to a segment. The records among them count as disk_dropped."""
+        lost = list(self._unreported)
+        for seq, priority, _ in self._unsent:
+            lost.append((seq, seq, priority))
+            self.disk_dropped += 1
+            self.disk_dropped_priority += priority
+        if self._holding is not None:
+            lost.append(self._holding)
+        return lost
+
+    def _report(self, lost: List[SeqRange]) -> List[SeqRange]:
+        """Write a queue_full gap for each run of lost seqs to a fresh segment, and return the seqs still unreported.
+
+        After a disk_full gap nothing is written, because that gap already explains every later seq.
+        """
+        ranges = _merged(lost)
+        if not ranges or DiskState.FULL in self._gaps_written or self._past_deadline():
+            return ranges
+        try:
+            segment = ActiveSegment(self.run_dir, self._next_number)
+        except OSError:
+            self.errors += 1
+            return ranges
+        self._next_number += 1
+        for first, last, priority in ranges:
+            seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
+            segment.add(seq, line, True, (first, last, priority))
+        try:
+            segment.sync()
+        except OSError:
+            self.errors += 1
+        try:
+            segment.abandon()
+        except OSError:
+            self.errors += 1
+        self._written += segment.written_records
+        return segment.unwritten()
+
+
+def _merged(ranges: List[SeqRange]) -> List[SeqRange]:
+    """Sort seq ranges and join those that overlap or touch, keeping whether any of them held a priority record."""
+    merged: List[SeqRange] = []
+    for first, last, priority in sorted(ranges):
+        if merged and first <= merged[-1][1] + 1:
+            start, end, any_priority = merged[-1]
+            merged[-1] = (start, max(end, last), any_priority or priority)
+        else:
+            merged.append((first, last, priority))
+    return merged

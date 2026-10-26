@@ -96,12 +96,18 @@ class CaptureQueue:
         else:
             current.snapshot = (seq, seq if priority else current.snapshot[1])
 
-    def close(self) -> None:
-        """Refuse every later record and release the queued ones. Called by the writer once it can write no more."""
+    def close(self) -> List[Tuple[int, int, bool]]:
+        """Refuse every later record and release the queued ones, returning their seqs as one-seq ranges.
+
+        Called by the writer once it can write no more.
+        """
         self.closed = True
+        released = []
         while (item := self.pop()) is not None:
             self._discarded += 1
             self._discarded_priority += item[1]
+            released.append((item[0], item[0], item[1]))
+        return released
 
     def seal_drops(self) -> None:
         if self._open is not None:

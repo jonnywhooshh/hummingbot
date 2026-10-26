@@ -1,5 +1,6 @@
 import gzip
 import hashlib
+import io
 import json
 import os
 import threading
@@ -9,6 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from hummingbot.analytics import recorder
+from hummingbot.analytics.commands import dump
+from hummingbot.analytics.recorder import segments
 from hummingbot.client.config.client_config_map import AnalyticsConfigMap
 
 
@@ -111,8 +114,7 @@ class WriterFailureTest(RunTestCase):
 
         with patch("hummingbot.analytics.recorder.segments.os.writev", side_effect=writev):
             recorder.resume()
-            run.writer._thread.join(5)
-        self.assertFalse(run.writer._thread.is_alive())
+            self.wait_for(lambda: recorder.stats()["disk"] == "failed")
         stats = recorder.stats()
         self.assertEqual(1, len(self.records(run_dir)))
         self.assertEqual(1, stats["written"])
@@ -127,6 +129,66 @@ class WriterFailureTest(RunTestCase):
         self.start()
         first.writer_dead()
         self.assertTrue(recorder.ACTIVE)
+
+    def assert_every_seq_written_or_explained_once(self, run_dir):
+        records = self.records(run_dir)
+        seqs = [row["seq"] for row in records]
+        for row in records:
+            if row["kind"] == "capture_gap":
+                seqs.extend(range(row["body"]["first_seq"], row["body"]["last_seq"] + 1))
+        self.assertEqual(list(range(1, max(seqs) + 1)), sorted(seqs))
+        out = io.BytesIO()
+        self.assertEqual(0, dump.main(["--run", str(run_dir), "--verify"], out), out.getvalue())
+
+    def fill_past_a_small_queue(self):
+        run_dir = self.start(queue_max_bytes=20_000, priority_reserve_bytes=0)
+        recorder.pause()
+        for index in range(60):
+            self.record("ws_in", {"text": "q" * 1000, "index": index})
+        return run_dir
+
+    def test_a_writer_that_stops_reports_every_seq_it_could_not_write(self):
+        run_dir = self.fill_past_a_small_queue()
+        real_writev = os.writev
+        calls = []
+
+        def writev(fd, lines):
+            calls.append(fd)
+            if len(calls) == 1:
+                raise OSError(5, "EIO")
+            return real_writev(fd, lines)
+
+        with patch("hummingbot.analytics.recorder.writer.BATCH_ITEMS", 5), \
+                patch("hummingbot.analytics.recorder.segments.os.writev", side_effect=writev):
+            recorder.resume()
+            self.wait_for(lambda: recorder.stats()["disk"] == "failed")
+        for index in range(3):
+            self.record("ws_in", {"text": "after the writer stopped", "index": index})
+        self.assertFalse(recorder.end_run({"path": "test"}))
+        self.assert_every_seq_written_or_explained_once(run_dir)
+
+    def test_seqs_a_failed_report_could_not_write_are_reported_at_run_end(self):
+        run_dir = self.fill_past_a_small_queue()
+        with patch("hummingbot.analytics.recorder.writer.BATCH_ITEMS", 5), \
+                patch("hummingbot.analytics.recorder.segments.os.writev", side_effect=OSError(5, "EIO")):
+            recorder.resume()
+            self.wait_for(lambda: recorder.stats()["disk"] == "failed")
+        self.assertFalse(recorder.end_run({"path": "test"}))
+        self.assert_every_seq_written_or_explained_once(run_dir)
+
+    def test_a_writer_that_stops_mid_batch_counts_and_reports_the_rest_of_the_batch(self):
+        run_dir = self.start(segment_max_bytes=4000)
+        recorder.pause()
+        for index in range(10):
+            self.record("clock", {"text": "r" * 1000, "index": index})
+        with patch.object(segments.ActiveSegment, "close", side_effect=OSError(28, "ENOSPC")):
+            recorder.resume()
+            self.wait_for(lambda: recorder.stats()["disk"] == "failed")
+        stats = recorder.stats()
+        self.assertFalse(recorder.end_run({"path": "test"}))
+        written = sum(row["kind"] == "clock" for row in self.records(run_dir))
+        self.assertEqual(stats["records"], written + stats["dropped"] + stats["disk_dropped"])
+        self.assert_every_seq_written_or_explained_once(run_dir)
 
 
 class DiskFloorTest(RunTestCase):
