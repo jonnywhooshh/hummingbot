@@ -287,8 +287,8 @@ class Writer:
         end inside a line.
         """
         self._drained.set()
-        lost = self._in_flight() + self.queue.close()
         self.on_dead()
+        lost = self._in_flight() + self.queue.close()
         logger.exception("Analytics writer stopped writing %s.", self.run_dir)
         lost = self._report(lost + self._abandon_segment() + self.queue.take_drops())
         self.errors += 1
