@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import time
 from json import JSONDecodeError
 from typing import Any, Dict, Mapping, Optional
@@ -6,18 +7,26 @@ from typing import Any, Dict, Mapping, Optional
 import aiohttp
 from aiohttp import WebSocketError, WSCloseCode
 
+from hummingbot.analytics import recorder
+from hummingbot.analytics.hooks import transport
 from hummingbot.core.web_assistant.connections.data_types import WSRequest, WSResponse
 
 
 class WSConnection:
     _MAX_MSG_SIZE = 4 * 1024 * 1024  # default aiohttp: 4 * 1024 * 1024
+    _connection_ids = itertools.count(1)
 
     def __init__(self, aiohttp_client_session: aiohttp.ClientSession):
+        self._capture = transport.SocketCapture(next(WSConnection._connection_ids))
         self._client_session = aiohttp_client_session
         self._connection: Optional[aiohttp.ClientWebSocketResponse] = None
         self._connected = False
         self._message_timeout: Optional[float] = None
         self._last_recv_time = 0
+
+    @property
+    def connection_id(self) -> int:
+        return self._capture.connection_id
 
     @property
     def last_recv_time(self) -> float:
@@ -36,24 +45,37 @@ class WSConnection:
         max_msg_size: Optional[int] = None
     ):
         self._ensure_not_connected()
-        self._connection = await self._client_session.ws_connect(
-            ws_url,
-            headers=ws_headers,
-            autoping=False,
-            heartbeat=ping_timeout,
-            max_msg_size=max_msg_size,
-        )
+        self._capture.url = ws_url
+        self._capture.authenticated = False
+        try:
+            self._connection = await self._client_session.ws_connect(
+                ws_url,
+                headers=ws_headers,
+                autoping=False,
+                heartbeat=ping_timeout,
+                max_msg_size=max_msg_size,
+            )
+        except Exception as error:
+            self._capture_failure(error)
+            raise
         self._message_timeout = message_timeout
         self._connected = True
+        if recorder.ACTIVE:
+            transport.ws_conn(self._capture, "connect")
 
     async def disconnect(self):
+        was_connected = self._connected
         if self._connection is not None and not self._connection.closed:
             await self._connection.close()
         self._connection = None
         self._connected = False
+        if was_connected and recorder.ACTIVE:
+            transport.ws_conn(self._capture, "disconnect")
 
     async def send(self, request: WSRequest):
         self._ensure_connected()
+        if recorder.ACTIVE:
+            transport.ws_out(self._capture, request)
         await request.send_with_connection(connection=self)
 
     async def ping(self):
@@ -63,12 +85,21 @@ class WSConnection:
         self._ensure_connected()
         response = None
         while self._connected:
-            msg = await self._read_message()
-            msg = await self._process_message(msg)
+            try:
+                msg = await self._read_message()
+                msg = await self._process_message(msg)
+            except Exception as error:
+                self._capture_failure(error)
+                raise
             if msg is not None:
                 response = self._build_resp(msg)
                 break
         return response
+
+    def _capture_failure(self, error: Exception):
+        if recorder.ACTIVE:
+            event = "timeout" if isinstance(error, asyncio.TimeoutError) else "error"
+            transport.ws_conn(self._capture, event, error)
 
     def _ensure_not_connected(self):
         if self._connected:
@@ -83,6 +114,8 @@ class WSConnection:
             msg = await self._connection.receive(self._message_timeout)
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError("Message receive timed out.")
+        if recorder.ACTIVE:
+            transport.ws_in(self._capture, msg)
         return msg
 
     async def _process_message(self, msg: aiohttp.WSMessage) -> Optional[aiohttp.WSMessage]:
