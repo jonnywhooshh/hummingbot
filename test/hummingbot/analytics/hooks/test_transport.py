@@ -150,11 +150,13 @@ class TransportTest(IsolatedAsyncioWrapperTestCase):
     async def test_serialization_failure_does_not_change_socket_calls(self):
         message = aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, '{"ok":true}', "")
         connection, socket = await self.socket([message])
-        with patch.object(transport.ujson, "dumps", side_effect=ValueError("encode failure")):
+        with patch.object(transport, "ujson", wraps=transport.ujson) as encoder:
+            encoder.dumps.side_effect = ValueError("encode failure")
             await connection.send(WSJSONRequest({"ok": True}))
             self.assertEqual({"ok": True}, (await connection.receive()).data)
         socket.send_json.assert_awaited_once_with({"ok": True})
-        self.assertEqual({"ws_out": 1, "ws_in": 1}, recorder.stats()["hook_errors_by_hook"])
+        self.assertEqual([message.data], [row["body"]["text"] for row in self.records("ws_in")])
+        self.assertEqual({"ws_out": 1}, recorder.stats()["hook_errors_by_hook"])
 
     async def test_connection_events_retain_id_across_reconnect(self):
         connection, socket = await self.socket([asyncio.TimeoutError(), ConnectionResetError("peer reset")])
