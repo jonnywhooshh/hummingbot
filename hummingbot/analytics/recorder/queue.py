@@ -1,12 +1,10 @@
 from bisect import bisect_right
 from collections import deque
 from itertools import accumulate, islice, repeat, starmap
-from operator import attrgetter
+from operator import itemgetter
 from typing import Deque, List, Optional, Tuple
 
-from hummingbot.analytics.recorder.envelope import Pending
-
-_size = attrgetter("size")
+Item = Tuple[int, bool, bytes]
 
 
 class DropRange:
@@ -23,11 +21,10 @@ class CaptureQueue:
     """Single hook producer and single writer consumer. Neither side ever waits for the other or takes a lock.
 
     The producer owns admission counters and drop snapshots. The consumer owns discarded counts and bytes_out.
-    Bounds charge each record's size, an upper bound of its encoded line, until the writer pops it.
     """
 
     def __init__(self, bulk_bound: int, priority_bound: int):
-        self.items: Deque[Pending] = deque()
+        self.items: Deque[Item] = deque()
         self.closed = False
         self.bulk_bound = bulk_bound
         self.priority_bound = priority_bound
@@ -56,14 +53,13 @@ class CaptureQueue:
     def __len__(self) -> int:
         return len(self.items)
 
-    def offer(self, record: Pending) -> bool:
-        bound = self.priority_bound if record.priority else self.bulk_bound
-        if self.closed or self.depth_bytes + record.size > bound:
-            self.lose(record.seq, record.priority)
+    def offer(self, seq: int, priority: bool, line: bytes) -> bool:
+        if self.closed or self.depth_bytes + len(line) > (self.priority_bound if priority else self.bulk_bound):
+            self.lose(seq, priority)
             return False
-        return self.push(record)
+        return self.push(seq, line, priority)
 
-    def push(self, record: Pending) -> bool:
+    def push(self, seq: int, line: bytes, priority: bool = True) -> bool:
         """Bypass capacity for lifecycle records, but never leave a record in a queue that close() has released.
 
         deque append, remove, and popleft are atomic, so a record appended while the writer closes the queue is
@@ -71,18 +67,19 @@ class CaptureQueue:
         """
         self.seal_drops()
         if self.closed:
-            self.lose(record.seq, record.priority)
+            self.lose(seq, priority)
             return False
-        self.bytes_in += record.size
-        self.items.append(record)
+        item = (seq, priority, line)
+        self.bytes_in += len(line)
+        self.items.append(item)
         if self.closed:
             try:
-                self.items.remove(record)
+                self.items.remove(item)
             except ValueError:
                 pass
             else:
-                self.bytes_in -= record.size
-                self.lose(record.seq, record.priority)
+                self.bytes_in -= len(line)
+                self.lose(seq, priority)
                 return False
         self.accepted += 1
         return True
@@ -99,16 +96,12 @@ class CaptureQueue:
         else:
             current.snapshot = (seq, seq if priority else current.snapshot[1])
 
-    def discard(self, priority: bool) -> None:
-        """Count a record the consumer took a seq for but will never write. Consumer only."""
-        self._discarded += 1
-        self._discarded_priority += priority
-
     def close(self) -> None:
         """Refuse every later record and release the queued ones. Called by the writer once it can write no more."""
         self.closed = True
-        while (record := self.pop()) is not None:
-            self.discard(record.priority)
+        while (item := self.pop()) is not None:
+            self._discarded += 1
+            self._discarded_priority += item[1]
 
     def seal_drops(self) -> None:
         if self._open is not None:
@@ -130,22 +123,22 @@ class CaptureQueue:
             self._ranges.popleft()
         return ranges
 
-    def pop(self) -> Optional[Pending]:
+    def pop(self) -> Optional[Item]:
         try:
-            record = self.items.popleft()
+            item = self.items.popleft()
         except IndexError:
             return None
-        self.bytes_out += record.size
-        return record
+        self.bytes_out += len(item[2])
+        return item
 
-    def pop_batch(self, max_items: int, max_bytes: int) -> List[Pending]:
-        """Pop a prefix bounded by charged bytes, allowing one oversized record so the queue always makes progress.
+    def pop_batch(self, max_items: int, max_bytes: int) -> List[Item]:
+        """Pop a byte-bounded prefix, allowing one oversized item so the queue always makes progress.
 
-        Sizes come from one pass of C-level calls, so popping holds the GIL for microseconds and the producer never
+        Sizes come from one pass of C-level calls, so the writer holds the GIL for microseconds and the caller never
         waits on a Python-level per-item loop.
         """
         items = self.items
-        ends = list(accumulate(map(_size, islice(items, max_items))))
+        ends = list(accumulate(map(len, map(itemgetter(2), islice(items, max_items)))))
         if not ends:
             return []
         count = max(1, bisect_right(ends, max_bytes))

@@ -1,12 +1,10 @@
 """Capture immutable observations without waiting on the trading path.
 
 Hooks check the module attribute ACTIVE before building a body, then call record with their perf_counter_ns start
-and hook name. record copies the body and queues it, and the writer thread encodes it. The trading thread encodes
-only lifecycle records and identifiers that are not strings. Local evidence is always priority. Authenticated
-transport hooks pass priority=True after redaction. Only end_run waits for the writer, for at most two seconds after
-the strategy has stopped. Activation leaves the process allocator unchanged. Recorder-owned log evidence has
-body.origin="recorder" and the application-log body fields logger, level, message, and exception. It respects
-log_level. External error handlers run after file work ends.
+and hook name. Local evidence is always priority. Authenticated transport hooks pass priority=True after redaction.
+Only end_run waits for the writer, for at most two seconds after the strategy has stopped. Activation leaves the
+process allocator unchanged. Recorder-owned log evidence has body.origin="recorder" and the application-log body
+fields logger, level, message, and exception. It respects log_level. External error handlers run after file work ends.
 """
 import itertools
 import logging
@@ -20,16 +18,7 @@ from typing import Any, Deque, Dict, Iterator, NamedTuple, Optional, Tuple, Unio
 from uuid import UUID
 
 from hummingbot.analytics.recorder import accounts, secrets, timing
-from hummingbot.analytics.recorder.envelope import (
-    Pending,
-    Raw,
-    encode_body,
-    gap_line,
-    header_bound,
-    identifiers,
-    payload,
-    snapshot,
-)
+from hummingbot.analytics.recorder.envelope import encode_body, frame, gap_line, payload, payload_size
 from hummingbot.analytics.recorder.kinds import KINDS
 from hummingbot.analytics.recorder.queue import CaptureQueue
 from hummingbot.analytics.recorder.writer import Writer
@@ -68,9 +57,8 @@ class _Run:
         self.off_thread_lock = threading.Lock()
         self.diagnostics: Deque[Tuple[str, int, BaseException]] = deque()
         self.deferred_logs: Deque[Tuple[str, int, BaseException]] = deque()
-        self.encode_errors: Dict[str, int] = {}
-        self.writer = Writer(run_dir, run_id, settings, self.queue, self.writer_gap, self.capture_diagnostics,
-                             self.writer_dead, self.defer_diagnostics, self.encode_error)
+        self.writer = Writer(run_dir, settings, self.queue, self.writer_gap, self.capture_diagnostics,
+                             self.writer_dead, self.defer_diagnostics)
         self.writer.run_json = _run_json(run_id, None, None)
         self.run_start_json: Optional[str] = None
 
@@ -85,7 +73,7 @@ class _Run:
         seq = next(self.counter)
         return seq, gap_line(seq, self.run_id, gap_type, first, last, count, priority)
 
-    def capture_diagnostics(self) -> Iterator[Pending]:
+    def capture_diagnostics(self) -> Iterator[Tuple[int, bytes]]:
         while self.diagnostics:
             diagnostic = self.diagnostics.popleft()
             self.deferred_logs.append(diagnostic)
@@ -95,23 +83,16 @@ class _Run:
             try:
                 t0_ns = perf_counter_ns()
                 exception = logging.Formatter().formatException((type(error), error, error.__traceback__))
-                body = {"logger": logger.name, "level": "ERROR", "origin": "recorder",
-                        "message": secrets.scrub(f"Analytics hook {hook} failed, occurrence {count}."),
-                        "exception": secrets.scrub(exception)}
-                t_wall_ns, t_mono_ns, hook_ns = time_ns(), monotonic_ns(), perf_counter_ns() - t0_ns
-                yield Pending(next(self.counter), True, 0, "log", "log", t_wall_ns, t_mono_ns, hook_ns, _NO_IDS, body)
+                body_json = encode_body({
+                    "logger": logger.name, "level": "ERROR", "origin": "recorder",
+                    "message": secrets.scrub(f"Analytics hook {hook} failed, occurrence {count}."),
+                    "exception": secrets.scrub(exception),
+                })
+                seq = next(self.counter)
+                yield seq, _framed(self, seq, True, "log", time_ns(), monotonic_ns(), t0_ns,
+                                   None, None, None, None, None, None, body_json, len(body_json))
             except Exception:
                 pass
-
-    def encode_error(self, hook: str, error: BaseException) -> None:
-        """Count a record the writer could not encode against its hook, and log the first ten as hook_error does.
-
-        Only the writer thread calls this. It reads the trading thread's counts but never writes them.
-        """
-        count = self.encode_errors[hook] = self.encode_errors.get(hook, 0) + 1
-        occurrence = _errors.get(hook, 0) + count
-        if occurrence <= LOGGED_ERRORS_PER_HOOK:
-            self.diagnostics.append((hook, occurrence, error))
 
     def defer_diagnostics(self) -> None:
         self.deferred_logs.extend(self.diagnostics)
@@ -123,8 +104,6 @@ _run: Optional[_Run] = None
 _errors: Dict[str, int] = {}
 _diagnostics: Deque[Tuple[str, int, BaseException]] = deque()
 _discarded: Optional[int] = None
-_NO_IDS = (None,) * 6
-_ACCOUNT_ID_ITEM = len('"account_id":,')
 
 
 def activate(config: Any, root: Union[str, Path, None] = None) -> Optional[str]:
@@ -165,16 +144,14 @@ def record(kind: str, body: Dict[str, Any], *, t0_ns: int, hook: str, priority: 
            connector: Optional[str] = None, trading_pair: Optional[str] = None, controller_id: Optional[str] = None,
            executor_id: Optional[str] = None, client_order_id: Optional[str] = None,
            exchange_order_id: Optional[str] = None) -> None:
-    """Copy body, stamp seq, clocks, and hook_ns, and enqueue for the writer to encode. Capture exceptions never reach
-    the caller.
+    """Serialize body before assembly, stamp hook_ns, and enqueue. Capture exceptions never reach the caller.
 
     A call from a thread other than the one that ran activate is counted in stats()["off_thread"] and recorded
     nowhere. It does no logging, so a logging handler that calls record() cannot loop. Hooks that can fire off the
     loop thread test on_capture_thread() first.
 
-    t0_ns comes from perf_counter_ns at hook entry, and hook_ns runs from it to the enqueue. The caller may change or
-    reuse body once record returns. connector adds body.account_id when absent. priority promotes venue evidence into
-    the reserved capacity; local evidence is always priority. The queue bounds charge an upper bound of the line.
+    t0_ns comes from perf_counter_ns at hook entry. connector adds body.account_id when absent, without changing
+    the caller's body. priority promotes venue evidence into the reserved capacity; local evidence is always priority.
     """
     global _discarded
     run = _run
@@ -188,23 +165,15 @@ def record(kind: str, body: Dict[str, Any], *, t0_ns: int, hook: str, priority: 
             return
         spec = KINDS[kind]
         t_wall_ns, t_mono_ns = time_ns(), monotonic_ns()
-        body, size = snapshot(body)
         if connector is not None and "account_id" not in body:
-            body["account_id"], bound = snapshot(accounts.get(connector))
-            size += bound + _ACCOUNT_ID_ITEM
+            body = {**body, "account_id": accounts.get(connector)}
+        body_json = encode_body(body)
+        size = payload_size(body, body_json) if spec.per_kib_us else 0
         priority = priority or spec.priority
         seq = next(run.counter)
-        try:
-            ids, bound = identifiers((connector, trading_pair, controller_id, executor_id, client_order_id,
-                                      exchange_order_id))
-            hook_ns = perf_counter_ns() - t0_ns
-            # tuple.__new__ skips the Python-level NamedTuple constructor on the trading thread.
-            pending = tuple.__new__(Pending, (seq, priority, size + bound + header_bound(kind, hook_ns), kind, hook,
-                                              t_wall_ns, t_mono_ns, hook_ns, ids, body))
-        except Exception:
-            run.queue.lose(seq, priority)
-            raise
-        run.queue.offer(pending)
+        line = _framed(run, seq, priority, kind, t_wall_ns, t_mono_ns, t0_ns, connector,
+                       trading_pair, controller_id, executor_id, client_order_id, exchange_order_id, body_json, size)
+        run.queue.offer(seq, priority, line)
     except Exception as error:
         hook_error(hook, error)
     try:
@@ -239,7 +208,7 @@ def end_run(body: Dict[str, Any]) -> bool:
 
     On timeout the active JSONL remains recoverable and run.json has no run_end. Calling twice does not add a record.
     """
-    global _run, _errors, ACTIVE
+    global _run, ACTIVE
     t0_ns = perf_counter_ns()
     deadline = monotonic() + END_RUN_TIMEOUT_S
     run = _run
@@ -254,7 +223,7 @@ def end_run(body: Dict[str, Any]) -> bool:
             counters = {"records": run.writer.written + 1,
                         "dropped": run.queue.dropped + run.writer.disk_dropped,
                         "dropped_priority": run.queue.dropped_priority + run.writer.disk_dropped_priority,
-                        "queue_records": 0, "queue_bytes": 0, "hook_errors": sum(_hook_errors(run).values()),
+                        "queue_records": 0, "queue_bytes": 0, "hook_errors": sum(_errors.values()),
                         "writer_errors": run.writer.errors, "off_thread": run.off_thread}
             body_json = encode_body({**body, "counters": counters})
             _push(run, "run_end", body_json, t0_ns)
@@ -267,7 +236,6 @@ def end_run(body: Dict[str, Any]) -> bool:
         hook_error("run_end", error)
         return False
     finally:
-        _errors = _hook_errors(run)
         _defer_diagnostics(_diagnostics)
 
 
@@ -313,9 +281,8 @@ def _log_diagnostics(diagnostics: Deque[Tuple[str, int, BaseException]]) -> None
 def stats() -> Dict[str, Any]:
     """Return hook errors, queue and writer counters. Writer-owned values may lag by one batch."""
     run = _run
-    errors = _hook_errors(run)
-    result = {"active": run is not None, "hook_errors": sum(errors.values()), "hook_errors_by_hook": errors,
-              "discarded": _discarded}
+    result = {"active": run is not None, "hook_errors": sum(_errors.values()),
+              "hook_errors_by_hook": dict(_errors), "discarded": _discarded}
     if run is not None:
         result.update(_counters(run))
         result.update(run_id=run.run_id, run_dir=str(run.run_dir))
@@ -353,23 +320,25 @@ def _counters(run: _Run) -> Dict[str, Any]:
     return {"records": queue.accepted, "dropped": queue.dropped, "dropped_priority": queue.dropped_priority,
             "queue_records": len(queue), "queue_bytes": queue.depth_bytes, "written": writer.written,
             "disk_dropped": writer.disk_dropped, "disk": writer.state.value, "free_bytes": writer.free_bytes,
-            "segments_closed": writer.segments_closed, "writer_errors": writer.errors, "off_thread": run.off_thread}
+            "segments_closed": writer.segments_closed, "writer_errors": writer.errors,
+            "hook_errors": sum(_errors.values()), "off_thread": run.off_thread}
 
 
-def _hook_errors(run: Optional[_Run]) -> Dict[str, int]:
-    """Merge the trading thread's per-hook counts with the writer's encoding failures, which only the writer writes."""
-    errors = dict(_errors)
-    if run is not None:
-        for hook, count in dict(run.encode_errors).items():
-            errors[hook] = errors.get(hook, 0) + count
-    return errors
+def _framed(run: _Run, seq: int, priority: bool, kind: str, t_wall_ns: int, t_mono_ns: int,
+            t0_ns: int, *fields: Any) -> bytes:
+    """Frame a record whose seq is already taken. A failure registers that seq as dropped, so no hole is left."""
+    try:
+        return frame(seq, run.run_id, kind, t_wall_ns, t_mono_ns, perf_counter_ns() - t0_ns, *fields)
+    except Exception:
+        run.queue.lose(seq, priority)
+        raise
 
 
 def _push(run: _Run, kind: str, body_json: str, t0_ns: int) -> None:
     t_wall_ns, t_mono_ns = time_ns(), monotonic_ns()
-    hook_ns = perf_counter_ns() - t0_ns
-    run.queue.push(Pending(next(run.counter), True, header_bound(kind, hook_ns) + 4 * len(_NO_IDS) + len(body_json),
-                           kind, kind, t_wall_ns, t_mono_ns, hook_ns, _NO_IDS, Raw(body_json)))
+    seq = next(run.counter)
+    run.queue.push(seq, _framed(run, seq, True, kind, t_wall_ns, t_mono_ns, t0_ns,
+                                None, None, None, None, None, None, body_json))
 
 
 def _run_json(run_id: str, start_json: Optional[str], end_json: Optional[str]) -> bytes:
