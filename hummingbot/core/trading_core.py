@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 from sqlalchemy.orm import Query, Session
 
+from hummingbot.analytics.hooks import run
 from hummingbot.client.config.client_config_map import ClientConfigMap
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.client.config.config_helpers import ClientConfigAdapter, get_strategy_starter_file
@@ -242,6 +243,7 @@ class TradingCore:
         connector = self.connector_manager.create_connector(
             connector_name, trading_pairs, trading_required, api_keys
         )
+        run.connector_created(connector_name, connector, api_keys)
 
         # Add to clock if running
         if self.clock and connector:
@@ -458,6 +460,8 @@ class TradingCore:
                 self.logger().warning("Strategy is already running")
                 return False
 
+            run.begin(self.client_config_map)
+
             self.strategy_name = strategy_name
             self._strategy_file_name = strategy_file_name or strategy_name
 
@@ -476,6 +480,8 @@ class TradingCore:
             else:
                 await self._initialize_regular_strategy()
 
+            run.started(self)
+
             # Initialize markets for backward compatibility
             self._initialize_markets_for_strategy()
 
@@ -492,6 +498,7 @@ class TradingCore:
 
         except Exception as e:
             self.logger().error(f"Failed to start strategy {strategy_name}: {e}")
+            run.finish("start_strategy", "start_failed", e)
             return False
 
     async def _initialize_v2_strategy(self):
@@ -679,6 +686,7 @@ class TradingCore:
             connector = self.connector_manager.create_connector(
                 connector_name, trading_pairs, self._trading_required
             )
+            run.connector_created(connector_name, connector)
 
             # Add to clock if running
             if self.clock and connector:
@@ -785,6 +793,7 @@ class TradingCore:
         Args:
             skip_order_cancellation: Whether to skip cancelling outstanding orders
         """
+        reason = run.shutdown_reason(self.kill_switch)
         try:
             # Handle V2 strategy specific cleanup first
             if self.strategy and isinstance(self.strategy, StrategyV2Base):
@@ -843,4 +852,7 @@ class TradingCore:
 
         except Exception as e:
             self.logger().error(f"Error during shutdown: {e}")
+            run.finish("shutdown", reason, e)
             return False
+        finally:
+            run.finish("shutdown", reason)
