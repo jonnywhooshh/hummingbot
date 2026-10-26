@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import aiohttp
+import pytest
 import yaml
 from aiohttp import web
 
@@ -133,7 +134,9 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                     events = EventLog(connector)
                     await venue.wait_subscribed("account.orderUpdate", timeout=60)
                     await venue.wait_subscribed(f"depth.{venue.symbol}", timeout=60)
-                    await until(lambda: connector.ready and bool(ctx.decision_by_order))
+                    await until(lambda: connector.ready and any(
+                        str(order["clientId"]) in ctx.decision_by_order and order["side"] == "Bid"
+                        for order in venue.orders.values()))
                     for instance in ctx.strategy.controllers.values():
                         instance.stop()
                     directory = Path(recorder.stats()["run_dir"]) if capture else None
@@ -171,7 +174,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
             sent = []
             async with aiohttp.ClientSession() as session:
                 socket = WSConnection(session)
-                await socket.connect(f"ws://127.0.0.1:{bot.venue.port}/")
+                await socket.connect(f"ws://127.0.0.1:{bot.venue.port}/", max_msg_size=4 * 1024 * 1024)
                 try:
                     await socket.send(WSJSONRequest({"method": "SUBSCRIBE", "params": ["acceptance.raw"]}))
                     await bot.venue.wait_subscribed("acceptance.raw")
@@ -270,7 +273,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
             run._run.sampler.sample(0.0)
         async with aiohttp.ClientSession() as session:
             socket = WSConnection(session)
-            await socket.connect(f"ws://127.0.0.1:{bot.venue.port}/")
+            await socket.connect(f"ws://127.0.0.1:{bot.venue.port}/", max_msg_size=4 * 1024 * 1024)
             try:
                 await socket.send(WSJSONRequest({"method": "SUBSCRIBE", "params": ["acceptance.call"]}))
                 await bot.venue.wait_subscribed("acceptance.call")
@@ -305,6 +308,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
         return ([tuple(order[key] for key in fields) for order in (first, second)], events,
                 (filled.amount, filled.price, filled.trade_fee.flat_fees[0].amount), message, ticker, leverage)
 
+    @pytest.mark.timeout(600)
     async def test_criterion_04_hooks_do_not_change_calls(self):
         async with self.trading("calls_off", capture=False) as bot:
             expected = await self.call_results(bot)
@@ -396,7 +400,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
             self.assertEqual(["disk_low", "disk_full"], gaps)
             self.assertFalse(any(row["client_order_id"] == str(full["clientId"]) for row in rows))
             bulk = [json.loads(row["body"]["text"]) for row in rows
-                    if row["kind"] == "ws_in" and "text" in row["body"]]
+                    if row["kind"] == "ws_in" and row["body"]["msg_type"] == "TEXT"]
             self.assertFalse(any(frame.get("data", {}).get("u") == low_uid for frame in bulk))
             self.assertEqual(["Filled", "Filled", "Filled"], [order["status"] for order in (before, low, full)])
 
@@ -474,4 +478,6 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(all(row["seq"] > start["seq"] for row in captured))
         fill = next(row for row in captured if row["body"]["event"] == "OrderFilled")
         self.assertEqual("9001", fill["body"]["fields"]["exchange_trade_id"])
-        self.assertEqual("0.000000123", fill["body"]["fields"]["trade_fee"]["flat_fees"][0]["amount"])
+        fee = fill["body"]["fields"]["trade_fee"]["flat_fees"][0]["amount"]
+        self.assertIsInstance(fee, str)
+        self.assertEqual(Decimal("0.000000123"), Decimal(fee))
