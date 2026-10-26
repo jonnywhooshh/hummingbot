@@ -310,6 +310,19 @@ class SequenceAccountingTest(RunTestCase):
         self.assertEqual(["clock", "log", "log", "run_end"], sorted(row["kind"] for row in records))
         self.assertEqual(2, recorder.stats()["hook_errors"])
 
+    def test_the_documented_seam_fails_a_record_on_the_calling_thread_before_it_takes_a_seq(self):
+        run_dir = self.start()
+        recorder.pause()
+        with patch("hummingbot.analytics.recorder.encode_body", side_effect=ValueError("injected")):
+            self.record("order_request", {"price": "1.5"})
+        self.assertEqual({"order_request": 1}, recorder.stats()["hook_errors_by_hook"])
+        recorder.resume()
+        self.record("clock", {})
+        self.assertTrue(recorder.end_run({"path": "test"}))
+        records = self.records(run_dir)
+        self.assertEqual(list(range(1, len(records) + 1)), [row["seq"] for row in records])
+        self.assertEqual(["clock", "log", "run_end"], sorted(row["kind"] for row in records))
+
     def test_failed_calls_are_counted_in_hook_timing(self):
         self.start()
         timing.drain()

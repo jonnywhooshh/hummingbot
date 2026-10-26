@@ -5,6 +5,11 @@ and hook name. Local evidence is always priority. Authenticated transport hooks 
 Only end_run waits for the writer, for at most two seconds after the strategy has stopped. Activation leaves the
 process allocator unchanged. Recorder-owned log evidence has body.origin="recorder" and the application-log body
 fields logger, level, message, and exception. It respects log_level. External error handlers run after file work ends.
+
+Tests inject a capture failure on the trading thread by patching hummingbot.analytics.recorder.encode_body to raise.
+record() calls it before it takes a seq, so the failure counts as a hook error, never reaches the caller, and leaves
+no capture_gap. It is the one supported seam. Patch it only around the record() calls under test, with the writer
+paused, because run_start, run_end, and the writer's own log records encode through it too.
 """
 import itertools
 import logging
