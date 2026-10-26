@@ -16,6 +16,7 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
+from uuid import UUID
 
 import aiohttp
 from aiohttp import web
@@ -567,16 +568,16 @@ class TransportEquivalenceTest(unittest.TestCase):
 
     @staticmethod
     def corpus():
-        """Freeze persisted bytes with the clocks and identities held constant."""
+        """Freeze the run identity at activation, before the writer retains it."""
         rows = []
         with tempfile.TemporaryDirectory() as root:
             config = AnalyticsConfigMap(enabled=True, dir=root, min_free_bytes=0, hard_min_free_bytes=0)
-            run_id = recorder.activate(config)
+            with patch.object(recorder, "_uuid7", return_value=UUID("00000000-0000-7000-8000-000000000000")):
+                run_id = recorder.activate(config)
             assert run_id is not None
             run_dir = Path(root) / run_id
             try:
-                with patch.object(recorder._run, "run_id", "00000000-0000-7000-8000-000000000000"), \
-                        patch.object(recorder._run, "counter", itertools.count(1)), \
+                with patch.object(recorder._run, "counter", itertools.count(1)), \
                         patch.object(recorder, "time_ns", return_value=30000), \
                         patch.object(recorder, "monotonic_ns", return_value=20000), \
                         patch.object(recorder, "perf_counter_ns", return_value=11000), \
