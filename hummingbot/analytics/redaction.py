@@ -3,10 +3,12 @@
 Host attribution cannot distinguish Backpack spot from perpetual accounts because they share endpoints.
 The production hosts and the fake venue's IPv4 loopback host use backpack_perpetual.
 Unknown hosts retain only outbound method, URL path, and timing. Inbound payloads stay verbatim.
-Tree redaction handles dict, list, and tuple containers without changing caller-owned values.
+Tree redaction handles mappings and non-text sequences without changing caller-owned values.
+Exact dict, list, and tuple nodes bypass abstract collection checks.
 """
+from collections.abc import Mapping, Sequence
 from functools import lru_cache
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 from urllib.parse import quote_plus, unquote_plus, urlsplit
 
 from hummingbot.analytics.recorder import secrets
@@ -122,8 +124,14 @@ def redact_paths(data: Any, paths: Sequence[JsonPath]) -> Tuple[Any, List[str]]:
 
 
 def _replace(node: Any, path: JsonPath) -> Any:
-    if not isinstance(node, (dict, list, tuple)):
-        return node
+    node_type = type(node)
+    mapping = node_type is dict
+    if not mapping and node_type is not list and node_type is not tuple:
+        if isinstance(node, (str, bytes, bytearray, memoryview)) or node is None or node_type in (int, float, bool):
+            return node
+        mapping = isinstance(node, Mapping)
+        if not mapping and not isinstance(node, Sequence):
+            return node
     key, rest = path[0], path[1:]
     try:
         child = node[key]
@@ -132,7 +140,7 @@ def _replace(node: Any, path: JsonPath) -> Any:
     replacement = _replace(child, rest) if rest else REDACTED
     if replacement is child:
         return node
-    copy: Any = dict(node) if isinstance(node, dict) else list(node)
+    copy: Any = dict(node) if mapping else list(node)
     copy[key] = replacement
     return copy
 
@@ -145,7 +153,10 @@ def scrub_tree(node: Any) -> Tuple[Any, bool]:
     if isinstance(node, (str, bytes, bytearray, memoryview)):
         scrubbed = secrets.scrub(node)
         return scrubbed, scrubbed != node
-    if isinstance(node, dict):
+    node_type = type(node)
+    if node is None or node_type in (int, float, bool):
+        return node, False
+    if node_type is dict or (node_type is not list and node_type is not tuple and isinstance(node, Mapping)):
         changed = False
         result = {}
         for key, value in node.items():
@@ -153,7 +164,7 @@ def scrub_tree(node: Any) -> Tuple[Any, bool]:
             result[clean_key], hit = scrub_tree(value)
             changed = changed or hit or key_hit
         return (result, True) if changed else (node, False)
-    if isinstance(node, (list, tuple)):
+    if node_type is list or node_type is tuple or isinstance(node, Sequence):
         changed = False
         items = []
         for value in node:
