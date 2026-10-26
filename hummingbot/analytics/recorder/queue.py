@@ -1,6 +1,6 @@
 from bisect import bisect_right
 from collections import deque
-from itertools import accumulate, islice, repeat, starmap
+from itertools import accumulate, repeat, starmap
 from operator import itemgetter
 from typing import Deque, List, Optional, Tuple
 
@@ -134,14 +134,24 @@ class CaptureQueue:
     def pop_batch(self, max_items: int, max_bytes: int) -> List[Item]:
         """Pop a byte-bounded prefix, allowing one oversized item so the queue always makes progress.
 
-        Sizes come from one pass of C-level calls, so the writer holds the GIL for microseconds and the caller never
-        waits on a Python-level per-item loop.
+        The writer never iterates the deque, because an append by the producer breaks a live deque iterator. It pops
+        as many items as fit max_bytes at the average queued size, then returns the ones that do not fit to the
+        front, all in C-level calls that hold the GIL for microseconds. Once the queue is closed the producer may
+        retract its newest item at any moment, so a closed queue gives up one item per call.
         """
+        if self.closed:
+            item = self.pop()
+            return [] if item is None else [item]
         items = self.items
-        ends = list(accumulate(map(len, map(itemgetter(2), islice(items, max_items)))))
-        if not ends:
+        queued = len(items)
+        if not queued:
             return []
+        take = min(max_items, queued, max_bytes * queued // max(1, self.depth_bytes) + 1)
+        batch = list(starmap(items.popleft, repeat((), take)))
+        ends = list(accumulate(map(len, map(itemgetter(2), batch))))
         count = max(1, bisect_right(ends, max_bytes))
-        batch = list(starmap(items.popleft, repeat((), count)))
+        if count < len(batch):
+            items.extendleft(reversed(batch[count:]))
+            del batch[count:]
         self.bytes_out += ends[count - 1]
         return batch

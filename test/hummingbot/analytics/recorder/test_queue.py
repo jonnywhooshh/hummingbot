@@ -69,6 +69,52 @@ class CaptureQueueTest(unittest.TestCase):
         self.assertEqual([4], [item[0] for item in queue.pop_batch(100, 500)])
         self.assertEqual(0, queue.depth_bytes)
 
+    def test_pop_batch_returns_the_oldest_items_while_the_producer_appends(self):
+        queue = CaptureQueue(10_000, 10_000)
+
+        class AppendedDuringPop(deque):
+            late = [6]
+
+            def produce(self):
+                if self.late:
+                    queue.offer(self.late.pop(), False, LINE)
+
+            def __iter__(self):
+                iterator = super().__iter__()
+                self.produce()
+                return iterator
+
+            def __getitem__(self, index):
+                self.produce()
+                return super().__getitem__(index)
+
+            def popleft(self):
+                self.produce()
+                return super().popleft()
+
+        queue.items = AppendedDuringPop()
+        for seq in range(1, 6):
+            queue.offer(seq, False, LINE)
+        self.assertEqual([1, 2, 3], [item[0] for item in queue.pop_batch(3, 10_000)])
+        self.assertEqual([4, 5, 6], [item[0] for item in queue.pop_batch(10, 10_000)])
+        self.assertEqual(0, queue.depth_bytes)
+
+    def test_pop_batch_on_a_closed_queue_survives_the_producer_retracting_its_newest_item(self):
+        queue = CaptureQueue(10_000, 10_000)
+        queue.close()
+
+        class RetractedBeforePop(deque):
+            retracting = True
+
+            def popleft(self):
+                if self.retracting:
+                    self.retracting = False
+                    super().pop()
+                return super().popleft()
+
+        queue.items = RetractedBeforePop([(7, True, LINE)])
+        self.assertEqual([], queue.pop_batch(128, 10_000))
+
     def test_a_close_that_lands_just_before_the_append_rejects_and_counts_the_record(self):
         queue = CaptureQueue(1000, 1000)
 
