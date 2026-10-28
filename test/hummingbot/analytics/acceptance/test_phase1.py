@@ -1,12 +1,18 @@
-"""Phase 1 capture acceptance. Backfill redaction belongs to phase 5 of the spec."""
+"""Phase 1 capture acceptance.
+
+Unread bodies stay gated while both capture modes face the same 200 ms deadline.
+Backfill redaction belongs to phase 5 of the spec.
+"""
 
 import asyncio
 import base64
+import errno
 import gzip
 import hashlib
 import json
 import logging
 import os
+import socket as network_socket
 import subprocess
 import tempfile
 from collections import Counter
@@ -24,14 +30,27 @@ from aiohttp import web
 
 from hummingbot.analytics import recorder, redaction
 from hummingbot.analytics.hooks import run
+from hummingbot.client.command.stop_command import StopCommand
 from hummingbot.connector.test_support.fake_backpack.harness import EventLog, v2_headless
 from hummingbot.connector.test_support.fake_backpack.load import REFERENCE_CONTROLLER
 from hummingbot.connector.test_support.fake_backpack.venue import FakeBackpackVenue, keypair
-from hummingbot.core.data_type.common import OrderType, PositionAction
+from hummingbot.connector.time_synchronizer import TimeSynchronizer
+from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
 from hummingbot.core.event.events import MarketEvent
+from hummingbot.core.trading_core import TradingCore
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest, WSJSONRequest
 from hummingbot.core.web_assistant.connections.rest_connection import RESTConnection
 from hummingbot.core.web_assistant.connections.ws_connection import WSConnection
+
+PHASE1_HOOKS = (
+    "run_start", "run_end", "ws_conn", "ws_in", "ws_out", "rest", "rest_body", "order_request",
+    "order_dispatch", "order_result", "cancel_request", "cancel_result", "tracker_update",
+    "connector_event", "clock", "log", "host",
+)
+
+
+class CaptureFailure(RuntimeError):
+    pass
 
 
 def records(directory, *, by_seq=True):
@@ -103,7 +122,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
 
     @asynccontextmanager
     async def trading(self, name, capture=True, analytics_root=None, passwords=None,
-                      controller_ids=("fake_backpack_reference",), **settings):
+                      controller_ids=("fake_backpack_reference",), keep_controllers=False, **settings):
         root = self.root / name
         root.mkdir()
         controller = root / "controller.yml"
@@ -113,6 +132,19 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
         }))
         analytics_root = analytics_root or root / "analytics"
         begin = run.begin
+        lifecycle = {}
+        start_strategy = TradingCore.start_strategy
+        stop_loop = StopCommand.stop_loop
+
+        async def observe_start(core, *args, **kwargs):
+            result = await start_strategy(core, *args, **kwargs)
+            lifecycle["start"] = result
+            return result
+
+        async def observe_stop(application, *args, **kwargs):
+            result = await stop_loop(application, *args, **kwargs)
+            lifecycle["stop"] = result
+            return result
 
         def configure(client):
             from hummingbot.client import settings as client_settings
@@ -139,7 +171,9 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
         venue = FakeBackpackVenue(state_dir=root / "venue")
         await venue.start()
         try:
-            with patch.object(run, "begin", configure):
+            with patch.object(run, "begin", configure), \
+                    patch.object(TradingCore, "start_strategy", observe_start), \
+                    patch.object(StopCommand, "stop_loop", observe_stop):
                 async with v2_headless(controller, venue=venue, temp_dir=root,
                                        analytics_dir=analytics_root if capture else None) as (_, ctx):
                     connector = ctx.connectors["backpack_perpetual"]
@@ -149,11 +183,12 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                     await until(lambda: connector.ready and any(
                         str(order["clientId"]) in ctx.decision_by_order and order["side"] == "Bid"
                         for order in venue.orders.values()))
-                    for instance in ctx.strategy.controllers.values():
-                        instance.stop()
+                    if not keep_controllers:
+                        for instance in ctx.strategy.controllers.values():
+                            instance.stop()
                     directory = Path(recorder.stats()["run_dir"]) if capture else None
                     yield SimpleNamespace(venue=venue, ctx=ctx, connector=connector, events=events,
-                                          directory=directory)
+                                          directory=directory, lifecycle=lifecycle)
         finally:
             await venue.stop()
 
@@ -221,12 +256,14 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
     async def test_criterion_03_never_blocks(self):
         for case in ("paused_orders", "private_fill_during_flood"):
             with self.subTest(case=case):
-                async with self.trading(case, queue_max_bytes=16384, priority_reserve_bytes=8 * 1024 * 1024) as bot:
+                async with self.trading(case, keep_controllers=True, queue_max_bytes=16384,
+                                        priority_reserve_bytes=8 * 1024 * 1024) as bot:
                     resting = await self.buy(bot) if case == "private_fill_during_flood" else None
                     await asyncio.to_thread(recorder.pause)
                     try:
                         written = recorder.stats()["written"]
                         previous = records(bot.directory, by_seq=False)
+                        tick_start = len(bot.ctx.ticks)
                         for index in range(256):
                             await bot.venue.push_depth([["149.90", str(index + 10)]], [])
                             if index == 128 and resting is not None:
@@ -238,6 +275,8 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                         order = await self.buy(bot)
                         filled = await self.fill(bot, order)
                         self.assertEqual(str(order["clientId"]), filled.order_id)
+                        await until(lambda: any(tick.gated is None and tick.error is None
+                                                for tick in bot.ctx.ticks[tick_start:]))
                         self.assertEqual(written, recorder.stats()["written"])
                         self.assertEqual(0, recorder.stats()["dropped_priority"])
                         directory = bot.directory
@@ -248,8 +287,9 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                     try:
                         resumed = records(directory, by_seq=False)[len(previous):]
                         self.assertTrue(resumed, "the writer did not resume")
-                        self.assertEqual("capture_gap", resumed[0]["kind"])
-                        self.assertEqual("queue_full", resumed[0]["body"]["type"])
+                        live_gaps = [row["body"] for row in resumed if row["kind"] == "capture_gap"]
+                        self.assertTrue(live_gaps, "queue gaps were not written before shutdown")
+                        self.assertTrue(all(gap["type"] == "queue_full" for gap in live_gaps))
                         self.assertFalse(any(row["kind"] == "run_end" for row in resumed))
                         self.assertTrue(recorder.ACTIVE)
                     finally:
@@ -286,68 +326,205 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                 self.assertEqual(end["counters"]["dropped"], len(missing))
 
     async def call_results(self, bot):
-        first = await self.buy(bot)
-        filled = await self.fill(bot, first)
-        second = await self.buy(bot)
-        bot.connector.cancel("SOL-USDC", str(second["clientId"]))
-        await until(lambda: any(tag == MarketEvent.OrderCancelled and event.order_id == str(second["clientId"])
-                                for _, tag, event in bot.events.items))
-        bot.connector._time_synchronizer.add_time_offset_ms_sample(
-            bot.connector._time_synchronizer.time_offset_ms)
-        logging.getLogger("hummingbot.acceptance").warning("capture failure must not interrupt trading")
-        if run._run is not None:
-            run._run.sampler.sample(0.0)
-        async with aiohttp.ClientSession() as session:
-            socket = WSConnection(session)
-            await socket.connect(f"ws://127.0.0.1:{bot.venue.port}/", max_msg_size=4 * 1024 * 1024)
-            try:
-                await socket.send(WSJSONRequest({"method": "SUBSCRIBE", "params": ["acceptance.call"]}))
-                await bot.venue.wait_subscribed("acceptance.call")
-                await bot.venue.push("acceptance.call", {"ok": True})
-                message = (await socket.receive()).data
-            finally:
-                await socket.disconnect()
-            response = await RESTConnection(session).call(RESTRequest(
-                RESTMethod.GET, f"http://127.0.0.1:{bot.venue.port}/api/v1/ticker"))
-            ticker = await response.json()
-        held, release = asyncio.Event(), asyncio.Event()
-        sleep = asyncio.sleep
+        effects = {"lifecycle": bot.lifecycle}
+        ids = {"1000001", "1000002", "1000003"}
+        tracker = bot.connector._order_tracker
+        process_order_update = tracker.process_order_update
+        process_trade_update = tracker.process_trade_update
+        order_tasks, trade_results = [], []
 
-        async def controlled_sleep(seconds):
-            if seconds == 123.456:
-                held.set()
-                await release.wait()
-            else:
-                await sleep(seconds)
+        def observe_order(order_update):
+            result = process_order_update(order_update)
+            if order_update.client_order_id in ids:
+                order_tasks.append(result)
+            return result
 
-        with patch("hummingbot.connector.test_support.fake_backpack.venue.asyncio.sleep", controlled_sleep):
-            bot.venue.delay_body_next("PATCH", "/api/v1/account", 123.456)
-            try:
-                leverage = await asyncio.wait_for(bot.connector._set_trading_pair_leverage("SOL-USDC", 5), 60)
-                await asyncio.wait_for(held.wait(), 60)
-                self.assertFalse(release.is_set())
-            finally:
-                release.set()
-        ids = {str(first["clientId"]), str(second["clientId"])}
-        events = Counter(tag.name for _, tag, event in bot.events.items if getattr(event, "order_id", None) in ids)
-        fields = ("side", "orderType", "quantity", "price", "postOnly", "reduceOnly", "status")
-        return ([tuple(order[key] for key in fields) for order in (first, second)], events,
-                (filled.amount, filled.price, filled.trade_fee.flat_fees[0].amount), message, ticker, leverage)
+        def observe_trade(trade_update):
+            result = process_trade_update(trade_update)
+            if trade_update.client_order_id in ids:
+                trade_results.append(result)
+            return result
+
+        observers = ExitStack()
+        observers.enter_context(patch.object(tracker, "process_order_update", observe_order))
+        observers.enter_context(patch.object(tracker, "process_trade_update", observe_trade))
+        log_records = []
+        handler = logging.Handler()
+        handler.emit = log_records.append
+        logger = logging.getLogger("hummingbot")
+        logger.addHandler(handler)
+        try:
+            placed = []
+            for client_id in ("1000001", "1000002", "1000003"):
+                rejected = client_id == "1000003"
+                if rejected:
+                    bot.venue.fail_next("POST", "/api/v1/order", 422,
+                                        {"code": "ACCEPTANCE_REJECT", "message": "venue rejected the order"})
+                task = asyncio.create_task(bot.connector._create_order(
+                    TradeType.BUY, client_id, "SOL-USDC", Decimal("0.10"), OrderType.LIMIT, Decimal("149.50"),
+                    position_action=PositionAction.OPEN))
+                self.assertIsNone(await task, f"placement task {client_id} changed its result")
+                event_tag = MarketEvent.OrderFailure if rejected else MarketEvent.BuyOrderCreated
+                await until(lambda: any(tag == event_tag and event.order_id == client_id
+                                        for _, tag, event in bot.events.items))
+                request = next(request for request in bot.venue.requests_to("POST", "/api/v1/order")
+                               if str(json.loads(request.body)["clientId"]) == client_id)
+                self.assertEqual(422 if rejected else 200, request.status)
+                if rejected:
+                    self.assertFalse(any(str(order["clientId"]) == client_id for order in bot.venue.orders.values()))
+                else:
+                    placed.append(next(order for order in bot.venue.orders.values()
+                                       if str(order["clientId"]) == client_id))
+            first, second = placed
+            filled = await self.fill(bot, first)
+            second_id = str(second["clientId"])
+            bot.venue.fail_next("DELETE", "/api/v1/order", 503,
+                                {"code": "ACCEPTANCE_CANCEL_FAILURE", "message": "venue could not cancel"})
+            self.assertIsNone(await asyncio.create_task(bot.connector._execute_cancel("SOL-USDC", second_id)))
+            self.assertEqual(503, bot.venue.requests_to("DELETE", "/api/v1/order")[-1].status)
+            self.assertEqual("New", second["status"])
+            self.assertFalse(any(tag == MarketEvent.OrderCancelled and event.order_id == second_id
+                                 for _, tag, event in bot.events.items))
+            self.assertEqual(second_id, await asyncio.create_task(
+                bot.connector._execute_cancel("SOL-USDC", second_id)))
+            await until(lambda: any(tag == MarketEvent.OrderCancelled and event.order_id == second_id
+                                    for _, tag, event in bot.events.items))
+            clock = TimeSynchronizer()
+            with patch.object(clock, "_current_seconds_counter", return_value=10.0):
+                clock_result = clock.add_time_offset_ms_sample(1234.5)
+                self.assertEqual(1234.5, clock.time_offset_ms)
+                effects["clock"] = (clock_result, clock.time_offset_ms, clock.time())
+            log_result = logging.getLogger("hummingbot.acceptance").warning(
+                "capture failure must not interrupt %s", "trading")
+            effects["log"] = (log_result, [(record.levelno, record.getMessage()) for record in log_records
+                                           if record.name == "hummingbot.acceptance"])
+            effects["host"] = run._run.sampler.sample(0.0) if run._run is not None else None
+            async with aiohttp.ClientSession() as session:
+                socket = WSConnection(session)
+                connected = await socket.connect(f"ws://127.0.0.1:{bot.venue.port}/",
+                                                 message_timeout=1, max_msg_size=4 * 1024 * 1024)
+                self.assertTrue(socket.connected)
+                try:
+                    sent = await socket.send(WSJSONRequest({"method": "SUBSCRIBE", "params": ["acceptance.call"]}))
+                    await bot.venue.wait_subscribed("acceptance.call")
+                    await bot.venue.push("acceptance.call", {"ok": True})
+                    message = (await socket.receive()).data
+                    server = next(ws for ws, streams in bot.venue.subscriptions.items()
+                                  if "acceptance.call" in streams)
+                    closing = asyncio.create_task(server.close())
+                    try:
+                        with self.assertRaises(ConnectionError):
+                            await socket.receive()
+                        await closing
+                    finally:
+                        await socket.disconnect()
+                finally:
+                    disconnected = await socket.disconnect()
+                effects["ws"] = (connected, sent, message, disconnected, socket.connected)
+                quiet = WSConnection(session)
+                self.assertIsNone(await quiet.connect(f"ws://127.0.0.1:{bot.venue.port}/",
+                                                      message_timeout=0.05, max_msg_size=4 * 1024 * 1024))
+                try:
+                    with self.assertRaises(TimeoutError) as timeout:
+                        await quiet.receive()
+                    effects["ws_timeout"] = (type(timeout.exception), str(timeout.exception))
+                finally:
+                    self.assertIsNone(await quiet.disconnect())
+                broken = WSConnection(session)
+                self.assertIsNone(await broken.connect(f"ws://127.0.0.1:{bot.venue.port}/",
+                                                       max_msg_size=4 * 1024 * 1024))
+                try:
+                    await broken._connection.close()
+                    self.assertTrue(broken.connected)
+                    with self.assertRaises(aiohttp.ClientConnectionError) as send_error:
+                        await broken.send(WSJSONRequest({"method": "SUBSCRIBE", "params": ["acceptance.closed"]}))
+                    effects["ws_send_error"] = (type(send_error.exception), str(send_error.exception))
+                finally:
+                    self.assertIsNone(await broken.disconnect())
+                response = await RESTConnection(session).call(RESTRequest(
+                    RESTMethod.GET, f"http://127.0.0.1:{bot.venue.port}/api/v1/ticker"))
+                effects["rest"] = (response.status, await response.json(), json.loads(await response.text()))
+                bot.venue._routes[("GET", "/acceptance/invalid")] = lambda request, params: web.Response(
+                    body=b'{"invalid":', content_type="application/json")
+                invalid = await RESTConnection(session).call(RESTRequest(
+                    RESTMethod.GET, f"http://127.0.0.1:{bot.venue.port}/acceptance/invalid"))
+                with self.assertRaises(json.JSONDecodeError) as parse_error:
+                    await invalid.json()
+                effects["rest_body_error"] = (type(parse_error.exception), parse_error.exception.pos)
+                with network_socket.socket() as refused:
+                    refused.bind(("127.0.0.1", 0))
+                    port = refused.getsockname()[1]
+                    with self.assertRaises(aiohttp.ClientConnectorError) as rest_error:
+                        await RESTConnection(session).call(RESTRequest(RESTMethod.GET, f"http://127.0.0.1:{port}/"))
+                    with self.assertRaises(aiohttp.ClientConnectorError) as ws_error:
+                        await WSConnection(session).connect(f"ws://127.0.0.1:{port}/")
+                    for operation, error in (("rest_error", rest_error.exception), ("ws_error", ws_error.exception)):
+                        self.assertEqual(errno.ECONNREFUSED, error.os_error.errno)
+                        effects[operation] = (type(error), error.os_error.errno)
+                held, release, body_sent = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+                async def unread(request, params):
+                    response = web.StreamResponse(status=202, headers={"Content-Type": "application/json"})
+                    await response.prepare(request)
+                    held.set()
+                    await release.wait()
+                    try:
+                        await response.write_eof(b'{"unread":true}')
+                    except ConnectionResetError:
+                        pass
+                    body_sent.set()
+                    return response
+
+                bot.venue._routes[("GET", "/acceptance/unread")] = unread
+                try:
+                    response = await asyncio.wait_for(RESTConnection(session).call(RESTRequest(
+                        RESTMethod.GET, f"http://127.0.0.1:{bot.venue.port}/acceptance/unread")), 0.2)
+                    await asyncio.wait_for(held.wait(), 1)
+                    self.assertFalse(body_sent.is_set(), "the caller waited for an unread response body")
+                    effects["unread"] = (response.status, response.headers["Content-Type"])
+                    response._aiohttp_response.release()
+                finally:
+                    release.set()
+            self.assertTrue(order_tasks)
+            self.assertTrue(trade_results)
+            for task in order_tasks:
+                self.assertIsInstance(task, asyncio.Task)
+                self.assertIsNone(await task, "the order tracker task changed its result")
+            for result in trade_results:
+                self.assertIsNone(result, "the trade update call changed its result")
+            effects["events"] = Counter(tag.name for _, tag, event in bot.events.items
+                                        if getattr(event, "order_id", None) in ids)
+            fields = ("side", "orderType", "quantity", "price", "postOnly", "reduceOnly", "status")
+            effects["orders"] = [tuple(order[key] for key in fields) for order in placed]
+            effects["fill"] = (filled.amount, filled.price, filled.trade_fee.flat_fees[0].amount)
+            escaped = [record.getMessage() for record in log_records
+                       if record.exc_info and isinstance(record.exc_info[1], CaptureFailure)
+                       and not record.name.startswith("hummingbot.analytics")]
+            self.assertEqual([], escaped, "capture exceptions escaped into the event dispatcher or trading tasks")
+            return effects
+        finally:
+            observers.close()
+            logger.removeHandler(handler)
 
     @pytest.mark.timeout(600)
     async def test_criterion_04_hooks_do_not_change_calls(self):
         async with self.trading("calls_off", capture=False) as bot:
             expected = await self.call_results(bot)
-        self.assertEqual(Counter(BuyOrderCreated=2, OrderFilled=1, BuyOrderCompleted=1, OrderCancelled=1), expected[1])
-        self.assertEqual((True, ""), expected[-1])
+        self.assertEqual(Counter(BuyOrderCreated=2, OrderFilled=1, BuyOrderCompleted=1, OrderCancelled=1,
+                                 OrderFailure=1), expected["events"])
+        self.assertEqual({"start": True, "stop": None}, expected["lifecycle"])
+        self.assertEqual((202, "application/json"), expected["unread"])
+        self.assertEqual((None, [(logging.WARNING, "capture failure must not interrupt trading")]), expected["log"])
         async with self.trading("calls_on") as bot:
-            self.assertEqual(expected, await self.call_results(bot))
-        hooks = (
-            "run_start", "run_end", "ws_conn", "ws_in", "ws_out", "rest", "rest_body", "order_request",
-            "order_dispatch", "order_result", "cancel_request", "cancel_result", "tracker_update",
-            "connector_event", "clock", "log", "host",
-        )
-        for hook in hooks:
+            actual = await self.call_results(bot)
+        self.assertEqual(expected, actual)
+        unread = [row for row in records(bot.directory)
+                  if row["kind"] == "rest" and row["body"]["url"].endswith("/acceptance/unread")]
+        self.assertEqual(1, len(unread))
+        self.assertFalse(any(row["kind"] == "rest_body"
+                             and row["body"]["request_id"] == unread[0]["body"]["request_id"]
+                             for row in records(bot.directory)))
+        for hook in PHASE1_HOOKS:
             with self.subTest(hook=hook):
                 failed = Counter()
                 record = recorder.record
@@ -355,28 +532,35 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
 
                 def fail_record(kind, body, **kwargs):
                     if kwargs["hook"] == hook:
-                        failed[body.get("update_type", hook)] += 1
-                        raise RuntimeError(f"injected {hook} failure")
+                        failed[body.get("update_type", body.get("outcome", hook))] += 1
+                        if body.get("error") is not None:
+                            failed["operation_error"] += 1
+                        raise CaptureFailure(f"injected {hook} failure")
                     return record(kind, body, **kwargs)
 
                 def fail_start(core):
                     failed[hook] += 1
-                    raise RuntimeError("injected run_start failure")
+                    raise CaptureFailure("injected run_start failure")
 
                 def fail_end(body):
                     if "counters" in body:
                         failed[hook] += 1
-                        raise RuntimeError("injected run_end failure")
+                        raise CaptureFailure("injected run_end failure")
                     return encode_body(body)
 
-                with ExitStack() as stack:
-                    stack.enter_context(patch.object(recorder, "record", fail_record))
-                    if hook == "run_start":
-                        stack.enter_context(patch.object(run, "_run_start_body", fail_start))
-                    if hook == "run_end":
-                        stack.enter_context(patch.object(recorder, "encode_body", fail_end))
+                if hook in ("run_start", "run_end"):
+                    with ExitStack() as stack:
+                        stack.enter_context(patch.object(recorder, "record", fail_record))
+                        if hook == "run_start":
+                            stack.enter_context(patch.object(run, "_run_start_body", fail_start))
+                        else:
+                            stack.enter_context(patch.object(recorder, "encode_body", fail_end))
+                        async with self.trading(f"calls_fail_{hook}") as bot:
+                            actual = await self.call_results(bot)
+                else:
                     async with self.trading(f"calls_fail_{hook}") as bot:
-                        actual = await self.call_results(bot)
+                        with patch.object(recorder, "record", fail_record):
+                            actual = await self.call_results(bot)
                 self.assertTrue(failed, f"{hook} was not exercised")
                 self.assertEqual(expected, actual)
                 errors = recorder.stats()["hook_errors_by_hook"]
@@ -384,11 +568,16 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                 if hook == "tracker_update":
                     self.assertGreater(failed["order"], 0)
                     self.assertGreater(failed["trade"], 0)
+                if hook in ("order_result", "cancel_result"):
+                    self.assertGreater(failed["failed"], 0)
+                    self.assertGreater(failed["accepted" if hook == "order_result" else "success"], 0)
+                if hook in ("rest", "ws_conn"):
+                    self.assertGreater(failed["operation_error"], 0)
 
     async def test_criterion_07_disk_floor(self):
         volume = self.root / "volume"
         with disk_volume(volume) as set_free:
-            async with self.trading("disk", analytics_root=volume / "analytics",
+            async with self.trading("disk", keep_controllers=True, analytics_root=volume / "analytics",
                                     min_free_bytes=48 * 1024 * 1024, hard_min_free_bytes=16 * 1024 * 1024) as bot:
                 before = await self.buy(bot)
                 await self.fill(bot, before)
@@ -400,6 +589,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                 await bot.venue.push_depth([["149.90", "71"]], [])
                 low_uids = {bot.venue.update_id}
                 await until(lambda: recorder.stats()["disk"] == "disk_low" and recorder.stats()["disk_dropped"] > 0)
+                tick_start = len(bot.ctx.ticks)
                 for index in range(64):
                     self.assertEqual("disk_low", recorder.stats()["disk"])
                     self.assertTrue(await bot.venue.push_depth([["149.90", str(100 + index)]], []))
@@ -409,6 +599,8 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                         await self.fill(bot, low)
                 await until(lambda: bot.connector.get_order_book("SOL-USDC").last_diff_uid == bot.venue.update_id)
                 self.assertEqual(65, len(low_uids))
+                await until(lambda: any(tick.gated is None and tick.error is None
+                                        for tick in bot.ctx.ticks[tick_start:]))
                 await until(lambda: recorder.stats()["queue_records"] == 0)
                 await asyncio.to_thread(recorder.pause)
                 try:
@@ -430,6 +622,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                                    and '"orderFill"' in row["body"]["text"]
                                    and str(json.loads(row["body"]["text"])["data"]["c"]) == str(low["clientId"])]
                     self.assertEqual(1, len(low_private))
+                    tick_start = len(bot.ctx.ticks)
                     set_free(8 * 1024 * 1024)
                 finally:
                     recorder.resume()
@@ -438,6 +631,8 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                 full = await self.buy(bot)
                 full_fill = await self.fill(bot, full)
                 self.assertEqual(str(full["clientId"]), full_fill.order_id)
+                await until(lambda: any(tick.gated is None and tick.error is None
+                                        for tick in bot.ctx.ticks[tick_start:]))
                 directory = bot.directory
             rows = records(directory)
             gaps = [row["body"]["type"] for row in rows if row["kind"] == "capture_gap"]
