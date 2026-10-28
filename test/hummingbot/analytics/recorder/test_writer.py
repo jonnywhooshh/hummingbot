@@ -267,6 +267,37 @@ class DiskFloorTest(RunTestCase):
                            "priority_dropped": True}], gaps)
         self.assertNotIn("run_end", json.loads((run_dir / "run.json").read_bytes()))
 
+    def test_a_delivered_disk_full_gap_stops_reports_even_when_its_sync_fails(self):
+        for syscall in ("writev", "fsync"):
+            with self.subTest(syscall=syscall):
+                self.free = 10 ** 9
+                run_dir = self.start(min_free_bytes=5000, hard_min_free_bytes=2000)
+                self.record("clock", {})
+                self.wait_for(lambda: recorder.stats()["written"] == 1)
+                recorder.pause()
+                for index in range(4):
+                    self.record("clock", {"index": index})
+                self.free = 1000
+                real = getattr(os, syscall)
+                failed = []
+
+                def fail_once(fd, *args):
+                    if not failed:
+                        failed.append(True)
+                        raise OSError(5, "EIO")
+                    return real(fd, *args)
+
+                with patch.object(segments.os, syscall, side_effect=fail_once):
+                    recorder.resume()
+                    self.wait_for(lambda: recorder.stats()["disk"] == "failed")
+                self.record("clock", {"after": "failure"})
+                self.assertFalse(recorder.end_run({}))
+                ordered = [json.loads(line) for line in segments.iter_records(run_dir)]
+                self.assertEqual(["disk_full"], [row["body"]["type"] for row in ordered
+                                                if row["kind"] == "capture_gap"])
+                self.assertEqual("capture_gap", ordered[-1]["kind"])
+                self.assertEqual("disk_full", ordered[-1]["body"]["type"])
+
     def test_a_framing_loss_is_reported_before_the_disk_full_gap(self):
         run_dir = self.start(min_free_bytes=5000, hard_min_free_bytes=2000)
         self.record("clock", {})

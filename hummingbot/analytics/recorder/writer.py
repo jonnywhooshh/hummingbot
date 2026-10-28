@@ -60,6 +60,7 @@ class Writer:
         self._segment: Optional[ActiveSegment] = None
         self._next_number = 1
         self._gaps_written = set()
+        self._disk_full_seq: Optional[int] = None
         self._last_sync = time.monotonic()
         self._paused = False
         self._finish: Optional[Finish] = None
@@ -206,6 +207,8 @@ class Writer:
             return True
         if state is not DiskState.FAILED and state not in self._gaps_written:
             gap_seq, line = self.make_gap(state.value, seq, None, None, state is DiskState.FULL)
+            if state is DiskState.FULL:
+                self._disk_full_seq = gap_seq
             self._append(gap_seq, line, rotate=False, covers=(seq, seq, priority))
             self._sync()
             self._gaps_written.add(state)
@@ -280,7 +283,11 @@ class Writer:
             self.disk_dropped += segment.records - segment.written_records
             self.disk_dropped_priority += segment.priority_records - segment.written_priority
             self._segment = None
-        return segment.unwritten()
+        lost = segment.unwritten()
+        if self._disk_full_seq is not None and not any(first <= self._disk_full_seq <= last
+                                                      for first, last, _ in lost):
+            self._gaps_written.add(DiskState.FULL)
+        return lost
 
     def _fail(self) -> None:
         """Stop capture after an error and write a queue_full gap for every seq the run lost, now and at end_run.
