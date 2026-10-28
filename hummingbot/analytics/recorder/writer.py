@@ -1,3 +1,4 @@
+import heapq
 import logging
 import os
 import threading
@@ -8,14 +9,13 @@ from operator import itemgetter
 from pathlib import Path
 from typing import Callable, Deque, Iterator, List, NamedTuple, Optional, Tuple
 
-from hummingbot.analytics.recorder.queue import CaptureQueue, Item
+from hummingbot.analytics.recorder.queue import RELEASE_CHUNK, CaptureQueue, Item, SeqRange
 from hummingbot.analytics.recorder.segments import Abandoned, ActiveSegment, write_run_json
 
 BATCH_BYTES = 1024 * 1024
 BATCH_ITEMS = 1024
 logger = logging.getLogger(__name__)
 GapFactory = Callable[[str, int, Optional[int], Optional[int], bool], Tuple[int, bytes]]
-SeqRange = Tuple[int, int, bool]
 
 
 class DiskState(Enum):
@@ -302,15 +302,19 @@ class Writer:
         """
         self._drained.set()
         self.on_dead()
-        lost = self._in_flight() + self.queue.close()
+        lost = self._in_flight()
+        lost.extend(self.queue.close())
         logger.exception("Analytics writer stopped writing %s.", self.run_dir)
-        lost = self._report(lost + self._abandon_segment() + self.queue.take_drops())
+        lost.extend(self._abandon_segment())
+        lost.extend(self.queue.take_drops())
+        lost = self._report(lost)
         self.errors += 1
         self.state = DiskState.FAILED
         while self._finish is None:
             self._wake.wait()
             self._wake.clear()
-        self._report(lost + self.queue.take_drops())
+        lost.extend(self.queue.take_drops())
+        self._report(lost)
 
     def _in_flight(self) -> List[SeqRange]:
         """Seq ranges the writer took but never handed to a segment. The records among them count as disk_dropped."""
@@ -364,12 +368,28 @@ class Writer:
 
 
 def _merged(ranges: List[SeqRange]) -> List[SeqRange]:
-    """Sort seq ranges and join those that overlap or touch, keeping whether any of them held a priority record."""
+    """Consume loss ranges and join overlaps, yielding between bounded sorting, merging, and release chunks."""
+    large = len(ranges) > RELEASE_CHUNK
+    runs = []
+    for offset in range(0, len(ranges), RELEASE_CHUNK):
+        runs.append(sorted(ranges[offset:offset + RELEASE_CHUNK]))
+        if large:
+            time.sleep(0)
     merged: List[SeqRange] = []
-    for first, last, priority in sorted(ranges):
+    for index, (first, last, priority) in enumerate(heapq.merge(*runs), 1):
         if merged and first <= merged[-1][1] + 1:
             start, end, any_priority = merged[-1]
             merged[-1] = (start, max(end, last), any_priority or priority)
         else:
             merged.append((first, last, priority))
+        if large and index % RELEASE_CHUNK == 0:
+            time.sleep(0)
+    for run in runs:
+        run.clear()
+        if large:
+            time.sleep(0)
+    while ranges:
+        del ranges[-RELEASE_CHUNK:]
+        if large:
+            time.sleep(0)
     return merged

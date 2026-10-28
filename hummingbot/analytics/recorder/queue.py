@@ -1,3 +1,4 @@
+import time
 from bisect import bisect_right
 from collections import deque
 from itertools import accumulate, repeat, starmap
@@ -5,6 +6,8 @@ from operator import itemgetter
 from typing import Deque, List, Optional, Tuple
 
 Item = Tuple[int, bool, bytes]
+SeqRange = Tuple[int, int, bool]
+RELEASE_CHUNK = 1024
 
 
 class DropRange:
@@ -62,7 +65,7 @@ class CaptureQueue:
     def push(self, seq: int, line: bytes, priority: bool = True) -> bool:
         """Bypass capacity for lifecycle records, but never leave a record in a queue that close() has released.
 
-        deque append, remove, and popleft are atomic, so a record appended while the writer closes the queue is
+        deque append, pop, and popleft are atomic, so a record appended while the writer closes the queue is
         either drained and counted by close() or retracted and counted here, never both and never neither.
         """
         self.seal_drops()
@@ -74,8 +77,8 @@ class CaptureQueue:
         self.items.append(item)
         if self.closed:
             try:
-                self.items.remove(item)
-            except ValueError:
+                self.items.pop()
+            except IndexError:
                 pass
             else:
                 self.bytes_in -= len(line)
@@ -96,17 +99,33 @@ class CaptureQueue:
         else:
             current.snapshot = (seq, seq if priority else current.snapshot[1])
 
-    def close(self) -> List[Tuple[int, int, bool]]:
-        """Refuse every later record and release the queued ones, returning their seqs as one-seq ranges.
+    def close(self) -> List[SeqRange]:
+        """Refuse later records and return compact ranges for the released observations.
 
-        Called by the writer once it can write no more.
+        Releasing and grouping records in bounded chunks avoids retaining or freeing a tuple per observation.
         """
         self.closed = True
         released = []
+        first = None
+        last = 0
+        priority = False
+        count = 0
         while (item := self.pop()) is not None:
+            seq, important, _ = item
             self._discarded += 1
-            self._discarded_priority += item[1]
-            released.append((item[0], item[0], item[1]))
+            self._discarded_priority += important
+            if first is None or seq != last + 1:
+                if first is not None:
+                    released.append((first, last, priority))
+                first, priority = seq, important
+            else:
+                priority = priority or important
+            last = seq
+            count += 1
+            if count % RELEASE_CHUNK == 0:
+                time.sleep(0)
+        if first is not None:
+            released.append((first, last, priority))
         return released
 
     def seal_drops(self) -> None:

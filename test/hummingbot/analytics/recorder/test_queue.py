@@ -159,6 +159,21 @@ class CaptureQueueTest(unittest.TestCase):
         self.assertEqual((3, 2, 1, 0, 0),
                          (queue.accepted, queue.dropped, queue.dropped_priority, len(queue), queue.depth_bytes))
 
+    def test_close_returns_compact_ranges_without_filling_sequence_holes(self):
+        queue = CaptureQueue(10_000, 10_000)
+        for seq, priority in ((1, False), (2, False), (3, True), (5, False), (8, True), (9, False)):
+            queue.offer(seq, priority, LINE)
+        self.assertEqual([(1, 3, True), (5, 5, False), (8, 9, True)], queue.close())
+        self.assertEqual((6, 2, 0), (queue._discarded, queue._discarded_priority, queue.depth_bytes))
+        self.assertEqual([], queue.close())
+
+    def test_releasing_a_large_contiguous_queue_returns_one_range(self):
+        queue = CaptureQueue(10_000_000, 10_000_000)
+        for seq in range(1, 50_001):
+            queue.offer(seq, seq == 25_000, LINE)
+        self.assertEqual([(1, 50_000, True)], queue.close())
+        self.assertEqual((50_000, 1, 0), (queue._discarded, queue._discarded_priority, queue.depth_bytes))
+
 
 class QueueFullGapTest(RunTestCase):
     def test_writer_reports_the_exact_dropped_range_without_waiting_for_another_hook(self):
