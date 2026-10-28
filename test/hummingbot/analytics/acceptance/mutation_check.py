@@ -46,6 +46,28 @@ MUTATIONS = {
         "            elif self.free_bytes < self.min_free_bytes:\n",
         "            elif False:\n",
     ),)),
+    "M26_run_start_lists_first_only": Mutation("24", (
+        (
+            "hummingbot/analytics/hooks/run.py",
+            '        "connectors": [_connector_body(name, connector) for name, connector in core.connectors.items()],\n',
+            '        "connectors": [_connector_body(name, connector) '
+            'for name, connector in list(core.connectors.items())[:1]],\n',
+        ),
+        (
+            "hummingbot/analytics/hooks/run.py",
+            "for controller_id, controller in controllers.items()],\n",
+            "for controller_id, controller in list(controllers.items())[:1]],\n",
+        ),
+    )),
+    "M27_connector_event_twice": Mutation("24", ((
+        "hummingbot/analytics/hooks/run.py",
+        "        capture = ConnectorEvents(connector, name)\n"
+        "        run.connectors[name] = capture\n        capture.attach()\n",
+        "        capture = ConnectorEvents(connector, name)\n"
+        "        run.connectors[name] = capture\n        capture.attach()\n"
+        "        duplicate = ConnectorEvents(connector, name)\n"
+        "        run.connectors[name + '#duplicate'] = duplicate\n        duplicate.attach()\n",
+    ),)),
 }
 
 
@@ -57,7 +79,9 @@ def main():
     root = Path(__file__).resolve().parents[4]
     sys.path.insert(0, str(root))
     sys.dont_write_bytecode = True
-    changes = {str(root / path): (before, after) for path, before, after in mutation.changes}
+    changes = {}
+    for path, before, after in mutation.changes:
+        changes.setdefault(str(root / path), []).append((before, after))
     applied = set()
     get_code = importlib.machinery.SourceFileLoader.get_code
 
@@ -66,12 +90,13 @@ def main():
         if change is None:
             return get_code(loader, fullname)
         source = Path(loader.path).read_text()
-        before, after = change
-        if source.count(before) != 1:
-            raise RuntimeError(f"{args.mutation} anchor must occur once in {loader.path}")
+        for before, after in change:
+            if source.count(before) != 1:
+                raise RuntimeError(f"{args.mutation} anchor must occur once in {loader.path}")
+            source = source.replace(before, after)
         applied.add(loader.path)
         print(f"MUTATION_APPLIED {args.mutation} {loader.path}", flush=True)
-        return compile(source.replace(before, after), loader.path, "exec")
+        return compile(source, loader.path, "exec")
 
     with patch.object(importlib.machinery.SourceFileLoader, "get_code", mutated_code):
         import pytest

@@ -102,23 +102,33 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
         self.temp.cleanup()
 
     @asynccontextmanager
-    async def trading(self, name, capture=True, analytics_root=None, passwords=None, **settings):
+    async def trading(self, name, capture=True, analytics_root=None, passwords=None,
+                      controller_ids=("fake_backpack_reference",), **settings):
         root = self.root / name
         root.mkdir()
         controller = root / "controller.yml"
         controller.write_text(yaml.safe_dump({
-            **REFERENCE_CONTROLLER, "buy_spreads": "0.001", "sell_spreads": "0.001",
+            **REFERENCE_CONTROLLER, "id": controller_ids[0], "buy_spreads": "0.001", "sell_spreads": "0.001",
             "buy_amounts_pct": "1", "sell_amounts_pct": "1", "executor_refresh_time": 86400,
         }))
         analytics_root = analytics_root or root / "analytics"
         begin = run.begin
 
         def configure(client):
+            from hummingbot.client import settings as client_settings
+            if len(controller_ids) > 1:
+                script = client_settings.SCRIPT_STRATEGY_CONF_DIR_PATH / "v2.yml"
+                document = yaml.safe_load(script.read_text())
+                for index, controller_id in enumerate(controller_ids[1:], 1):
+                    filename = f"controller-{index}.yml"
+                    config = {**yaml.safe_load(controller.read_text()), "id": controller_id}
+                    (client_settings.CONTROLLERS_CONF_DIR_PATH / filename).write_text(yaml.safe_dump(config))
+                    document["controllers_config"].append(filename)
+                script.write_text(yaml.safe_dump(document))
             for key, value in {"min_free_bytes": 0, "hard_min_free_bytes": 0,
                                "flush_interval_ms": 10, **settings}.items():
                 setattr(client.analytics, key, value)
             if passwords is not None:
-                from hummingbot.client import settings as client_settings
                 path = client_settings.CLIENT_CONFIG_PATH
                 document = yaml.safe_load(path.read_text())
                 document["mqtt_bridge"]["mqtt_password"] = passwords["mqtt_password"]
@@ -487,9 +497,11 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                     self.assertTrue(any("signature[1]" in body["redacted"] for body in outbound))
 
     async def test_criterion_24_fresh_start(self):
-        async with self.trading("fresh") as bot:
+        controller_ids = ("acceptance_first", "acceptance_second")
+        async with self.trading("fresh", controller_ids=controller_ids) as bot:
             expected_connectors = set(bot.ctx.connectors)
             expected_controllers = set(bot.ctx.strategy.controllers)
+            self.assertEqual(set(controller_ids), expected_controllers)
             entry_id = next(client_id for client_id in bot.ctx.decision_by_order
                             if any(str(order["clientId"]) == client_id and order["side"] == "Bid"
                                    for order in bot.venue.orders.values()))
