@@ -83,14 +83,16 @@ class ActiveSegment:
         self.dirty = False
         self._pending: List[bytes] = []
         self._pending_seqs: List[int] = []
-        self._pending_priority: List[bool] = []
+        self._pending_priority: List[Optional[bool]] = []
         self._covers: Dict[int, Tuple[int, int, bool]] = {}
         self.written_records = 0
-        self.priority_records = 0
-        self.written_priority = 0
 
-    def add(self, seq: int, line: bytes, priority: bool = True, covers: Optional[Tuple[int, int, bool]] = None) -> None:
-        """Add one line. covers is the seq range a capture_gap line explains, which is lost again if the line is."""
+    def add(self, seq: int, line: bytes, priority: Optional[bool] = None,
+            covers: Optional[Tuple[int, int, bool]] = None) -> None:
+        """None priority marks writer-created evidence, which must not count as a lost queue observation.
+
+        covers is the seq range a capture_gap explains, which is lost again if its line is.
+        """
         if self.opened is None:
             self.opened = time.monotonic()
         self._pending.append(line)
@@ -98,7 +100,6 @@ class ActiveSegment:
         self._pending_priority.append(priority)
         if covers is not None:
             self._covers[seq] = covers
-        self.priority_records += priority
         self.size += len(line)
         self.records += 1
         self.first_seq = seq if self.first_seq is None else min(self.first_seq, seq)
@@ -112,7 +113,6 @@ class ActiveSegment:
         self._pending.extend(lines)
         self._pending_seqs.extend(seqs)
         self._pending_priority.extend(priorities)
-        self.priority_records += sum(priorities)
         self.size += sum(map(len, lines))
         self.records += len(lines)
         low, high = min(seqs), max(seqs)
@@ -129,7 +129,6 @@ class ActiveSegment:
             self.dirty = True
             if written == sum(map(len, chunk)):
                 self.written_records += len(chunk)
-                self.written_priority += sum(self._pending_priority[:len(chunk)])
                 del self._pending_priority[:len(chunk)]
                 del self._pending_seqs[:len(chunk)]
                 del self._pending[:len(chunk)]
@@ -139,7 +138,6 @@ class ActiveSegment:
                 written -= len(chunk[done])
                 done += 1
             self.written_records += done
-            self.written_priority += sum(self._pending_priority[:done])
             del self._pending_priority[:done]
             del self._pending_seqs[:done]
             del self._pending[:done]
@@ -148,9 +146,13 @@ class ActiveSegment:
 
     def unwritten(self) -> List[Tuple[int, int, bool]]:
         """Seq ranges of the lines not yet written whole, plus the ranges their capture_gap lines explain."""
-        lost = [(seq, seq, priority) for seq, priority in zip(self._pending_seqs, self._pending_priority)]
+        lost = [(seq, seq, priority is not False) for seq, priority in zip(self._pending_seqs, self._pending_priority)]
         lost.extend(self._covers[seq] for seq in self._pending_seqs if seq in self._covers)
         return lost
+
+    def unwritten_queue_counts(self) -> Tuple[int, int]:
+        return (sum(priority is not None for priority in self._pending_priority),
+                sum(priority is True for priority in self._pending_priority))
 
     def sync(self) -> None:
         self.flush()

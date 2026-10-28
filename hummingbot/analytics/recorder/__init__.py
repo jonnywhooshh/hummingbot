@@ -284,7 +284,11 @@ def _log_diagnostics(diagnostics: Deque[Tuple[str, int, BaseException]]) -> None
 
 
 def stats() -> Dict[str, Any]:
-    """Return hook errors, queue and writer counters. Writer-owned values may lag by one batch."""
+    """Return hook errors, queue and writer counters. Writer-owned values may lag by one batch.
+
+    records counts queue admissions, including lifecycle records. disk_dropped counts admitted queue observations
+    lost at the writer, not writer-created capture_gap or diagnostic log lines.
+    """
     run = _run
     result = {"active": run is not None, "hook_errors": sum(_errors.values()),
               "hook_errors_by_hook": dict(_errors), "discarded": _discarded}

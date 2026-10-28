@@ -223,9 +223,9 @@ class Writer:
         self.queue.close()
         self.on_dead()
 
-    def _append(self, seq: int, line: bytes, rotate: bool = True, priority: bool = True,
+    def _append(self, seq: int, line: bytes, rotate: bool = True, priority: Optional[bool] = None,
                 covers: Optional[SeqRange] = None) -> None:
-        self._holding = (seq, seq, priority)
+        self._holding = (seq, seq, priority is not False)
         segment = self._segment
         if rotate and segment is not None and segment.records and segment.size + len(line) > self.segment_max_bytes:
             self._close_segment()
@@ -280,8 +280,9 @@ class Writer:
             self.errors += 1
         finally:
             self._written += segment.written_records
-            self.disk_dropped += segment.records - segment.written_records
-            self.disk_dropped_priority += segment.priority_records - segment.written_priority
+            dropped, priority_dropped = segment.unwritten_queue_counts()
+            self.disk_dropped += dropped
+            self.disk_dropped_priority += priority_dropped
             self._segment = None
         lost = segment.unwritten()
         if self._disk_full_seq is not None and not any(first <= self._disk_full_seq <= last
@@ -334,7 +335,7 @@ class Writer:
             return ranges
         for first, last, priority in ranges:
             seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
-            segment.add(seq, line, True, (first, last, priority))
+            segment.add(seq, line, covers=(first, last, priority))
         try:
             segment.sync()
         except OSError:

@@ -159,6 +159,18 @@ class WriterFailureTest(RunTestCase):
         self.assertEqual(999, run.queue.dropped_priority + run.writer.disk_dropped_priority)
         self.assertEqual((0, 0), (stats["queue_records"], stats["queue_bytes"]))
 
+    def test_disk_dropped_counts_queue_observations_but_not_writer_gaps_or_logs(self):
+        run_dir = self.fill_past_a_small_queue()
+        run = recorder._run
+        recorder.hook_error("clock", ValueError("diagnostic evidence"))
+        with patch.object(segments.os, "writev", side_effect=OSError(5, "EIO")):
+            recorder.resume()
+            self.wait_for(lambda: recorder.stats()["disk"] == "failed")
+        self.assertFalse(recorder.end_run({}))
+        written = sum(row["kind"] not in ("capture_gap", "log") for row in self.records(run_dir))
+        self.assertEqual(run.queue.accepted, written + run.queue._discarded + run.writer.disk_dropped)
+        self.assertEqual(0, run.writer.disk_dropped_priority)
+
     def test_a_finished_run_that_died_late_cannot_turn_off_the_next_run(self):
         self.start()
         first = recorder._run
