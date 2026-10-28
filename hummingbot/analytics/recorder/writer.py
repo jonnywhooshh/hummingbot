@@ -55,6 +55,7 @@ class Writer:
         self.segments_closed = 0
         self.errors = 0
         self.clean = False
+        self.report_late = False
         self.run_json: Optional[bytes] = None
         self._run_json_written: Optional[bytes] = None
         self._segment: Optional[ActiveSegment] = None
@@ -275,7 +276,9 @@ class Writer:
         if segment is None:
             return []
         try:
-            segment.abandon()
+            segment.abandon(self._check_deadline)
+        except Abandoned:
+            pass
         except OSError:
             self.errors += 1
         finally:
@@ -321,31 +324,43 @@ class Writer:
         return lost
 
     def _report(self, lost: List[SeqRange]) -> List[SeqRange]:
-        """Write a queue_full gap for each run of lost seqs to a fresh segment, and return the seqs still unreported.
+        """Write loss ranges unless a delivered disk_full gap or the shutdown deadline has stopped capture.
 
-        After a disk_full gap nothing is written, because that gap already explains every later seq.
+        A syscall already in flight cannot be cancelled. report_late and the application log mark its late return.
         """
         ranges = _merged(lost)
         if not ranges or DiskState.FULL in self._gaps_written or self._past_deadline():
             return ranges
+        segment = None
+        processed = 0
         try:
+            self._check_deadline()
             segment = self._new_segment()
+            self._check_deadline()
+            for first, last, priority in ranges:
+                self._check_deadline()
+                seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
+                segment.add(seq, line, covers=(first, last, priority))
+                processed += 1
+            segment.sync(self._check_deadline)
+        except Abandoned:
+            pass
         except OSError:
             self.errors += 1
+        if segment is None:
             return ranges
-        for first, last, priority in ranges:
-            seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
-            segment.add(seq, line, covers=(first, last, priority))
         try:
-            segment.sync()
+            segment.abandon(self._check_deadline)
+        except Abandoned:
+            pass
         except OSError:
             self.errors += 1
-        try:
-            segment.abandon()
-        except OSError:
-            self.errors += 1
+        if self._past_deadline():
+            self.report_late = True
+            logger.warning("Analytics writer-death report exceeded end_run deadline. %s may contain late I/O.",
+                           segment.path)
         self._written += segment.written_records
-        return segment.unwritten()
+        return segment.unwritten() + ranges[processed:]
 
 
 def _merged(ranges: List[SeqRange]) -> List[SeqRange]:

@@ -212,6 +212,8 @@ def end_run(body: Dict[str, Any]) -> bool:
     """Drain observations, write run_end once with final counters, close, and save run.json within two seconds.
 
     On timeout the active JSONL remains recoverable and run.json has no run_end. Calling twice does not add a record.
+    No writer-death report starts another write after the deadline. An in-flight syscall can still finish later.
+    The writer marks that report_late and logs its segment path as possible late I/O.
     """
     global _run, ACTIVE
     t0_ns = perf_counter_ns()

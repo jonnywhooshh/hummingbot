@@ -337,6 +337,71 @@ class DiskFloorTest(RunTestCase):
 
 
 class EndRunBoundTest(RunTestCase):
+    def test_writer_death_reports_do_not_start_writing_after_a_slow_creation_passes_the_deadline(self):
+        for final_report in (False, True):
+            with self.subTest(final_report=final_report):
+                run_dir = self.start()
+                self.wait_for(lambda: (run_dir / "run.json").exists())
+                run = recorder._run
+                if final_report:
+                    with patch.object(segments.os, "writev", side_effect=OSError(5, "EIO")):
+                        self.record("clock", {})
+                        self.wait_for(lambda: run.writer.state.value == "failed")
+                    self.record("clock", {"after": "failure"})
+                blocked, release = threading.Event(), threading.Event()
+                real_fsync_dir = segments.fsync_dir
+
+                def fsync_dir(path):
+                    blocked.set()
+                    release.wait(2)
+                    real_fsync_dir(path)
+
+                with self.assertLogs("hummingbot.analytics.recorder.writer", level="WARNING") as logs, \
+                        patch.object(segments, "fsync_dir", side_effect=fsync_dir):
+                    if not final_report:
+                        with patch.object(segments.os, "writev", side_effect=OSError(5, "EIO")):
+                            self.record("clock", {})
+                            self.assertTrue(blocked.wait(1))
+                    with patch.object(recorder, "END_RUN_TIMEOUT_S", 0.05):
+                        self.assertFalse(recorder.end_run({}))
+                    self.assertTrue(blocked.is_set())
+                    before = {p.name: p.stat().st_size for p in run_dir.glob("seg-*")}
+                    release.set()
+                    run.writer._thread.join(2)
+                self.assertFalse(run.writer._thread.is_alive())
+                self.assertEqual(before, {p.name: p.stat().st_size for p in run_dir.glob("seg-*")})
+                self.assertTrue(run.writer.report_late)
+                self.assertTrue(any("late" in entry for entry in logs.output))
+
+    def test_an_in_flight_report_write_that_finishes_after_end_run_is_marked_late(self):
+        run_dir = self.start()
+        self.wait_for(lambda: (run_dir / "run.json").exists())
+        run = recorder._run
+        blocked, release = threading.Event(), threading.Event()
+        real_writev = os.writev
+        calls = []
+
+        def writev(fd, lines):
+            calls.append(fd)
+            if len(calls) <= 2:
+                raise OSError(5, "EIO")
+            blocked.set()
+            release.wait(2)
+            return real_writev(fd, lines)
+
+        with self.assertLogs("hummingbot.analytics.recorder.writer", level="WARNING") as logs, \
+                patch.object(segments.os, "writev", side_effect=writev):
+            self.record("clock", {})
+            self.assertTrue(blocked.wait(1))
+            with patch.object(recorder, "END_RUN_TIMEOUT_S", 0.05):
+                self.assertFalse(recorder.end_run({}))
+            release.set()
+            run.writer._thread.join(2)
+        self.assertFalse(run.writer._thread.is_alive())
+        self.assertTrue(run.writer.report_late)
+        self.assertTrue(any("late I/O" in entry for entry in logs.output))
+        self.assertEqual(["capture_gap"], [row["kind"] for row in self.records(run_dir)])
+
     def test_end_run_returns_within_two_seconds_leaving_an_open_segment_and_no_run_end(self):
         run_dir = self.start()
         self.record("ws_in", {"text": "written"})

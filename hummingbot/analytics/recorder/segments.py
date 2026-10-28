@@ -119,9 +119,11 @@ class ActiveSegment:
         self.first_seq = low if self.first_seq is None else min(self.first_seq, low)
         self.last_seq = high if self.last_seq is None else max(self.last_seq, high)
 
-    def flush(self) -> None:
+    def flush(self, check: Optional[Callable[[], None]] = None) -> None:
         """Write pending lines with writev, which neither copies them nor holds the GIL while writing."""
         while self._pending:
+            if check is not None:
+                check()
             chunk = self._pending[:IOV_MAX]
             written = os.writev(self.fd, chunk)
             if written == 0:
@@ -143,6 +145,8 @@ class ActiveSegment:
             del self._pending[:done]
             self._pending[0] = self._pending[0][written:]
         self._covers.clear()
+        if check is not None:
+            check()
 
     def unwritten(self) -> List[Tuple[int, int, bool]]:
         """Seq ranges of the lines not yet written whole, plus the ranges their capture_gap lines explain."""
@@ -154,16 +158,18 @@ class ActiveSegment:
         return (sum(priority is not None for priority in self._pending_priority),
                 sum(priority is True for priority in self._pending_priority))
 
-    def sync(self) -> None:
-        self.flush()
+    def sync(self, check: Optional[Callable[[], None]] = None) -> None:
+        self.flush(check)
         if self.dirty:
             os.fsync(self.fd)
             self.dirty = False
+            if check is not None:
+                check()
 
     def close(self, check: Callable[[], None]) -> None:
         """Publish gzip before the manifest. Only incomplete compression output may be removed on failure."""
         check()
-        self.sync()
+        self.sync(check)
         os.close(self.fd)
         self.fd = -1
         gz_path = self.path.with_name(self.path.name + ".gz")
@@ -191,10 +197,10 @@ class ActiveSegment:
         self.path.unlink()
         fsync_dir(self.run_dir)
 
-    def abandon(self) -> None:
+    def abandon(self, check: Optional[Callable[[], None]] = None) -> None:
         if self.fd >= 0:
             try:
-                self.flush()
+                self.flush(check)
             finally:
                 os.close(self.fd)
                 self.fd = -1
