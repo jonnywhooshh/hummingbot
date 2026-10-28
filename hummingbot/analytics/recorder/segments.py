@@ -69,7 +69,12 @@ class ActiveSegment:
         self.run_dir = run_dir
         self.path = run_dir / segment_name(number)
         self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        fsync_dir(run_dir)
+        try:
+            fsync_dir(run_dir)
+        except BaseException:
+            os.close(self.fd)
+            self.fd = -1
+            raise
         self.opened: Optional[float] = None
         self.size = 0
         self.records = 0

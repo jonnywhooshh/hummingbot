@@ -67,6 +67,27 @@ class CommandsTest(RunTestCase):
             self.assertEqual(result, dump.main(["--run", str(run_dir), "--verify"], out))
             self.assertIn(text, out.getvalue())
 
+    def test_verify_checks_the_assigned_tail_even_when_no_record_reached_disk(self):
+        for rows in ([], [{"seq": 1}]):
+            for metadata in ({"last_seq": 5}, {"run_end": {"counters": {"records": 3, "dropped": 2}}}):
+                with self.subTest(rows=rows, metadata=metadata):
+                    run_dir = self.fixture_run(rows)
+                    (run_dir / "run.json").write_text(json.dumps(metadata))
+                    out = io.BytesIO()
+                    self.assertEqual(1, dump.main(["--run", str(run_dir), "--verify"], out))
+                    first = 2 if rows else 1
+                    self.assertIn(f"unexplained missing seq {first}-5".encode(), out.getvalue())
+
+    def test_verify_uses_run_end_counters_and_gap_ranges_as_tail_evidence(self):
+        for tail in ({"seq": 2, "kind": "run_end", "body": {"counters": {"records": 2, "dropped": 3}}},
+                     {"seq": 2, "kind": "capture_gap",
+                      "body": dict(type="queue_full", first_seq=3, last_seq=5, count=3)}):
+            run_dir = self.fixture_run([{"seq": 1}, tail])
+            out = io.BytesIO()
+            expected = 0 if tail["kind"] == "capture_gap" else 1
+            self.assertEqual(expected, dump.main(["--run", str(run_dir), "--verify"], out))
+            self.assertIn(b"seq 1-5", out.getvalue())
+
     def test_verify_reports_only_the_seqs_no_gap_explains(self):
         def gap(first, last):
             return dict(type="queue_full", first_seq=first, last_seq=last, count=last - first + 1,

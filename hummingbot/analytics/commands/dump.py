@@ -15,7 +15,8 @@ def main(argv: List[str], out: Optional[BinaryIO] = None) -> int:
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--kind", help="comma-separated kinds")
     parser.add_argument("--seq", type=_seq_range, help="inclusive sequence range a-b")
-    parser.add_argument("--verify", action="store_true", help="verify segment hashes, counts, and sequence coverage")
+    parser.add_argument("--verify", action="store_true",
+                        help="verify hashes, counts, and sequence coverage through run.json, counters, and gap ranges")
     args = parser.parse_args(argv)
     out = out or sys.stdout.buffer
     kinds = set(args.kind.split(",")) if args.kind else None
@@ -23,7 +24,10 @@ def main(argv: List[str], out: Optional[BinaryIO] = None) -> int:
         entries, partial = segments.read_manifest(args.run)
         chosen = segments.sources(args.run, entries)
         if args.verify:
-            ok, report = _verify(chosen, partial)
+            metadata_path = args.run / segments.RUN_JSON
+            metadata = ujson.loads(metadata_path.read_bytes()) if metadata_path.exists() else {}
+            last_seq = max(_assigned_through(metadata), _assigned_through(metadata.get("run_end", {})))
+            ok, report = _verify(chosen, partial, last_seq)
             out.write("".join(line + "\n" for line in report).encode("utf-8"))
             if not ok:
                 return 1
@@ -59,7 +63,12 @@ def _seq_range(text: str) -> Tuple[int, int]:
         raise argparse.ArgumentTypeError("seq must be a positive integer or an increasing a-b range") from None
 
 
-def _verify(chosen: List[segments.Source], manifest_partial: int) -> Tuple[bool, List[str]]:
+def _assigned_through(metadata: dict) -> int:
+    counters = metadata.get("counters", {})
+    return max(metadata.get("last_seq", 0), counters.get("records", 0) + counters.get("dropped", 0))
+
+
+def _verify(chosen: List[segments.Source], manifest_partial: int, last_seq: int) -> Tuple[bool, List[str]]:
     problems = []
     notes = []
     seqs = []
@@ -80,6 +89,9 @@ def _verify(chosen: List[segments.Source], manifest_partial: int) -> Tuple[bool,
             seqs.append(record["seq"])
             if record["kind"] == "capture_gap":
                 gaps.append(record["body"])
+                last_seq = max(last_seq, record["body"].get("last_seq") or 0)
+            elif record["kind"] == "run_end":
+                last_seq = max(last_seq, _assigned_through(record["body"]))
     seqs.sort()
     missing = []
     previous = 0
@@ -89,6 +101,9 @@ def _verify(chosen: List[segments.Source], manifest_partial: int) -> Tuple[bool,
         elif seq > previous + 1:
             missing.append((previous + 1, seq - 1))
         previous = seq
+    if last_seq > previous:
+        missing.append((previous + 1, last_seq))
+        previous = last_seq
     explained = []
     for gap in gaps:
         first, last = gap["first_seq"], gap["last_seq"]

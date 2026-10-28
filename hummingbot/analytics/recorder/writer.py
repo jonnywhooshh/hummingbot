@@ -112,10 +112,14 @@ class Writer:
         if self._past_deadline():
             raise Abandoned()
 
+    def _new_segment(self) -> ActiveSegment:
+        number = self._next_number
+        self._next_number += 1
+        return ActiveSegment(self.run_dir, number)
+
     def _loop(self) -> None:
         try:
-            self._segment = ActiveSegment(self.run_dir, self._next_number)
-            self._next_number += 1
+            self._segment = self._new_segment()
             while True:
                 self._check_deadline()
                 if not self._paused:
@@ -224,8 +228,7 @@ class Writer:
             self._close_segment()
             segment = None
         if segment is None:
-            segment = self._segment = ActiveSegment(self.run_dir, self._next_number)
-            self._next_number += 1
+            segment = self._segment = self._new_segment()
         segment.add(seq, line, priority, covers)
         self._holding = None
 
@@ -318,11 +321,10 @@ class Writer:
         if not ranges or DiskState.FULL in self._gaps_written or self._past_deadline():
             return ranges
         try:
-            segment = ActiveSegment(self.run_dir, self._next_number)
+            segment = self._new_segment()
         except OSError:
             self.errors += 1
             return ranges
-        self._next_number += 1
         for first, last, priority in ranges:
             seq, line = self.make_gap("queue_full", first, last, last - first + 1, priority)
             segment.add(seq, line, True, (first, last, priority))

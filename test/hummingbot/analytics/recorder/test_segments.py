@@ -10,6 +10,16 @@ from hummingbot.analytics.recorder import segments
 
 
 class SegmentRecoveryTest(RunTestCase):
+    def test_a_directory_sync_failure_closes_the_new_segment_fd(self):
+        real_close = os.close
+        with patch.object(segments, "fsync_dir", side_effect=OSError(5, "EIO")), \
+                patch.object(segments.os, "close", wraps=real_close) as close:
+            with self.assertRaises(OSError):
+                segments.ActiveSegment(self.root, 1)
+        self.assertEqual(1, close.call_count)
+        with self.assertRaises(OSError):
+            os.fstat(close.call_args.args[0])
+
     def test_manifest_wins_over_a_leftover_original_and_unlisted_gzip_is_ignored(self):
         run_dir = self.start()
         self.record("clock", {"offset_ms": 1})

@@ -82,6 +82,43 @@ class RotationTest(RunTestCase):
 
 
 class WriterFailureTest(RunTestCase):
+    def test_a_failed_segment_creation_does_not_block_either_writer_death_report(self):
+        for fail_report in (False, True):
+            with self.subTest(fail_report=fail_report):
+                run_dir = self.start(segment_max_bytes=1500)
+                self.wait_for(lambda: (run_dir / "run.json").exists())
+                recorder.pause()
+                run = recorder._run
+                for index in range(6):
+                    self.record("clock", {"index": index, "text": "x" * 1000})
+                real_fsync_dir = segments.fsync_dir
+                fired = []
+
+                def fsync_dir(path):
+                    if not fired and (run_dir / "seg-000002.jsonl").exists():
+                        fired.append(True)
+                        raise OSError(5, "EIO")
+                    real_fsync_dir(path)
+
+                with patch.object(segments, "fsync_dir", side_effect=fsync_dir):
+                    if fail_report:
+                        with patch.object(segments.ActiveSegment, "close", side_effect=OSError(5, "EIO")):
+                            recorder.resume()
+                            self.wait_for(lambda: run.writer.state.value == "failed")
+                    else:
+                        recorder.resume()
+                        self.wait_for(lambda: run.writer.state.value == "failed")
+                self.record("clock", {"after": "death"})
+                self.assertFalse(recorder.end_run({}))
+                self.assertTrue(fired)
+                rows = self.records(run_dir)
+                observed = {row["seq"] for row in rows}
+                for row in rows:
+                    if row["kind"] == "capture_gap":
+                        observed.update(range(row["body"]["first_seq"], row["body"]["last_seq"] + 1))
+                self.assertEqual(set(range(1, next(run.counter))), observed)
+                self.assertEqual(0, dump.main(["--run", str(run_dir), "--verify"], io.BytesIO()))
+
     def test_a_dead_writer_turns_capture_off_and_releases_the_queue(self):
         self.start(queue_max_bytes=1 << 20)
         with patch("hummingbot.analytics.recorder.segments.os.writev", side_effect=OSError(5, "EIO")):
