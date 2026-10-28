@@ -306,7 +306,7 @@ class DiskFloorTest(RunTestCase):
                 self.assertFalse(recorder.end_run({}))
                 ordered = [json.loads(line) for line in segments.iter_records(run_dir)]
                 self.assertEqual(["disk_full"], [row["body"]["type"] for row in ordered
-                                                if row["kind"] == "capture_gap"])
+                                                 if row["kind"] == "capture_gap"])
                 self.assertEqual("capture_gap", ordered[-1]["kind"])
                 self.assertEqual("disk_full", ordered[-1]["body"]["type"])
 

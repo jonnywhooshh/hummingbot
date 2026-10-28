@@ -289,7 +289,7 @@ class Writer:
             self._segment = None
         lost = segment.unwritten()
         if self._disk_full_seq is not None and not any(first <= self._disk_full_seq <= last
-                                                      for first, last, _ in lost):
+                                                       for first, last, _ in lost):
             self._gaps_written.add(DiskState.FULL)
         return lost
 
