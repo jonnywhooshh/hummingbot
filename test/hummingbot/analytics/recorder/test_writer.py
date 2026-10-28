@@ -350,10 +350,12 @@ class EndRunBoundTest(RunTestCase):
                     self.record("clock", {"after": "failure"})
                 blocked, release = threading.Event(), threading.Event()
                 real_fsync_dir = segments.fsync_dir
+                report_path = run_dir / segments.segment_name(run.writer._next_number)
 
                 def fsync_dir(path):
-                    blocked.set()
-                    release.wait(2)
+                    if report_path.exists():
+                        blocked.set()
+                        release.wait(2)
                     real_fsync_dir(path)
 
                 with self.assertLogs("hummingbot.analytics.recorder.writer", level="WARNING") as logs, \
@@ -368,7 +370,7 @@ class EndRunBoundTest(RunTestCase):
                     before = {p.name: p.stat().st_size for p in run_dir.glob("seg-*")}
                     release.set()
                     run.writer._thread.join(2)
-                self.assertFalse(run.writer._thread.is_alive())
+                    self.assertFalse(run.writer._thread.is_alive())
                 self.assertEqual(before, {p.name: p.stat().st_size for p in run_dir.glob("seg-*")})
                 self.assertTrue(run.writer.report_late)
                 self.assertTrue(any("late" in entry for entry in logs.output))
@@ -397,7 +399,7 @@ class EndRunBoundTest(RunTestCase):
                 self.assertFalse(recorder.end_run({}))
             release.set()
             run.writer._thread.join(2)
-        self.assertFalse(run.writer._thread.is_alive())
+            self.assertFalse(run.writer._thread.is_alive())
         self.assertTrue(run.writer.report_late)
         self.assertTrue(any("late I/O" in entry for entry in logs.output))
         self.assertEqual(["capture_gap"], [row["kind"] for row in self.records(run_dir)])
