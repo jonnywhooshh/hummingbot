@@ -1,3 +1,5 @@
+"""Phase 1 capture acceptance. Backfill redaction belongs to phase 5 of the spec."""
+
 import asyncio
 import base64
 import gzip
@@ -32,12 +34,12 @@ from hummingbot.core.web_assistant.connections.rest_connection import RESTConnec
 from hummingbot.core.web_assistant.connections.ws_connection import WSConnection
 
 
-def records(directory):
+def records(directory, *, by_seq=True):
     result = []
     for path in sorted(directory.glob("seg-*")):
         data = gzip.decompress(path.read_bytes()) if path.suffix == ".gz" else path.read_bytes()
         result.extend(json.loads(line) for line in data.splitlines())
-    return sorted(result, key=lambda row: row["seq"])
+    return sorted(result, key=lambda row: row["seq"]) if by_seq else result
 
 
 def raw_bytes(body):
@@ -214,6 +216,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                     await asyncio.to_thread(recorder.pause)
                     try:
                         written = recorder.stats()["written"]
+                        previous = records(bot.directory, by_seq=False)
                         for index in range(256):
                             await bot.venue.push_depth([["149.90", str(index + 10)]], [])
                             if index == 128 and resting is not None:
@@ -230,6 +233,19 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                         directory = bot.directory
                     finally:
                         recorder.resume()
+                    await until(lambda: recorder.stats()["queue_records"] == 0)
+                    await asyncio.to_thread(recorder.pause)
+                    try:
+                        resumed = records(directory, by_seq=False)[len(previous):]
+                        self.assertTrue(resumed, "the writer did not resume")
+                        self.assertEqual("capture_gap", resumed[0]["kind"])
+                        self.assertEqual("queue_full", resumed[0]["body"]["type"])
+                        self.assertFalse(any(row["kind"] == "run_end" for row in resumed))
+                        self.assertTrue(recorder.ACTIVE)
+                    finally:
+                        recorder.resume()
+                    continued = await self.buy(bot)
+                    await self.fill(bot, continued)
                 rows = records(directory)
                 seqs = [row["seq"] for row in rows]
                 self.assertEqual(len(seqs), len(set(seqs)))
@@ -244,7 +260,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                     reported.extend(range(gap["first_seq"], gap["last_seq"] + 1))
                 self.assertEqual(len(reported), len(set(reported)))
                 self.assertEqual(missing, set(reported))
-                for placed in (order,) if resting is None else (resting, order):
+                for placed in (order, continued) if resting is None else (resting, order, continued):
                     client_id = str(placed["clientId"])
                     evidence = [row for row in rows if row["client_order_id"] == client_id]
                     self.assertTrue({"order_request", "order_dispatch", "order_result", "tracker_update",
