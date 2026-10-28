@@ -436,12 +436,16 @@ class OrderHooksTest(IsolatedAsyncioWrapperTestCase):
                         await asyncio.gather(task, return_exceptions=True)
         self.assertEqual([], self.events[MarketEvent.OrderFailure].event_log)
 
-    async def test_snapshot_failure_and_adapter_failure_do_not_change_a_cancel_failure(self):
+    async def test_encoding_failure_and_adapter_failure_do_not_change_a_cancel_failure(self):
         await self.create()
         self.exchange._place_cancel.side_effect = OSError("venue cancel failure")
-        with patch.object(recorder, "snapshot", side_effect=RuntimeError("snapshot failed")) as snapshot:
-            self.assertIsNone(await self.exchange._execute_cancel("SOL-USDC", "order"))
-        self.assertGreaterEqual(snapshot.call_count, 2)
+        recorder.pause()
+        try:
+            with patch.object(recorder, "encode_body", side_effect=RuntimeError("encoding failed")) as encode_body:
+                self.assertIsNone(await self.exchange._execute_cancel("SOL-USDC", "order"))
+            self.assertGreaterEqual(encode_body.call_count, 2)
+        finally:
+            recorder.resume()
         with patch.object(orders, "_cancel", Mock(get=Mock(side_effect=RuntimeError("context failed")))):
             orders.cancel_error(OSError("venue cancel failure"))
         self.assertGreaterEqual(recorder.stats()["hook_errors"], 3)
