@@ -30,6 +30,22 @@ MUTATIONS = {
         "            unreported = self._unreported\n            if self._drain_requested:\n"
         "                unreported.extend(self.queue.take_drops())\n",
     ),)),
+    "M16_low_drops_private_ws_in": Mutation("07", ((
+        "hummingbot/analytics/recorder/writer.py",
+        "                if self._admit(seq, priority):\n",
+        "                if self._admit(seq, priority and b'\"kind\":\"ws_in\"' not in line):\n",
+    ),)),
+    "M17_low_drops_only_first_bulk": Mutation("07", ((
+        "hummingbot/analytics/recorder/writer.py",
+        "        if state is DiskState.OK or (state is DiskState.LOW and priority):\n",
+        "        if state is DiskState.OK or (state is DiskState.LOW and "
+        "(priority or DiskState.LOW in self._gaps_written)):\n",
+    ),)),
+    "M29_skip_disk_low": Mutation("07", ((
+        "hummingbot/analytics/recorder/writer.py",
+        "            elif self.free_bytes < self.min_free_bytes:\n",
+        "            elif False:\n",
+    ),)),
 }
 
 

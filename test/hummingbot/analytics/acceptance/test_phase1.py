@@ -388,20 +388,38 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
                 finally:
                     recorder.resume()
                 await bot.venue.push_depth([["149.90", "71"]], [])
-                low_uid = bot.venue.update_id
+                low_uids = {bot.venue.update_id}
                 await until(lambda: recorder.stats()["disk"] == "disk_low" and recorder.stats()["disk_dropped"] > 0)
-                low = await self.buy(bot)
-                await self.fill(bot, low)
+                for index in range(64):
+                    self.assertEqual("disk_low", recorder.stats()["disk"])
+                    self.assertTrue(await bot.venue.push_depth([["149.90", str(100 + index)]], []))
+                    low_uids.add(bot.venue.update_id)
+                    if index == 32:
+                        low = await self.buy(bot)
+                        await self.fill(bot, low)
+                await until(lambda: bot.connector.get_order_book("SOL-USDC").last_diff_uid == bot.venue.update_id)
+                self.assertEqual(65, len(low_uids))
                 await until(lambda: recorder.stats()["queue_records"] == 0)
                 await asyncio.to_thread(recorder.pause)
                 try:
                     low_rows = records(bot.directory)
+                    self.assertEqual(["disk_low"], [row["body"]["type"] for row in low_rows
+                                                    if row["kind"] == "capture_gap"])
+                    low_bulk_uids = {json.loads(row["body"]["text"]).get("data", {}).get("u")
+                                     for row in low_rows if row["kind"] == "ws_in"
+                                     and row["body"]["msg_type"] == "TEXT"}
+                    self.assertFalse(low_uids & low_bulk_uids)
+                    self.assertGreaterEqual(recorder.stats()["disk_dropped"], len(low_uids))
                     low_events = [row for row in low_rows if row["kind"] == "connector_event"
                                   and row["client_order_id"] == str(low["clientId"])]
                     self.assertEqual(1, sum(row["body"]["event"] == "OrderFilled" for row in low_events))
                     low_orders = {row["kind"] for row in low_rows
                                   if row["client_order_id"] == str(low["clientId"])}
                     self.assertTrue({"order_request", "order_dispatch", "order_result"}.issubset(low_orders))
+                    low_private = [row for row in low_rows if row["kind"] == "ws_in" and "text" in row["body"]
+                                   and '"orderFill"' in row["body"]["text"]
+                                   and str(json.loads(row["body"]["text"])["data"]["c"]) == str(low["clientId"])]
+                    self.assertEqual(1, len(low_private))
                     set_free(8 * 1024 * 1024)
                 finally:
                     recorder.resume()
@@ -417,7 +435,7 @@ class Phase1AcceptanceTests(IsolatedAsyncioWrapperTestCase):
             self.assertFalse(any(row["client_order_id"] == str(full["clientId"]) for row in rows))
             bulk = [json.loads(row["body"]["text"]) for row in rows
                     if row["kind"] == "ws_in" and row["body"]["msg_type"] == "TEXT"]
-            self.assertFalse(any(frame.get("data", {}).get("u") == low_uid for frame in bulk))
+            self.assertFalse(low_uids & {frame.get("data", {}).get("u") for frame in bulk})
             self.assertEqual(["Filled", "Filled", "Filled"], [order["status"] for order in (before, low, full)])
 
     async def test_criterion_08_redaction(self):
